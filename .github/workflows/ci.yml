@@ -1,0 +1,88 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+  # The conformance suite commit this crate targets (suite 1.3). Moving to a
+  # newer suite is a reviewed change to this one line.
+  CONFORMANCE_REF: ded73f8b399be0d446964b7277d77ba5f7262752
+
+# Every action is pinned to a full commit SHA, with its tag or branch in a
+# comment, and no checkout leaves credentials in the working copy.
+jobs:
+  lint:
+    name: Format, lint and docs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - run: cargo fmt --all --check
+      - run: cargo clippy --all-targets --features blocking -- -D warnings
+      - run: cargo doc --no-deps --features blocking
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+  test:
+    name: Unit tests and conformance (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+      - name: Check out the conformance suite
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          repository: Bynn-Intelligence/decision-node-conformance
+          ref: ${{ env.CONFORMANCE_REF }}
+          token: ${{ secrets.DECISIONNODE_CONFORMANCE_TOKEN }}
+          persist-credentials: false
+          path: conformance
+      - name: Python for the mock server
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.12"
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      # The conformance test starts the suite's mock server itself and runs every
+      # case of every kind, with the async and the blocking client.
+      - name: Unit tests, doc tests and the conformance suite (async and blocking clients)
+        run: cargo test --features blocking
+        env:
+          DECISIONNODE_CONFORMANCE_DIR: ${{ github.workspace }}/conformance
+          DECISIONNODE_PYTHON: python
+      - name: Build without the blocking client
+        run: cargo build --no-default-features --features rustls-tls
+
+  native-tls:
+    name: Build with native-tls
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - run: cargo build --no-default-features --features native-tls,blocking

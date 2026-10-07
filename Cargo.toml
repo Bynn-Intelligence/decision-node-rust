@@ -1,0 +1,55 @@
+[package]
+name = "bynn-decisionnode"
+version = "0.1.0"
+edition = "2021"
+description = "The official Rust client for the DecisionNode API: typed truth, choice and score decisions."
+license = "MIT"
+authors = ["Bynn Intelligence, Inc."]
+repository = "https://github.com/Bynn-Intelligence/decision-node-rust"
+homepage = "https://decisionnode.com"
+documentation = "https://docs.rs/bynn-decisionnode"
+readme = "README.md"
+keywords = ["decisionnode", "decision", "classification", "api", "sdk"]
+categories = ["api-bindings", "web-programming::http-client"]
+exclude = ["/.github", "/tests"]
+
+[lib]
+name = "decisionnode"
+path = "src/lib.rs"
+
+[features]
+default = ["rustls-tls"]
+# A synchronous client in `decisionnode::blocking`.
+blocking = ["tokio/rt-multi-thread"]
+# TLS backends, passed through to reqwest.
+rustls-tls = ["reqwest/rustls-tls"]
+native-tls = ["reqwest/native-tls"]
+
+[dependencies]
+base64 = "0.22"
+fastrand = "2"
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+indexmap = "2"
+log = "0.4"
+reqwest = { version = "0.12", default-features = false, features = ["charset", "http2"] }
+serde = "1"
+serde_json = { version = "1", features = ["preserve_order", "float_roundtrip"] }
+tokio = { version = "1", features = ["time"] }
+
+[dev-dependencies]
+regex = "1"
+serde_json = { version = "1", features = ["preserve_order", "float_roundtrip"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "fs", "net", "io-util"] }
+
+[[test]]
+name = "conformance"
+path = "tests/conformance/main.rs"
+harness = false
+
+[[example]]
+name = "blocking"
+required-features = ["blocking"]
+
+[package.metadata.docs.rs]
+all-features = false
+features = ["blocking"]
