@@ -537,8 +537,9 @@ impl Point {
         self
     }
 
-    /// The id of the image to look in, required when the request has two or
-    /// more images.
+    /// The id of the image to look in (a string), required when the request
+    /// has two or more images. A reference by number ("Picture 2") goes in
+    /// the instructions.
     pub fn image(mut self, id: impl Into<String>) -> Point {
         self.0.image = Some(id.into());
         self
@@ -584,8 +585,9 @@ impl BoundingBox {
         self
     }
 
-    /// The id of the image to look in, required when the request has two or
-    /// more images.
+    /// The id of the image to look in (a string), required when the request
+    /// has two or more images. A reference by number ("Picture 2") goes in
+    /// the instructions.
     pub fn image(mut self, id: impl Into<String>) -> BoundingBox {
         self.0.image = Some(id.into());
         self

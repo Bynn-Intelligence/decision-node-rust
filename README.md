@@ -139,7 +139,7 @@ let pick = d["pick"].as_point().unwrap(); // x 812, y 455, present 0.97
 let damage = d["damage"].as_box().unwrap(); // x1 300, y1 120, x2 520, y2 410
 ```
 
-`x` and `y` are measured from the top-left corner of the image, `x` to the right and `y` down; a box runs from its top-left corner (`x1`, `y1`) to its bottom-right corner (`x2`, `y2`). `units` is `"pixels"` (the default: pixels of the image as sent) or `"normalized"` (fractions of the width and the height). `present` is the probability that what the instructions describe is in the image at all; `confidence` the probability that the place is right if it is. `image`, `width` and `height` name the image looked in and its size in pixels. The request needs an image, and `.image(id)` names the one to look in when it carries two or more.
+`x` and `y` are measured from the top-left corner of the image, `x` to the right and `y` down; a box runs from its top-left corner (`x1`, `y1`) to its bottom-right corner (`x2`, `y2`). `units` is `"pixels"` (the default: pixels of the image as sent) or `"normalized"` (fractions of the width and the height). `present` is the probability that what the instructions describe is in the image at all; `confidence` the probability that the place is right if it is. `image`, `width` and `height` name the image looked in and its size in pixels. The request needs an image, and `.image(id)` names the one to look in by its id when it carries two or more; a reference by number ("Picture 2") goes in the instructions.
 
 A question id is any string and comes back as the key of its answer. Without a state the request sends `""`.
 
@@ -182,6 +182,15 @@ let request = DecideRequest::new()
 | `Image::path(id, path)`, `Image::bytes(id, data)`, `Image::bytes_with_type(id, data, media_type)`, `Image::base64(id, text)` | Checked locally, then inline as base64 when all the request's local images total under the inline threshold (`DEFAULT_INLINE_THRESHOLD`, 512 KiB, set with `ClientBuilder::inline_threshold`), and uploaded at or above it: one `POST /v1/uploads` for all of them, the `PUT`s in parallel, then the request names them by `upload_id` |
 | An image the client uploaded before | Its cached `upload_id`, whatever its size, until 5 minutes before the upload expires |
 | `Image::upload_id(id, upload_id)` | `{"id", "upload_id"}` as given |
+
+The model sees each image as "Picture 1", "Picture 2", ... with its id beside it, numbered from 1 in the order of `images`, and each video as "Video 1", "Video 2", ... in the order of `videos`, numbered separately. Text in the state, the instructions or a criterion can refer to an image by position ("Picture 2", "image 2", "the second image", "the last image") or by its id ("the receipt", "`receipt`"), and to a video the same way ("Video 1" or its id):
+
+```rust
+let request = DecideRequest::new()
+    .image(Image::url("receipt", "https://files.example.com/claims/4411/receipt.jpg"))
+    .image(Image::url("statement", "https://files.example.com/claims/4411/statement.png"))
+    .question("charged", truth("Does the total in Picture 1 match the charge on the statement?"));
+```
 
 The local checks are the API's own: JPEG, PNG or WebP by the first bytes (a declared type must match them), at most 10 MB, at most 40 megapixels read from the image header, at most 16 images in a request (URLs included; a 17th is the API's `Validation` error with a `too_long` entry), ids unique. `upload` takes up to 16 images a call. A file is read when the `Image` is made, so a file that cannot be read fails there. No image is resized or re-encoded.
 

@@ -190,8 +190,10 @@ impl Image {
         Image { id, source: Source::Local(Arc::new(Local::new(data, declared))) }
     }
 
-    /// The image's id. Text in the state or the instructions can refer to the
-    /// image by it.
+    /// The image's id, unique within a request. The model sees the image as
+    /// `"Picture <n>"` (its place in the request's images, from 1) with this id
+    /// beside it, so text in the state or the instructions can refer to it by
+    /// either.
     pub fn id(&self) -> &str {
         &self.id
     }

@@ -152,8 +152,10 @@ impl From<Value> for VideoFrame {
 
 impl Video {
     /// A video with this id and no frames yet. The id must be unique across
-    /// the request's images and videos; text in the state or the instructions
-    /// can refer to the video by it.
+    /// the request's images and videos. The model sees the video as
+    /// `"Video <n>"` (its place in the request's videos, from 1) with this id
+    /// beside it, so text in the state or the instructions can refer to it by
+    /// either.
     pub fn new(id: impl Into<String>) -> Video {
         Video { source: VideoSource::Typed { id: id.into(), frames: Vec::new(), fps: None, start: None, end: None } }
     }
