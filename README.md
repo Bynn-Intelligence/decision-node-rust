@@ -183,15 +183,6 @@ let request = DecideRequest::new()
 | An image the client uploaded before | Its cached `upload_id`, whatever its size, until 5 minutes before the upload expires |
 | `Image::upload_id(id, upload_id)` | `{"id", "upload_id"}` as given |
 
-The model sees each image as "Picture 1", "Picture 2", ... with its id beside it, numbered from 1 in the order of `images`, and each video as "Video 1", "Video 2", ... in the order of `videos`, numbered separately. Text in the state, the instructions or a criterion can refer to an image by position ("Picture 2", "image 2", "the second image", "the last image") or by its id ("the receipt", "`receipt`"), and to a video the same way ("Video 1" or its id):
-
-```rust
-let request = DecideRequest::new()
-    .image(Image::url("receipt", "https://files.example.com/claims/4411/receipt.jpg"))
-    .image(Image::url("statement", "https://files.example.com/claims/4411/statement.png"))
-    .question("charged", truth("Does the total in Picture 1 match the charge on the statement?"));
-```
-
 The local checks are the API's own: JPEG, PNG or WebP by the first bytes (a declared type must match them), at most 10 MB, at most 40 megapixels read from the image header, at most 16 images in a request (URLs included; a 17th is the API's `Validation` error with a `too_long` entry), ids unique. `upload` takes up to 16 images a call. A file is read when the `Image` is made, so a file that cannot be read fails there. No image is resized or re-encoded.
 
 The upload cache lives in the client's memory only: by SHA-256 of the bytes and the media type, at most 256 entries, never written to disk and never shared between clients. Requests holding the same bytes at the same time share one upload. If the API answers that an upload the client placed has expired, was consumed or is not there, the client uploads the image again and resends the request once.
@@ -201,6 +192,23 @@ The `PUT` goes to the storage URL the API returned, with exactly the headers it 
 ```rust
 let ids = dn.upload([Image::path("receipt", "receipt.jpg")?]).await?;
 let again = DecideRequest::new().image(Image::upload_id("receipt", &ids[0])).question("q", truth("Is it paid?"));
+```
+
+#### Referring to images and videos
+
+There are two ways to say which image a question is about:
+
+1. **By id (recommended).** Give each image a short, meaningful id and use it in the instructions, in backticks: "Does the total on `receipt` match the amount in the claim?"
+2. **By number.** Images are numbered from 1 in the order of `images`: "image 2", "the second image", "Picture 2" and "the last image" all work.
+
+The model sees each image as `Picture 1 (receipt):`, `Picture 2 (claim_photo):`, so both ways point to the same image. Prefer ids: they stay right when images are added or reordered. Use names, not digits, as ids (`front`, not `2`). Videos work the same way, by id or by number ("video 1"), numbered separately in the order of `videos`. The `image` of a point or box question takes the id.
+
+```rust
+let request = DecideRequest::new()
+    .state("Expense claim 4411: 740.00 EUR.")
+    .image(Image::url("receipt", "https://files.example.com/claims/4411/receipt.jpg"))
+    .image(Image::url("claim_photo", "https://files.example.com/claims/4411/photo.jpg"))
+    .question("matches", truth("Does the total on `receipt` match the amount in the claim?"));
 ```
 
 ### Videos
