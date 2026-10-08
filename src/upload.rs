@@ -47,10 +47,10 @@ impl UploadCache {
 
     /// The live upload id of these bytes, if any. An entry within 5 minutes of
     /// its `expires_at` is dropped.
-    fn get(&self, key: &Key) -> Option<String> {
+    fn get(&self, key: &Key, now: SystemTime) -> Option<String> {
         let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
         let index = entries.get_index_of(key)?;
-        let usable = entries[index].expires_at.checked_sub(CACHE_MARGIN).is_some_and(|t| SystemTime::now() < t);
+        let usable = entries[index].expires_at.checked_sub(CACHE_MARGIN).is_some_and(|t| now < t);
         if !usable {
             entries.shift_remove_index(index);
             return None;
@@ -128,7 +128,7 @@ impl DecisionNode {
             };
             total += local.data.len();
             if !cache_empty {
-                if let Some(id) = cache.get(&key_of(local)) {
+                if let Some(id) = cache.get(&key_of(local), self.now()) {
                     wires[i] = Some(image.wire_upload(&id, with_id));
                     uploaded.push(id);
                     continue;
@@ -176,7 +176,7 @@ impl DecisionNode {
         let mut ids: HashMap<&Key, String> = HashMap::new();
         let mut todo = Vec::new();
         for &i in &distinct {
-            match cache.get(&keys[i]) {
+            match cache.get(&keys[i], self.now()) {
                 Some(id) => {
                     ids.insert(&keys[i], id);
                 }
@@ -184,26 +184,12 @@ impl DecisionNode {
             }
         }
         if !todo.is_empty() {
-            let files: Vec<Value> = todo
-                .iter()
-                .map(|&i| {
-                    let l = locals[i];
-                    json!({
-                        "content_type": l.media_type(),
-                        "byte_size": l.data.len(),
-                        "checksum": base64::engine::general_purpose::STANDARD.encode(md5::Md5::digest(&l.data)),
-                        "sha256": base64::engine::general_purpose::STANDARD.encode(l.sha256()),
-                    })
-                })
-                .collect();
-            let presigned = self.presign(&json!({ "files": files })).await?;
-            if presigned.len() != todo.len() {
-                return Err(Error::new(
-                    ErrorKind::Server,
-                    format!("the upload answer holds {} uploads for {} files", presigned.len(), todo.len()),
-                ));
-            }
-            try_join_all(todo.iter().zip(&presigned).map(|(&i, p)| self.put(p, locals[i]))).await?;
+            let group: Vec<&Local> = todo.iter().map(|&i| &**locals[i]).collect();
+            let (presigned, urls_expire) = self.presign(&group).await?;
+            let presigned = try_join_all(
+                todo.iter().zip(presigned).map(|(&i, p)| self.put_or_presign_again(p, locals[i], urls_expire)),
+            )
+            .await?;
             for (&i, p) in todo.iter().zip(presigned) {
                 // An upload whose expiry cannot be read is used once, not cached.
                 if let Some(at) = p.expires_at {
@@ -216,8 +202,51 @@ impl DecisionNode {
         Ok(keys.iter().map(|k| ids[k].clone()).collect())
     }
 
-    async fn presign(&self, body: &Value) -> Result<Vec<Presigned>> {
-        let reply = self.request_json(Method::POST, "/v1/uploads", Some(body), Policy::Default).await?;
+    /// The `PUT` of one file, and when it is answered `403` once the URL's
+    /// lifetime has passed by the client's clock, one new presign and `PUT`
+    /// (a `403` inside the lifetime is a refusal and is raised). Returns the
+    /// upload the bytes went to.
+    async fn put_or_presign_again(
+        &self,
+        presigned: Presigned,
+        local: &Local,
+        urls_expire: SystemTime,
+    ) -> Result<Presigned> {
+        match self.put(&presigned, local).await {
+            Ok(()) => Ok(presigned),
+            Err(e) if e.status() == Some(403) && self.now() >= urls_expire => {
+                log::debug!("storage URL expired before its PUT; presigning again");
+                let (again, _) = self.presign(&[local]).await?;
+                let again = again
+                    .into_iter()
+                    .next()
+                    .ok_or_else(|| Error::new(ErrorKind::Server, "the upload answer holds no upload for the file"))?;
+                self.put(&again, local).await?;
+                Ok(again)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// One `POST /v1/uploads` for these files. Returns the uploads, in order,
+    /// and when their URLs stop taking a `PUT` by the client's clock
+    /// (`expires_in`, 300 seconds, from the answer).
+    async fn presign(&self, group: &[&Local]) -> Result<(Vec<Presigned>, SystemTime)> {
+        let files: Vec<Value> = group
+            .iter()
+            .map(|l| {
+                json!({
+                    "content_type": l.media_type(),
+                    "byte_size": l.data.len(),
+                    "checksum": base64::engine::general_purpose::STANDARD.encode(md5::Md5::digest(&l.data)),
+                    "sha256": base64::engine::general_purpose::STANDARD.encode(l.sha256()),
+                })
+            })
+            .collect();
+        let body = json!({ "files": files });
+        let reply = self.request_json(Method::POST, "/v1/uploads", Some(&body), Policy::Default).await?;
+        let lifetime = reply.body.get("expires_in").and_then(Value::as_f64).filter(|s| *s > 0.0).unwrap_or(300.0);
+        let urls_expire = self.now() + Duration::from_secs_f64(lifetime.min(86_400.0));
         let invalid = || {
             Error::new(ErrorKind::Server, "the response is not a valid upload answer")
                 .with_response(reply.status, &reply.headers)
@@ -243,7 +272,17 @@ impl DecisionNode {
                     expires_at: text("expires_at").as_deref().and_then(parse_rfc3339),
                 })
             })
-            .collect()
+            .collect::<Result<Vec<_>>>()
+            .and_then(|uploads| {
+                if uploads.len() == group.len() {
+                    Ok((uploads, urls_expire))
+                } else {
+                    Err(Error::new(
+                        ErrorKind::Server,
+                        format!("the upload answer holds {} uploads for {} files", uploads.len(), group.len()),
+                    ))
+                }
+            })
     }
 
     /// The `PUT` of one file: to the returned URL with exactly the returned
@@ -324,7 +363,7 @@ impl DecisionNode {
                 )));
             }
         }
-        check_images(&images)?;
+        check_images(&images, &self.limits(&self.inner.model))?;
         let placed = self.place_images(&images, true, true).await?;
         Ok(placed
             .wires
@@ -348,11 +387,11 @@ mod tests {
         let now = SystemTime::now();
         cache.put(key(1), "upl_1".into(), now + Duration::from_secs(3600));
         cache.put(key(2), "upl_2".into(), now + Duration::from_secs(200));
-        assert_eq!(cache.get(&key(1)).as_deref(), Some("upl_1"));
-        assert_eq!(cache.get(&key(2)), None);
+        assert_eq!(cache.get(&key(1), SystemTime::now()).as_deref(), Some("upl_1"));
+        assert_eq!(cache.get(&key(2), SystemTime::now()), None);
         assert_eq!(cache.entries.lock().unwrap().len(), 1);
         cache.forget(&["upl_1".to_owned()]);
-        assert_eq!(cache.get(&key(1)), None);
+        assert_eq!(cache.get(&key(1), SystemTime::now()), None);
     }
 
     #[test]
@@ -362,11 +401,11 @@ mod tests {
         for n in 0..=255u8 {
             cache.put(key(n), format!("upl_{n}"), later);
         }
-        assert!(cache.get(&key(0)).is_some()); // now the most recently used
+        assert!(cache.get(&key(0), SystemTime::now()).is_some()); // now the most recently used
         cache.put(([9; 32], "image/jpeg".to_owned()), "upl_new".into(), later);
         assert_eq!(cache.entries.lock().unwrap().len(), CACHE_ENTRIES);
-        assert!(cache.get(&key(0)).is_some());
-        assert!(cache.get(&key(1)).is_none());
+        assert!(cache.get(&key(0), SystemTime::now()).is_some());
+        assert!(cache.get(&key(1), SystemTime::now()).is_none());
     }
 
     #[test]

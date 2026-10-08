@@ -1,10 +1,11 @@
 //! The asynchronous client.
 
+use std::collections::HashMap;
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant, SystemTime};
 
 use bytes::Bytes;
 use futures_util::stream::{self, StreamExt};
@@ -13,7 +14,7 @@ use reqwest::Method;
 use serde::Serialize;
 use serde_json::{Map, Value};
 
-use crate::check::check_questions;
+use crate::check::{check_request, object_depth, Limits, Profile};
 use crate::error::{header, retry_after, Error, ErrorKind, Result};
 use crate::http::HttpSettings;
 use crate::image::{check_images, Image};
@@ -42,6 +43,10 @@ pub(crate) const USER_AGENT_VALUE: &str = concat!("decisionnode-rust/", env!("CA
 
 /// A wait between attempts, see [`ClientBuilder::sleeper`].
 pub type Sleeper = Arc<dyn Fn(Duration) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
+
+/// The time the client judges upload URLs and cache entries by, see
+/// [`ClientBuilder::clock`].
+pub type Clock = Arc<dyn Fn() -> SystemTime + Send + Sync>;
 
 /// An empty string counts as not given.
 fn given(value: String) -> Option<String> {
@@ -83,7 +88,8 @@ pub(crate) struct Prepared {
 }
 
 /// Builds a question map, refusing an empty one and a question that cannot
-/// be serialised (argument errors), then checks the API's fixed rules.
+/// be serialised (argument errors). The API's rules are checked on the whole
+/// body afterwards.
 pub(crate) fn build_questions(questions: Vec<(String, Question)>) -> Result<Map<String, Value>> {
     if questions.is_empty() {
         return Err(Error::invalid("questions must hold at least one question"));
@@ -93,7 +99,6 @@ pub(crate) fn build_questions(questions: Vec<(String, Question)>) -> Result<Map<
         let wire = q.into_value().map_err(|e| Error::invalid(format!("question {id:?}: {e}")))?;
         map.insert(id, wire);
     }
-    check_questions(&map)?;
     Ok(map)
 }
 
@@ -157,20 +162,34 @@ impl DecideRequest {
     }
 
     /// Checks the request and builds its body: an empty question map or a
-    /// value that cannot be serialised is an argument error; a question or
-    /// image the API would refuse is the API's own error, before any request.
-    pub(crate) fn prepare(self, default_model: &str) -> Result<Prepared> {
-        let questions = build_questions(self.questions)?;
+    /// value that cannot be serialised is an argument error; a request the
+    /// API would refuse is the API's own error, before any request. On
+    /// `/v1/systemone` a `truth` question is written as `noul`, that path's
+    /// type, before the checks.
+    pub(crate) fn prepare(self, client: &DecisionNode, profile: Profile) -> Result<Prepared> {
+        let mut questions = build_questions(self.questions)?;
+        if profile == Profile::Systemone {
+            for q in questions.values_mut() {
+                if let Some(t) = q.get_mut("type").filter(|t| *t == "truth") {
+                    *t = Value::String("noul".into());
+                }
+            }
+        }
         let state = match self.state {
             None | Some(Ok(Value::Null)) => Value::String(String::new()),
             Some(Ok(v)) => v,
             Some(Err(e)) => return Err(Error::invalid(e)),
         };
-        check_images(&self.images)?;
         let mut body = Map::new();
-        body.insert("model".into(), Value::String(self.model.unwrap_or_else(|| default_model.to_owned())));
+        let model = self.model.unwrap_or_else(|| client.inner.model.clone());
+        let limits = client.limits(&model);
+        body.insert("model".into(), Value::String(model));
         body.insert("state".into(), state);
         body.insert("questions".into(), Value::Object(questions));
+        // The images count toward the nesting as `[{...}]`.
+        let depth = object_depth(&body).max(if self.images.is_empty() { 0 } else { 3 });
+        check_request(&body, depth, profile, &limits, Vec::new())?;
+        check_images(&self.images, &limits)?;
         Ok(Prepared { body, images: self.images })
     }
 }
@@ -237,6 +256,7 @@ pub struct ClientBuilder {
     headers: Vec<(String, String)>,
     http: HttpSettings,
     sleeper: Option<Sleeper>,
+    clock: Option<Clock>,
 }
 
 impl fmt::Debug for ClientBuilder {
@@ -389,6 +409,16 @@ impl ClientBuilder {
         self
     }
 
+    /// Replaces the clock the client judges upload URLs and cached uploads by
+    /// (default: the system clock). Meant for tests that move time.
+    pub fn clock<F>(mut self, clock: F) -> ClientBuilder
+    where
+        F: Fn() -> SystemTime + Send + Sync + 'static,
+    {
+        self.clock = Some(Arc::new(clock));
+        self
+    }
+
     /// Builds the client. Fails, with an error of the base kind and no
     /// status, on a header name or value that is not valid, a base URL that is
     /// not `https` (plain `http` only for `localhost`, `127.0.0.1` and `::1`),
@@ -430,7 +460,9 @@ impl ClientBuilder {
                 headers,
                 http,
                 sleeper: self.sleeper,
+                clock: self.clock,
                 uploads: UploadCache::default(),
+                held: Mutex::new(HashMap::new()),
             }),
         })
     }
@@ -486,7 +518,10 @@ pub(crate) struct Inner {
     pub(crate) headers: HeaderMap,
     pub(crate) http: reqwest::Client,
     pub(crate) sleeper: Option<Sleeper>,
+    pub(crate) clock: Option<Clock>,
     pub(crate) uploads: UploadCache,
+    /// The `/v1/models` entries by name, from the last `models()` call.
+    pub(crate) held: Mutex<HashMap<String, Map<String, Value>>>,
 }
 
 impl fmt::Debug for DecisionNode {
@@ -546,7 +581,7 @@ impl DecisionNode {
     /// is sent. Local images go inline or are uploaded by the inline
     /// threshold.
     pub async fn decide(&self, request: DecideRequest) -> Result<Decision> {
-        let prepared = request.prepare(&self.inner.model)?;
+        let prepared = request.prepare(self, Profile::Decide)?;
         Ok(self.decision_call("/v1/decide", prepared).await?.decision)
     }
 
@@ -556,14 +591,7 @@ impl DecisionNode {
     /// [`TruthAnswer`]. Every other question goes as given; the path answers
     /// `truth`, `choice` and `score` only.
     pub async fn systemone(&self, request: DecideRequest) -> Result<Decision> {
-        let mut prepared = request.prepare(&self.inner.model)?;
-        if let Some(Value::Object(questions)) = prepared.body.get_mut("questions") {
-            for q in questions.values_mut() {
-                if let Some(t) = q.get_mut("type").filter(|t| *t == "truth") {
-                    *t = Value::String("noul".into());
-                }
-            }
-        }
+        let prepared = request.prepare(self, Profile::Systemone)?;
         Ok(self.decision_call("/v1/systemone", prepared).await?.decision)
     }
 
@@ -641,7 +669,9 @@ impl DecisionNode {
         let prepared = requests
             .into_iter()
             .enumerate()
-            .map(|(i, r)| r.prepare(&self.inner.model).map_err(|e| if e.is_argument() { e.in_request(i) } else { e }))
+            .map(|(i, r)| {
+                r.prepare(self, Profile::Decide).map_err(|e| if e.is_argument() { e.in_request(i) } else { e })
+            })
             .collect::<Result<Vec<_>>>()?;
         Ok(stream::iter(prepared)
             .map(|p| async move { self.decision_call("/v1/decide", p).await.map(|a| a.decision) })
@@ -653,7 +683,7 @@ impl DecisionNode {
     /// Sends a one-question helper request and returns its decision with the
     /// response's status and headers, for `take_answer`.
     async fn ask(&self, request: DecideRequest) -> Result<Answered> {
-        let prepared = request.prepare(&self.inner.model)?;
+        let prepared = request.prepare(self, Profile::Decide)?;
         self.decision_call("/v1/decide", prepared).await
     }
 
@@ -768,10 +798,29 @@ impl DecisionNode {
     }
 
     /// Lists the models the key may use, with their published limits (the
-    /// number grid, upload, session and batch limits included).
+    /// number grid, upload, session and batch limits included). The client
+    /// keeps the list and checks later requests against the limits it states.
     pub async fn models(&self) -> Result<Vec<ModelInfo>> {
         let reply = self.request_json(Method::GET, "/v1/models", None, Policy::Default).await?;
-        ModelInfo::list_from(reply.body, reply.status, &reply.headers)
+        let models = ModelInfo::list_from(reply.body, reply.status, &reply.headers)?;
+        // Held for the local checks: a limit only /v1/models states is
+        // checked once the client knows it.
+        let held = models.iter().filter_map(|m| Some((m.name.clone(), m.raw.as_object()?.clone()))).collect();
+        *self.inner.held.lock().unwrap_or_else(|e| e.into_inner()) = held;
+        Ok(models)
+    }
+
+    /// The held `/v1/models` entry of a model, for the local checks.
+    pub(crate) fn limits(&self, model: &str) -> Limits {
+        Limits::of(model, &self.inner.held.lock().unwrap_or_else(|e| e.into_inner()))
+    }
+
+    /// The client's time: the system clock, or the one a test set.
+    pub(crate) fn now(&self) -> SystemTime {
+        match &self.inner.clock {
+            Some(clock) => clock(),
+            None => SystemTime::now(),
+        }
     }
 
     /// Sends a body to `POST /v1/decide` exactly as given and returns the
@@ -1068,7 +1117,8 @@ mod tests {
     use serde_json::json;
 
     fn body(request: DecideRequest) -> Result<Value> {
-        request.prepare("decisionnode-latest").map(|p| Value::Object(p.body))
+        let dn = DecisionNode::builder().model("decisionnode-latest").build().unwrap();
+        request.prepare(&dn, Profile::Decide).map(|p| Value::Object(p.body))
     }
 
     #[test]
@@ -1156,7 +1206,9 @@ mod tests {
             headers: dn.inner.headers.clone(),
             http: dn.inner.http.clone(),
             sleeper: None,
+            clock: None,
             uploads: UploadCache::default(),
+            held: Mutex::new(HashMap::new()),
         }
     }
 

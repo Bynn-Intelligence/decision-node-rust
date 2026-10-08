@@ -233,7 +233,7 @@ impl Batches<'_> {
     }
 
     /// See [`crate::Batches::list`].
-    pub fn list(&self, offset: Option<u64>, limit: Option<u64>) -> Result<BatchPage> {
+    pub fn list(&self, offset: Option<i64>, limit: Option<i64>) -> Result<BatchPage> {
         self.client.run(self.client.client.batches().list(offset, limit))
     }
 

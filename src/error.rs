@@ -175,6 +175,21 @@ impl Error {
         e
     }
 
+    /// The API's `422` for a request refused before anything is sent: the
+    /// entries the server would list, no status, no request id.
+    pub(crate) fn local_entries(entries: Vec<Value>) -> Error {
+        let mut e = Error::local(ErrorKind::Validation, None, "");
+        e.inner.entries = Some(entries);
+        e
+    }
+
+    /// What `x-decisionnode-error` would say about a request refused before
+    /// anything is sent.
+    pub(crate) fn with_reason(mut self, reason: impl Into<String>) -> Error {
+        self.inner.reason = Some(reason.into());
+        self
+    }
+
     /// A storage `PUT` that failed: the base kind with the storage's status,
     /// `error_type` `upload_failed` and the storage's error code in `reason`.
     pub(crate) fn upload_failed(status: u16, body: &[u8]) -> Error {

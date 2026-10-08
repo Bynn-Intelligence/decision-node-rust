@@ -21,9 +21,10 @@ use tokio_tungstenite::tungstenite::protocol::CloseFrame;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
+use crate::check::{check_session_open, nesting_depth, object_depth, usage_error, MAX_NESTING};
 use crate::client::{build_questions, is_loopback, DecisionNode, Policy, USER_AGENT_VALUE};
 use crate::error::{Error, ErrorKind, Result};
-use crate::image::{check_image, Image};
+use crate::image::{check_images, Image};
 use crate::question::Question;
 use crate::response::{Answer, Usage};
 use crate::safety::Safety;
@@ -31,6 +32,9 @@ use crate::safety::Safety;
 /// The close codes after which a session is gone and a new one is opened
 /// with the same body: `1001`, `1006`, `1011`, `4404`, `4408`, `4409`, `4410`.
 pub const REOPEN_CODES: [u16; 7] = [1001, 1006, 1011, 4404, 4408, 4409, 4410];
+
+/// The largest `seq` a frame may carry: 2^53 - 1.
+const MAX_SEQ: i64 = (1 << 53) - 1;
 
 /// How long [`DecisionNode::supervise`] waits for the outstanding replies
 /// once its feed has ended.
@@ -57,8 +61,8 @@ pub struct SessionOptions {
     instructions: Option<std::result::Result<Value, String>>,
     questions: Vec<(String, Question)>,
     model: Option<String>,
-    window: Option<u64>,
-    ttl_seconds: Option<u64>,
+    window: Option<i64>,
+    ttl_seconds: Option<i64>,
 }
 
 fn json_of(value: impl Serialize, what: &str) -> std::result::Result<Value, String> {
@@ -116,22 +120,26 @@ impl SessionOptions {
 
     /// How many frames each frame is answered with, itself included (1 to
     /// 64, default 8 on the server).
-    pub fn window(mut self, window: u64) -> SessionOptions {
+    pub fn window(mut self, window: i64) -> SessionOptions {
         self.window = Some(window);
         self
     }
 
     /// The session's lifetime in seconds from the open (1 to 3,600, default
     /// 300 on the server).
-    pub fn ttl_seconds(mut self, ttl_seconds: u64) -> SessionOptions {
+    pub fn ttl_seconds(mut self, ttl_seconds: i64) -> SessionOptions {
         self.ttl_seconds = Some(ttl_seconds);
         self
     }
 
-    fn body(self, default_model: &str) -> Result<Value> {
+    /// Builds the open body and checks it: an empty question map is an
+    /// argument error; a body the API would refuse is its own error.
+    fn body(self, client: &DecisionNode) -> Result<Value> {
         let questions = build_questions(self.questions)?;
         let mut body = Map::new();
-        body.insert("model".into(), Value::String(self.model.unwrap_or_else(|| default_model.to_owned())));
+        let model = self.model.unwrap_or_else(|| client.inner.model.clone());
+        let limits = client.limits(&model);
+        body.insert("model".into(), Value::String(model));
         if let Some(i) = self.instructions {
             body.insert("instructions".into(), i.map_err(Error::invalid)?);
         }
@@ -145,6 +153,7 @@ impl SessionOptions {
         if let Some(t) = self.ttl_seconds {
             body.insert("ttl_seconds".into(), t.into());
         }
+        check_session_open(&body, object_depth(&body), &limits)?;
         Ok(Value::Object(body))
     }
 }
@@ -164,7 +173,7 @@ pub struct Frame {
     image: Option<Image>,
     questions: Option<Vec<String>>,
     reset: Option<bool>,
-    seq: Option<u64>,
+    seq: Option<i64>,
 }
 
 impl Frame {
@@ -211,7 +220,7 @@ impl Frame {
 
     /// The frame's own number, carried back in its reply. By default the
     /// session counts from 1.
-    pub fn seq(mut self, seq: u64) -> Frame {
+    pub fn seq(mut self, seq: i64) -> Frame {
         self.seq = Some(seq);
         self
     }
@@ -570,24 +579,18 @@ impl Session {
     /// checked as in a request and sent inline or uploaded by the client's
     /// inline threshold; a URL is refused locally, since frames take none.
     pub async fn send(&self, frame: Frame) -> Result<u64> {
+        let value = frame.frame.transpose().map_err(Error::invalid)?;
+        self.check_frame(frame.seq, value.as_ref(), frame.image.as_ref(), frame.questions.as_deref())?;
         let seq = match frame.seq {
-            Some(s) => s,
+            Some(s) => s as u64,
             None => self.seq.fetch_add(1, Ordering::Relaxed) + 1,
         };
         let mut message = Map::new();
         message.insert("seq".into(), seq.into());
-        if let Some(f) = frame.frame {
-            message.insert("frame".into(), f.map_err(Error::invalid)?);
+        if let Some(f) = value {
+            message.insert("frame".into(), f);
         }
         if let Some(image) = frame.image {
-            if image.is_url() {
-                return Err(Error::local(
-                    ErrorKind::BadRequest,
-                    Some("api_usage_error"),
-                    "A frame's image takes bytes or an upload, not a url.",
-                ));
-            }
-            check_image(&image)?;
             let placed = self.client.place_images(std::slice::from_ref(&image), false, false).await?;
             message.insert("image".into(), placed.wires.into_iter().next().unwrap_or(Value::Null));
         }
@@ -604,6 +607,51 @@ impl Session {
             Error::new(ErrorKind::Connection, format!("the frame could not be sent: {e}")).with_source(e)
         })?;
         Ok(seq)
+    }
+
+    /// A frame's fixed rules, checked before anything is sent: the frame
+    /// error the server would send, as a [`ErrorKind::BadRequest`] error
+    /// (`api_usage_error`). Nothing goes on the socket and no `seq` is used.
+    fn check_frame(
+        &self,
+        seq: Option<i64>,
+        frame: Option<&Value>,
+        image: Option<&Image>,
+        questions: Option<&[String]>,
+    ) -> Result<()> {
+        if seq.is_some_and(|s| !(0..=MAX_SEQ).contains(&s)) {
+            return Err(usage_error(format!("seq: must be an integer from 0 to {MAX_SEQ}.")));
+        }
+        if frame.is_none() && image.is_none() {
+            return Err(usage_error("frame: a frame needs a frame value or an image."));
+        }
+        if frame.is_some_and(|f| !(f.is_string() || f.is_object() || f.is_array()) || f == "") {
+            return Err(usage_error("frame: must be a string, an object or an array, not empty."));
+        }
+        if let Some(ids) = questions {
+            if ids.is_empty() {
+                return Err(usage_error("questions: must be a non-empty list of the session's question ids."));
+            }
+            let known = self.questions();
+            if self.raw.get("questions").is_some_and(Value::is_array) {
+                if let Some(unknown) = ids.iter().find(|id| !known.contains(&id.as_str())) {
+                    return Err(usage_error(format!("questions: unknown question id '{unknown}'")));
+                }
+            }
+        }
+        if frame.is_some_and(|f| nesting_depth(f) + 1 > MAX_NESTING) {
+            return Err(usage_error(format!(
+                "The frame nests more than {MAX_NESTING} objects and arrays inside each other."
+            )));
+        }
+        if let Some(image) = image {
+            if image.is_url() {
+                return Err(usage_error("image: a frame takes bytes or an upload, not a url."));
+            }
+            let model = self.model().map(str::to_owned).unwrap_or_else(|| self.client.inner.model.clone());
+            check_images(std::slice::from_ref(image), &self.client.limits(&model))?;
+        }
+        Ok(())
     }
 
     /// The next event: a [`Reply`], a [`FrameError`], or
@@ -711,7 +759,7 @@ impl DecisionNode {
     /// # }
     /// ```
     pub async fn open_session(&self, options: SessionOptions) -> Result<Session> {
-        let body = options.body(&self.inner.model)?;
+        let body = options.body(self)?;
         let reply = self.request_json(Method::POST, "/v1/sessions", Some(&body), Policy::SessionOpen).await?;
         Session::from_open(self.clone(), reply.body, reply.status, &reply.headers)
     }
@@ -917,13 +965,14 @@ mod tests {
 
     #[test]
     fn open_bodies_send_only_what_is_given() {
-        let body = SessionOptions::new().question("abort", crate::truth("Abort?")).body("decisionnode-latest").unwrap();
+        let dn = DecisionNode::builder().model("decisionnode-latest").build().unwrap();
+        let body = SessionOptions::new().question("abort", crate::truth("Abort?")).body(&dn).unwrap();
         assert_eq!(
             body,
             json!({"model": "decisionnode-latest", "questions": {"abort": {"type": "truth", "instructions": "Abort?"}}})
         );
-        assert!(SessionOptions::new().body("m").unwrap_err().is_argument());
-        let local = SessionOptions::new().question("s", crate::score("?", Vec::<String>::new())).body("m").unwrap_err();
+        assert!(SessionOptions::new().body(&dn).unwrap_err().is_argument());
+        let local = SessionOptions::new().question("s", crate::score("?", Vec::<String>::new())).body(&dn).unwrap_err();
         assert_eq!(local.kind(), ErrorKind::Validation);
     }
 }

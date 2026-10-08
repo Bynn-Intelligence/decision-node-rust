@@ -2,6 +2,7 @@
 //! before a request leaves the client.
 
 use std::fmt;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::Path;
 use std::sync::{Arc, OnceLock};
 
@@ -10,6 +11,7 @@ use bytes::Bytes;
 use serde_json::{Map, Value};
 use sha2::Digest;
 
+use crate::check::Limits;
 use crate::error::{Error, ErrorKind, Result};
 
 /// The most images one request (or one batch line) may carry, URLs included.
@@ -20,6 +22,8 @@ pub(crate) const MAX_IMAGE_BYTES: usize = 10 * 1024 * 1024;
 pub(crate) const MAX_IMAGE_PIXELS: u64 = 40_000_000;
 /// The longest image URL the API takes, in characters.
 pub(crate) const MAX_URL_CHARS: usize = 2048;
+/// The media types the API takes.
+const MEDIA_TYPES: [&str; 3] = ["image/jpeg", "image/png", "image/webp"];
 
 /// An image every question in the request can see, together with the state.
 ///
@@ -383,36 +387,116 @@ fn refuse(message: String) -> Error {
     Error::local(ErrorKind::BadRequest, Some("api_usage_error"), message)
 }
 
-/// The API's fixed image rules, checked before any request: at most 4 images;
-/// a URL `https` and at most 2,048 characters; local bytes JPEG, PNG or WebP by
-/// their first bytes (a declared type must match), at most 10 MB and at most
-/// 40 megapixels by their header; ids unique. A fault is a
+/// A literal IPv4 address in a range the API never fetches from.
+fn blocked_v4(ip: Ipv4Addr) -> bool {
+    let n = u32::from(ip);
+    const RANGES: [(u32, u32); 16] = [
+        (0x0000_0000, 8),  // 0.0.0.0/8
+        (0x0A00_0000, 8),  // 10.0.0.0/8
+        (0x6440_0000, 10), // 100.64.0.0/10
+        (0x7F00_0000, 8),  // 127.0.0.0/8
+        (0xA9FE_0000, 16), // 169.254.0.0/16
+        (0xAC10_0000, 12), // 172.16.0.0/12
+        (0xC000_0000, 24), // 192.0.0.0/24
+        (0xC000_0200, 24), // 192.0.2.0/24
+        (0xC058_6300, 24), // 192.88.99.0/24
+        (0xC0A8_0000, 16), // 192.168.0.0/16
+        (0xC612_0000, 15), // 198.18.0.0/15
+        (0xC633_6400, 24), // 198.51.100.0/24
+        (0xCB00_7100, 24), // 203.0.113.0/24
+        (0xE000_0000, 4),  // 224.0.0.0/4
+        (0xF000_0000, 4),  // 240.0.0.0/4
+        (0xFFFF_FFFF, 32), // 255.255.255.255/32
+    ];
+    RANGES.iter().any(|&(net, bits)| n >> (32 - bits) == net >> (32 - bits))
+}
+
+/// A literal IPv6 address in a range the API never fetches from; an
+/// IPv4-mapped or NAT64 address by the IPv4 address it embeds.
+fn blocked_v6(ip: Ipv6Addr) -> bool {
+    let n = u128::from(ip);
+    if n >> 32 == 0xFFFF || n >> 32 == 0x0064_FF9B_0000_0000_0000_0000 {
+        return blocked_v4(Ipv4Addr::from(n as u32));
+    }
+    const RANGES: [(u128, u32); 7] = [
+        (0, 128),                           // ::/128
+        (1, 128),                           // ::1/128
+        (0xFC00 << 112, 7),                 // fc00::/7
+        (0xFE80 << 112, 10),                // fe80::/10
+        (0xFF00 << 112, 8),                 // ff00::/8
+        (0x2001_0DB8 << 96, 32),            // 2001:db8::/32
+        ((0xFD00_0EC2 << 96) | 0x254, 128), // fd00:ec2::254/128
+    ];
+    RANGES.iter().any(|&(net, bits)| n >> (128 - bits) == net >> (128 - bits))
+}
+
+/// The URL rules that need no network: `https` (else the API's
+/// `api_usage_error`), then `image_url_refused` for over 2,048 characters,
+/// user information, a port other than 443, no host or a literal address in
+/// a blocked range. A DNS name is the server's to resolve and judge.
+fn check_url(id: &str, url: &str) -> Result<()> {
+    if !url.starts_with("https://") {
+        return Err(refuse(format!("Image {id}: only https URLs are accepted.")));
+    }
+    let reason = if url.chars().count() > MAX_URL_CHARS {
+        Some(format!("the URL is {} characters, over the limit of {MAX_URL_CHARS}", url.chars().count()))
+    } else {
+        match reqwest::Url::parse(url) {
+            Err(_) => Some("the URL has no host".to_owned()),
+            Ok(u) if !u.username().is_empty() || u.password().is_some() => {
+                Some("the URL carries user information".to_owned())
+            }
+            Ok(u) if u.port().is_some_and(|p| p != 443) => Some("the URL uses a port other than 443".to_owned()),
+            Ok(u) => match u.host_str().filter(|h| !h.is_empty()) {
+                None => Some("the URL has no host".to_owned()),
+                Some(host) => match host.trim_start_matches('[').trim_end_matches(']').parse::<IpAddr>() {
+                    Ok(IpAddr::V4(ip)) if blocked_v4(ip) => Some("the URL resolves to a private address".to_owned()),
+                    Ok(IpAddr::V6(ip)) if blocked_v6(ip) => Some("the URL resolves to a private address".to_owned()),
+                    _ => None,
+                },
+            },
+        }
+    };
+    match reason {
+        Some(r) => Err(Error::local(ErrorKind::BadRequest, Some("image_url_refused"), format!("Image '{id}': {r}."))),
+        None => Ok(()),
+    }
+}
+
+/// The API's image rules, checked before any request: at most 4 images
+/// (URLs included; a held `max_images` replaces the bound); ids present and
+/// unique; a URL by [`check_url`]; an upload reference's media type one of
+/// the three; local bytes JPEG, PNG or WebP by their first bytes (a declared
+/// type must match), at most 10 MB (or the held `max_image_bytes`) and at
+/// most 40 megapixels by their header. A fault is a
 /// [`ErrorKind::BadRequest`] error with no status, as the API would answer.
-pub(crate) fn check_images(images: &[Image]) -> Result<()> {
-    if images.len() > MAX_IMAGES {
-        return Err(refuse(format!("Too many images. Must have at most {MAX_IMAGES} images.")));
+pub(crate) fn check_images(images: &[Image], limits: &Limits) -> Result<()> {
+    let most = limits.count(&["max_images"]).map_or(MAX_IMAGES, |n| n as usize);
+    let biggest = limits.count(&["max_image_bytes"]).map_or(MAX_IMAGE_BYTES, |n| n as usize);
+    if images.len() > most {
+        return Err(refuse(format!("Too many images. Must have at most {most} images.")));
     }
     for (n, image) in images.iter().enumerate() {
-        if images[..n].iter().any(|other| other.id == image.id) {
-            return Err(refuse(format!("Image ids must be unique; {:?} is given twice.", image.id)));
+        if image.id.is_empty() {
+            return Err(refuse(format!("Image {n} needs an id.")));
         }
-        check_image(image)?;
+        if images[..n].iter().any(|other| other.id == image.id) {
+            return Err(refuse(format!("Duplicate image id: {}", image.id)));
+        }
+        check_image(image, biggest)?;
     }
     Ok(())
 }
 
-/// The rules of one image, without the count.
-pub(crate) fn check_image(image: &Image) -> Result<()> {
+fn check_image(image: &Image, biggest: usize) -> Result<()> {
     let id = &image.id;
     match &image.source {
-        Source::Url(url) => {
-            if !url.starts_with("https://") || url.chars().count() > MAX_URL_CHARS {
-                return Err(refuse(format!(
-                    "Image {id}: only https URLs of at most {MAX_URL_CHARS} characters are accepted."
-                )));
+        Source::Url(url) => check_url(id, url)?,
+        Source::Upload { media_type, .. } => {
+            if media_type.as_deref().is_some_and(|t| !MEDIA_TYPES.contains(&t)) {
+                return Err(refuse(format!("Image {id}: media_type must be image/jpeg, image/png or image/webp.")));
             }
         }
-        Source::Upload { .. } => {}
         Source::Local(local) => {
             let Some(found) = local.sniffed else {
                 return Err(refuse(format!("Image {id} is not a JPEG, PNG or WebP image.")));
@@ -422,7 +506,7 @@ pub(crate) fn check_image(image: &Image) -> Result<()> {
                     return Err(refuse(format!("Image {id} could not be decoded as {declared}.")));
                 }
             }
-            if local.data.len() > MAX_IMAGE_BYTES {
+            if local.data.len() > biggest {
                 return Err(refuse(format!("Image {id} is larger than 10 MB.")));
             }
             let Some((w, h)) = dimensions(&local.data, found) else {
@@ -524,8 +608,12 @@ mod tests {
         assert_eq!(dimensions(&bad_signature, "image/webp"), None);
     }
 
+    fn check_images_default(images: &[Image]) -> Result<()> {
+        check_images(images, &Limits::default())
+    }
+
     fn refused(images: &[Image]) -> Error {
-        let e = check_images(images).unwrap_err();
+        let e = check_images(images, &Limits::default()).unwrap_err();
         assert_eq!(e.kind(), ErrorKind::BadRequest);
         assert_eq!(e.status(), None);
         assert_eq!(e.request_id(), None);
@@ -534,23 +622,40 @@ mod tests {
 
     #[test]
     fn local_checks() {
-        assert!(check_images(&[Image::bytes("a", PNG_2X2)]).is_ok());
-        assert!(check_images(&[Image::bytes_with_type("a", JPEG_300X200, "image/jpeg")]).is_ok());
+        assert!(check_images_default(&[Image::bytes("a", PNG_2X2)]).is_ok());
+        assert!(check_images_default(&[Image::bytes_with_type("a", JPEG_300X200, "image/jpeg")]).is_ok());
         refused(&[Image::bytes("g", &b"GIF89a...."[..])]);
         refused(&[Image::bytes_with_type("p", JPEG_300X200, "image/png")]);
         refused(&[Image::bytes("big", PNG_8000X6000)]);
         refused(&[Image::bytes("w", WEBP_VP8X_10000X5000)]);
-        assert!(check_images(&[Image::bytes("w", WEBP_VP8L_100X50)]).is_ok());
+        assert!(check_images_default(&[Image::bytes("w", WEBP_VP8L_100X50)]).is_ok());
         let mut padded = PNG_2X2.to_vec();
         padded.resize(MAX_IMAGE_BYTES + 1, 0);
         refused(&[Image::bytes("over", padded)]);
         let five: Vec<Image> = (0..5).map(|i| Image::url(format!("u{i}"), "https://example.com/x.png")).collect();
         refused(&five);
-        refused(&[Image::url("u", "http://example.com/x.png")]);
-        refused(&[Image::url("u", format!("https://example.com/{}", "a".repeat(2040)))]);
-        assert!(check_images(&[Image::url("u", format!("https://e.co/{}", "a".repeat(2035)))]).is_ok());
+        assert_eq!(refused(&[Image::url("u", "http://example.com/x.png")]).error_type(), Some("api_usage_error"));
+        for bad in [
+            format!("https://example.com/{}", "a".repeat(2040)),
+            "https://user:pw@example.com/x.png".to_owned(),
+            "https://example.com:8443/x.png".to_owned(),
+            "https://127.0.0.1/x.png".to_owned(),
+            "https://169.254.169.254/latest".to_owned(),
+            "https://[::1]/x.png".to_owned(),
+            "https://[::ffff:10.0.0.1]/x.png".to_owned(),
+            "https://[64:ff9b::a00:1]/x.png".to_owned(),
+            "https://[fd00:ec2::254]/x.png".to_owned(),
+        ] {
+            assert_eq!(refused(&[Image::url("u", bad.clone())]).error_type(), Some("image_url_refused"), "{bad}");
+        }
+        for good in ["https://example.com:443/x.png", "https://8.8.8.8/x.png", "https://[2606:4700::1]/x.png"] {
+            assert!(check_images_default(&[Image::url("u", good)]).is_ok(), "{good}");
+        }
+        assert_eq!(refused(&[Image::url("", "https://example.com/x.png")]).message(), "Image 0 needs an id.");
+        refused(&[Image::upload_id_with_type("u", "upl_0", "image/gif")]);
+        assert!(check_images_default(&[Image::url("u", format!("https://e.co/{}", "a".repeat(2035)))]).is_ok());
         refused(&[Image::bytes("a", PNG_2X2), Image::url("a", "https://example.com/x.png")]);
-        assert!(check_images(&[Image::upload_id("u", "upl_0")]).is_ok());
+        assert!(check_images_default(&[Image::upload_id("u", "upl_0")]).is_ok());
     }
 
     #[test]

@@ -1,6 +1,7 @@
 //! The Batch API: up to 10,000 decide requests answered within 24 hours at
 //! half the price, with results kept for 7 days.
 
+use std::collections::HashSet;
 use std::fmt;
 use std::time::{Duration, Instant};
 
@@ -10,10 +11,13 @@ use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use reqwest::Method;
 use serde_json::{Map, Value};
 
+use crate::check::{usage_error, Profile};
 use crate::client::{DecideRequest, DecisionNode, Payload, Policy, Prepared};
 use crate::error::{retry_after, Error, ErrorKind, Result};
 use crate::response::{Decision, Usage};
 
+/// The largest page of [`Batches::list`].
+const MAX_LIST_LIMIT: i64 = 100;
 /// The largest body of one `add` call; a longer list is split into several
 /// calls, in order.
 pub(crate) const MAX_ADD_BYTES: usize = 10 * 1024 * 1024;
@@ -38,19 +42,27 @@ pub const DEFAULT_BATCH_TIMEOUT: Duration = Duration::from_secs(26 * 3600);
 /// ```
 #[derive(Clone, Debug, PartialEq)]
 pub struct BatchRequest {
-    custom_id: String,
+    custom_id: Option<String>,
     request: DecideRequest,
 }
 
 impl BatchRequest {
     /// A request under `custom_id`: 1 to 512 characters, unique in the batch.
     pub fn new(custom_id: impl Into<String>, request: DecideRequest) -> BatchRequest {
-        BatchRequest { custom_id: custom_id.into(), request }
+        BatchRequest { custom_id: Some(custom_id.into()), request }
     }
 
-    /// The `custom_id`.
-    pub fn custom_id(&self) -> &str {
-        &self.custom_id
+    /// The `custom_id`, if one was given. A request without one is refused
+    /// before anything is sent.
+    pub fn custom_id(&self) -> Option<&str> {
+        self.custom_id.as_deref()
+    }
+}
+
+/// A request without a `custom_id` yet; see [`BatchRequest::new`].
+impl From<DecideRequest> for BatchRequest {
+    fn from(request: DecideRequest) -> BatchRequest {
+        BatchRequest { custom_id: None, request }
     }
 }
 
@@ -369,7 +381,7 @@ impl DecisionNode {
                 poll_interval.as_secs_f64()
             )));
         }
-        let lines = self.prepare_lines(requests)?;
+        let lines = self.prepare_lines(requests, true)?;
         let started = Instant::now();
         let batches = self.batches();
         let draft = batches.create_lines(Vec::new()).await?;
@@ -400,17 +412,59 @@ impl DecisionNode {
         Ok(BatchRun { batch, results })
     }
 
-    /// Checks every request before anything is sent.
-    fn prepare_lines(&self, requests: impl IntoIterator<Item = BatchRequest>) -> Result<Vec<Line>> {
+    /// Checks every request of one call before anything is sent: the
+    /// `custom_id` rules (lines numbered from 1 within the call), an empty
+    /// `add`, the held `batch` limits (`requests_per_batch`,
+    /// `max_custom_id_chars`), then each line as a decide request.
+    fn prepare_lines(&self, requests: impl IntoIterator<Item = BatchRequest>, allow_empty: bool) -> Result<Vec<Line>> {
+        let requests: Vec<BatchRequest> = requests.into_iter().collect();
+        if requests.is_empty() && !allow_empty {
+            return Err(usage_error("The call holds no requests."));
+        }
+        let limits = self.limits(&self.inner.model);
+        if let Some(most) = limits.count(&["batch", "requests_per_batch"]) {
+            if requests.len() as u64 > most {
+                return Err(usage_error(format!(
+                    "The batch would hold {} requests. The limit is {most}.",
+                    requests.len()
+                )));
+            }
+        }
+        let longest = limits.count(&["batch", "max_custom_id_chars"]);
+        let mut seen = HashSet::new();
+        for (n, r) in requests.iter().enumerate().map(|(i, r)| (i + 1, r)) {
+            let Some(id) = &r.custom_id else {
+                return Err(usage_error(format!("Line {n} has no custom_id.")));
+            };
+            let chars = id.chars().count() as u64;
+            if chars < 1 || longest.is_some_and(|most| chars > most) {
+                return Err(usage_error(format!(
+                    "Line {n}: custom_id must be a string of 1 to {} characters.",
+                    longest.unwrap_or(512)
+                )));
+            }
+            if !seen.insert(id.as_str()) {
+                let shown = Value::String(id.clone()).to_string();
+                let shown = if shown.chars().count() <= 64 {
+                    shown
+                } else {
+                    format!("{}...", shown.chars().take(64).collect::<String>())
+                };
+                return Err(usage_error(format!("Line {n}: custom_id {shown} is already in the batch.")));
+            }
+        }
         requests
             .into_iter()
             .enumerate()
             .map(|(i, r)| {
-                let prepared =
-                    r.request
-                        .prepare(&self.inner.model)
-                        .map_err(|e| if e.is_argument() { e.in_request(i) } else { e })?;
-                Ok(Line { custom_id: r.custom_id, prepared })
+                let prepared = r.request.prepare(self, Profile::Decide).map_err(|e| {
+                    if e.is_argument() {
+                        e.in_request(i)
+                    } else {
+                        e
+                    }
+                })?;
+                Ok(Line { custom_id: r.custom_id.unwrap_or_default(), prepared })
             })
             .collect()
     }
@@ -477,7 +531,7 @@ impl Batches<'_> {
     /// model (the request's, else the client's) and the state (`""` when the
     /// request has none). Every request is checked before anything is sent.
     pub async fn create(&self, requests: impl IntoIterator<Item = BatchRequest>) -> Result<Batch> {
-        let lines = self.client.prepare_lines(requests)?;
+        let lines = self.client.prepare_lines(requests, true)?;
         self.create_lines(lines).await
     }
 
@@ -491,12 +545,9 @@ impl Batches<'_> {
 
     /// `POST /v1/batches/{id}/requests`: adds requests to a draft, in calls
     /// of at most 10 MiB each, in order. Returns the batch after the last
-    /// call.
+    /// call. An `add` without requests is refused before anything is sent.
     pub async fn add(&self, batch_id: &str, requests: impl IntoIterator<Item = BatchRequest>) -> Result<Batch> {
-        let lines = self.client.prepare_lines(requests)?;
-        if lines.is_empty() {
-            return Err(Error::invalid("add needs at least one request"));
-        }
+        let lines = self.client.prepare_lines(requests, false)?;
         self.add_lines(batch_id, lines).await
     }
 
@@ -548,8 +599,18 @@ impl Batches<'_> {
     }
 
     /// `GET /v1/batches`: one page of the key's batches, newest first.
-    /// `offset` defaults to 0 and `limit` to 20 (at most 100) on the server.
-    pub async fn list(&self, offset: Option<u64>, limit: Option<u64>) -> Result<BatchPage> {
+    /// `offset` defaults to 0 and `limit` to 20 on the server. An `offset`
+    /// below 0 or a `limit` outside 1 to 100 is refused before anything is
+    /// sent, with the API's own error.
+    pub async fn list(&self, offset: Option<i64>, limit: Option<i64>) -> Result<BatchPage> {
+        if let Some(o) = offset.filter(|o| *o < 0) {
+            return Err(usage_error(format!("Query parameter offset must be an integer of 0 or more, got {o}.")));
+        }
+        if let Some(l) = limit.filter(|l| !(1..=MAX_LIST_LIMIT).contains(l)) {
+            return Err(usage_error(format!(
+                "Query parameter limit must be an integer from 1 to {MAX_LIST_LIMIT}, got {l}."
+            )));
+        }
         let mut query = Vec::new();
         if let Some(o) = offset {
             query.push(format!("offset={o}"));
