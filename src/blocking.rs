@@ -1,7 +1,8 @@
 //! A synchronous client, enabled with the `blocking` feature.
 //!
 //! It has the same methods as the asynchronous [`crate::DecisionNode`] and
-//! returns their results directly: decisions and uploads. It runs them on a small runtime of its own, so it
+//! returns their results directly: decisions, uploads, the Batch API through
+//! [`DecisionNode::batches`]. It runs them on a small runtime of its own, so it
 //! must not be used from inside an asynchronous context: use the asynchronous
 //! client there.
 //!
@@ -20,6 +21,9 @@ use std::sync::Arc;
 use serde::Serialize;
 use serde_json::Value;
 
+use std::time::Duration;
+
+use crate::batch::{Batch, BatchPage, BatchRequest, BatchResults, BatchRun};
 use crate::client::{CallOptions, ClientBuilder, DecideRequest};
 use crate::error::{Error, ErrorKind, Result};
 use crate::image::Image;
@@ -177,5 +181,68 @@ impl DecisionNode {
     /// See [`crate::DecisionNode::upload`].
     pub fn upload(&self, images: impl IntoIterator<Item = Image>) -> Result<Vec<String>> {
         self.run(self.client.upload(images))
+    }
+
+    /// The Batch API. See [`crate::DecisionNode::batches`].
+    pub fn batches(&self) -> Batches<'_> {
+        Batches { client: self }
+    }
+
+    /// See [`crate::DecisionNode::run_batch`].
+    pub fn run_batch(&self, requests: impl IntoIterator<Item = BatchRequest>) -> Result<BatchRun> {
+        self.run(self.client.run_batch(requests))
+    }
+
+    /// See [`crate::DecisionNode::run_batch_with`].
+    pub fn run_batch_with(
+        &self,
+        requests: impl IntoIterator<Item = BatchRequest>,
+        poll_interval: Duration,
+        timeout: Duration,
+    ) -> Result<BatchRun> {
+        self.run(self.client.run_batch_with(requests, poll_interval, timeout))
+    }
+}
+
+/// The Batch API of a blocking client. See [`crate::Batches`].
+#[derive(Clone, Copy, Debug)]
+pub struct Batches<'a> {
+    client: &'a DecisionNode,
+}
+
+impl Batches<'_> {
+    /// See [`crate::Batches::create`].
+    pub fn create(&self, requests: impl IntoIterator<Item = BatchRequest>) -> Result<Batch> {
+        self.client.run(self.client.client.batches().create(requests))
+    }
+
+    /// See [`crate::Batches::add`].
+    pub fn add(&self, batch_id: &str, requests: impl IntoIterator<Item = BatchRequest>) -> Result<Batch> {
+        self.client.run(self.client.client.batches().add(batch_id, requests))
+    }
+
+    /// See [`crate::Batches::finalize`].
+    pub fn finalize(&self, batch_id: &str) -> Result<Batch> {
+        self.client.run(self.client.client.batches().finalize(batch_id))
+    }
+
+    /// See [`crate::Batches::get`].
+    pub fn get(&self, batch_id: &str) -> Result<Batch> {
+        self.client.run(self.client.client.batches().get(batch_id))
+    }
+
+    /// See [`crate::Batches::list`].
+    pub fn list(&self, offset: Option<u64>, limit: Option<u64>) -> Result<BatchPage> {
+        self.client.run(self.client.client.batches().list(offset, limit))
+    }
+
+    /// See [`crate::Batches::results`].
+    pub fn results(&self, batch_id: &str) -> Result<BatchResults> {
+        self.client.run(self.client.client.batches().results(batch_id))
+    }
+
+    /// See [`crate::Batches::cancel`].
+    pub fn cancel(&self, batch_id: &str) -> Result<Batch> {
+        self.client.run(self.client.client.batches().cancel(batch_id))
     }
 }

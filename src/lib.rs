@@ -9,7 +9,8 @@
 //!
 //! Beside [`DecisionNode::decide`] it covers every public call: the strict
 //! [`DecisionNode::systemone`] path, [`DecisionNode::models`], image uploads
-//! ([`DecisionNode::upload`], also chosen for you by size),.
+//! ([`DecisionNode::upload`], also chosen for you by size), and the Batch API ([`DecisionNode::batches`],
+//! [`DecisionNode::run_batch`]).
 //!
 //! ```no_run
 //! use decisionnode::{choice, score, truth, DecideRequest, DecisionNode};
@@ -40,6 +41,7 @@
 #![cfg_attr(docsrs, feature(doc_cfg))]
 #![deny(missing_docs)]
 
+mod batch;
 #[cfg(feature = "blocking")]
 pub mod blocking;
 mod check;
@@ -52,6 +54,10 @@ mod response;
 mod safety;
 mod upload;
 
+pub use batch::{
+    Batch, BatchCounters, BatchPage, BatchRequest, BatchResult, BatchResults, BatchRun, BatchStatus, Batches,
+    DEFAULT_BATCH_TIMEOUT, DEFAULT_POLL_INTERVAL, MIN_POLL_INTERVAL,
+};
 pub use client::{
     gate_questions, CallOptions, ClientBuilder, DecideRequest, DecisionNode, Sleeper, DEFAULT_BASE_URL,
     DEFAULT_CONCURRENCY, DEFAULT_INLINE_THRESHOLD, DEFAULT_MAX_RETRIES, DEFAULT_MODEL, DEFAULT_TIMEOUT,
