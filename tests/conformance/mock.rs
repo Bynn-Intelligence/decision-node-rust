@@ -54,9 +54,20 @@ impl Mock {
         }
     }
 
-    /// The requests the mock recorded for a session.
+    /// The requests the mock recorded for a session, without the pongs,
+    /// which are counted in `pongs`.
     pub fn requests(&self, session: &str) -> Value {
-        self.get(&format!("/_mock/requests?session={session}"))
+        let mut out = self.get(&format!("/_mock/requests?session={session}"));
+        let all = out["requests"].as_array().cloned().unwrap_or_default();
+        let (pongs, requests): (Vec<Value>, Vec<Value>) = all.into_iter().partition(|r| r["method"] == "PONG");
+        out["pongs"] = Value::from(pongs.len());
+        out["requests"] = Value::Array(requests);
+        out
+    }
+
+    /// Moves the session's clock on the mock.
+    pub fn clock(&self, session: &str, body: &Value) {
+        self.send("POST", &format!("/_mock/clock?session={session}"), Some(body));
     }
 
     /// The requests any session sent to `path`.
@@ -72,9 +83,20 @@ impl Mock {
     }
 
     fn get(&self, path: &str) -> Value {
+        self.send("GET", path, None)
+    }
+
+    fn send(&self, method: &str, path: &str, body: Option<&Value>) -> Value {
         let mut stream = TcpStream::connect(&self.addr).expect("connect to the mock");
         stream.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
-        write!(stream, "GET {path} HTTP/1.0\r\nHost: {}\r\nConnection: close\r\n\r\n", self.addr).unwrap();
+        let body = body.map(Value::to_string).unwrap_or_default();
+        write!(
+            stream,
+            "{method} {path} HTTP/1.0\r\nHost: {}\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            self.addr,
+            body.len()
+        )
+        .unwrap();
         let mut raw = Vec::new();
         stream.read_to_end(&mut raw).unwrap();
         let split = raw.windows(4).position(|w| w == b"\r\n\r\n").expect("an HTTP response");
