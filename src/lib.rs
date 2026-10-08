@@ -2,7 +2,8 @@
 //!
 //! DecisionNode answers typed questions about a state: `truth` (is this
 //! statement true, as a probability), `choice` (one option of a set), `score`
-//! (a place on an ordered scale) and `number` (a value on a grid). This crate
+//! (a place on an ordered scale), `number` (a value on a grid), `point` (a spot
+//! in an image) and `box` (a rectangle in an image). This crate
 //! checks the request locally, sends it over pooled connections with retries,
 //! and returns typed answers and typed errors. It adds no behaviour of its own
 //! to a decision: the values you read are the values the API sent.
@@ -72,10 +73,13 @@ pub use client::{
 pub use error::{DecisionNodeError, Error, ErrorKind, Result};
 pub use http::HttpSettings;
 pub use image::Image;
-pub use question::{choice, number, score, truth, Choice, Levels, Number, Options, Question, Score, Truth};
+pub use question::{
+    bounding_box, choice, number, point, score, truth, BoundingBox, Choice, Levels, Number, Options, Point, Question,
+    Score, Truth,
+};
 pub use response::{
-    Answer, ChoiceAnswer, Decision, DecisionResult, ModelInfo, NumberAnswer, ScoreAnswer, TruthAnswer, UnknownAnswer,
-    Usage,
+    Answer, BoxAnswer, ChoiceAnswer, Decision, DecisionResult, ModelInfo, NumberAnswer, PointAnswer, ScoreAnswer,
+    TruthAnswer, UnknownAnswer, Usage,
 };
 pub use safety::Safety;
 #[cfg(feature = "sessions")]

@@ -27,9 +27,9 @@ use std::time::{Duration, Instant};
 
 use base64::Engine;
 use decisionnode::{
-    Batch, BatchPage, BatchRequest, BatchResult, BatchStatus, CallOptions, Choice, ChoiceAnswer, ClientBuilder,
-    DecideRequest, Decision, DecisionNode, DecisionResult, Error, Image, Levels, ModelInfo, Number, NumberAnswer,
-    Options, Question, Safety, Score, ScoreAnswer, Truth, TruthAnswer, Video, VideoFrame,
+    Batch, BatchPage, BatchRequest, BatchResult, BatchStatus, BoundingBox, CallOptions, Choice, ChoiceAnswer,
+    ClientBuilder, DecideRequest, Decision, DecisionNode, DecisionResult, Error, Image, Levels, ModelInfo, Number,
+    NumberAnswer, Options, Point, Question, Safety, Score, ScoreAnswer, Truth, TruthAnswer, Video, VideoFrame,
 };
 use serde_json::{json, Map, Value};
 use sha2::Digest;
@@ -448,12 +448,44 @@ fn build_number(args: &Value) -> Number {
     n
 }
 
+/// `$point` and `$box`: instructions, image and units, each only when given.
+fn build_place(kind: &str, args: &Value) -> Question {
+    let image = opt(args, "image").and_then(Value::as_str);
+    let units = opt(args, "units").and_then(Value::as_str);
+    if kind == "point" {
+        let mut p = Point::new();
+        if let Some(i) = opt(args, "instructions") {
+            p = p.instructions(i);
+        }
+        if let Some(i) = image {
+            p = p.image(i);
+        }
+        if let Some(u) = units {
+            p = p.units(u);
+        }
+        return p.into();
+    }
+    let mut b = BoundingBox::new();
+    if let Some(i) = opt(args, "instructions") {
+        b = b.instructions(i);
+    }
+    if let Some(i) = image {
+        b = b.image(i);
+    }
+    if let Some(u) = units {
+        b = b.units(u);
+    }
+    b.into()
+}
+
 fn question(value: &Value) -> Question {
     match single(value) {
         Some(("$truth", a)) => build_truth(a).into(),
         Some(("$choice", a)) => build_choice(a).into(),
         Some(("$score", a)) => build_score(a).into(),
         Some(("$number", a)) => build_number(a).into(),
+        Some(("$point", a)) => build_place("point", a),
+        Some(("$box", a)) => build_place("box", a),
         _ => Question::from(value.clone()),
     }
 }
@@ -993,6 +1025,12 @@ fn norm_answer(a: &decisionnode::Answer) -> Value {
         norm_score(s)
     } else if let Some(n) = a.as_number() {
         norm_number(n)
+    } else if let Some(p) = a.as_point() {
+        json!({"kind": "point", "x": num(p.x), "y": num(p.y), "present": num(p.present), "confidence": num(p.confidence),
+            "image": p.image, "width": num(p.width), "height": num(p.height)})
+    } else if let Some(b) = a.as_box() {
+        json!({"kind": "box", "x1": num(b.x1), "y1": num(b.y1), "x2": num(b.x2), "y2": num(b.y2), "present": num(b.present),
+            "confidence": num(b.confidence), "image": b.image, "width": num(b.width), "height": num(b.height)})
     } else {
         json!({"kind": "unknown", "type": a.answer_type(), "raw": a.raw()})
     }

@@ -1,4 +1,5 @@
-//! Question builders: [`truth`], [`choice`], [`score`] and [`number`].
+//! Question builders: [`truth`], [`choice`], [`score`], [`number`], [`point`]
+//! and [`bounding_box`].
 //!
 //! Each builder produces the wire form of one question. Instructions, option
 //! descriptions and levels take a string or any value that serialises to JSON,
@@ -16,7 +17,7 @@ fn to_json<T: Serialize>(value: T) -> Result<Value, String> {
 }
 
 /// One question, in its wire form. Built from [`Truth`], [`Choice`], [`Score`],
-/// [`Number`] or a [`serde_json::Value`].
+/// [`Number`], [`Point`], [`BoundingBox`] or a [`serde_json::Value`].
 #[derive(Clone, Debug, PartialEq)]
 pub struct Question {
     inner: Result<Value, String>,
@@ -60,6 +61,18 @@ impl From<Score> for Question {
 impl From<Number> for Question {
     fn from(n: Number) -> Question {
         Question { inner: n.build() }
+    }
+}
+
+impl From<Point> for Question {
+    fn from(p: Point) -> Question {
+        Question { inner: p.0.build("point") }
+    }
+}
+
+impl From<BoundingBox> for Question {
+    fn from(b: BoundingBox) -> Question {
+        Question { inner: b.0.build("box") }
     }
 }
 
@@ -464,10 +477,141 @@ impl Number {
     }
 }
 
+// --------------------------------------------------------------------------- point and box
+
+/// What a `point` and a `box` question share: the instructions, the image to
+/// look in and the units.
+#[derive(Clone, Debug, Default, PartialEq)]
+struct Place {
+    instructions: Option<Result<Value, String>>,
+    image: Option<String>,
+    units: Option<String>,
+}
+
+impl Place {
+    fn build(self, qtype: &str) -> Result<Value, String> {
+        let mut q = Map::new();
+        q.insert("type".into(), qtype.into());
+        if let Some(i) = self.instructions {
+            q.insert("instructions".into(), i?);
+        }
+        for (name, value) in [("image", self.image), ("units", self.units)] {
+            if let Some(v) = value {
+                q.insert(name.into(), Value::String(v));
+            }
+        }
+        Ok(Value::Object(q))
+    }
+}
+
+/// A `point` question: one spot in an image, answered by a
+/// [`crate::PointAnswer`]: `x` and `y`, the probability that what the
+/// instructions describe is there at all (`present`) and that the spot lies
+/// on it (`confidence`).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Point(Place);
+
+/// A `point` question with these instructions. The request needs an image;
+/// with two or more, name the one to look in with [`Point::image`].
+///
+/// ```
+/// use decisionnode::point;
+///
+/// let pick = point("Point to the yellow package closest to the robot arm.");
+/// let exact = point("Where is the crack?").image("belt").units("normalized");
+/// ```
+pub fn point(instructions: impl Serialize) -> Point {
+    Point::new().instructions(instructions)
+}
+
+impl Point {
+    /// A `point` question without instructions. The API needs them, so add
+    /// them with [`Point::instructions`].
+    pub fn new() -> Point {
+        Point::default()
+    }
+
+    /// What to find: a string, or any value that serialises to JSON.
+    pub fn instructions(mut self, instructions: impl Serialize) -> Point {
+        self.0.instructions = Some(to_json(instructions));
+        self
+    }
+
+    /// The id of the image to look in, required when the request has two or
+    /// more images.
+    pub fn image(mut self, id: impl Into<String>) -> Point {
+        self.0.image = Some(id.into());
+        self
+    }
+
+    /// `"pixels"` (the default: pixels of the image as sent) or
+    /// `"normalized"` (fractions of the width and the height).
+    pub fn units(mut self, units: impl Into<String>) -> Point {
+        self.0.units = Some(units.into());
+        self
+    }
+}
+
+/// A `box` question: a rectangle in an image, answered by a
+/// [`crate::BoxAnswer`]: its top-left (`x1`, `y1`) and bottom-right (`x2`,
+/// `y2`) corners, with `present` and `confidence` as a point has. Named for
+/// the wire type `box`, a reserved word in Rust.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct BoundingBox(Place);
+
+/// A `box` question with these instructions. The request needs an image;
+/// with two or more, name the one to look in with [`BoundingBox::image`].
+///
+/// ```
+/// use decisionnode::bounding_box;
+///
+/// let damage = bounding_box("Draw a box around the damaged package.").image("belt");
+/// ```
+pub fn bounding_box(instructions: impl Serialize) -> BoundingBox {
+    BoundingBox::new().instructions(instructions)
+}
+
+impl BoundingBox {
+    /// A `box` question without instructions. The API needs them, so add
+    /// them with [`BoundingBox::instructions`].
+    pub fn new() -> BoundingBox {
+        BoundingBox::default()
+    }
+
+    /// What to find: a string, or any value that serialises to JSON.
+    pub fn instructions(mut self, instructions: impl Serialize) -> BoundingBox {
+        self.0.instructions = Some(to_json(instructions));
+        self
+    }
+
+    /// The id of the image to look in, required when the request has two or
+    /// more images.
+    pub fn image(mut self, id: impl Into<String>) -> BoundingBox {
+        self.0.image = Some(id.into());
+        self
+    }
+
+    /// `"pixels"` (the default) or `"normalized"`.
+    pub fn units(mut self, units: impl Into<String>) -> BoundingBox {
+        self.0.units = Some(units.into());
+        self
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn point_and_box_wire_forms() {
+        assert_eq!(wire(point("Where?")), json!({"type": "point", "instructions": "Where?"}));
+        assert_eq!(
+            wire(bounding_box("Where?").image("belt").units("normalized")),
+            json!({"type": "box", "instructions": "Where?", "image": "belt", "units": "normalized"})
+        );
+        assert_eq!(wire(Point::new().image("a")), json!({"type": "point", "image": "a"}));
+    }
 
     fn wire(q: impl Into<Question>) -> Value {
         q.into().into_value().unwrap()

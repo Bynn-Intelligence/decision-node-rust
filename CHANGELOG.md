@@ -4,10 +4,11 @@ All notable changes to this crate are listed here. The format follows [Keep a Ch
 
 ## [0.2.0] - Unreleased
 
-Implements DecisionNode SDK specification version 1.2 (`SPEC_VERSION`): sixteen images and videos as frames, checked against conformance suite 1.7 with the async and the blocking client.
+Implements DecisionNode SDK specification version 1.2 (`SPEC_VERSION`): sixteen images, videos as frames, and the point and box question types, checked against conformance suite 1.8 with the async and the blocking client.
 
 ### Added
 
+- Point and box questions: `point` and `bounding_box` (named for the wire type `box`, a reserved word in Rust), with `.image(id)` and `.units(...)`, and the answers `Answer::Point(PointAnswer)` (`x`, `y`, `present`, `confidence`, `image`, `width`, `height`) and `Answer::Box(BoxAnswer)` (`x1`, `y1`, `x2`, `y2` and the same), read with `as_point` and `as_box`. An answer with a field missing or of the wrong type is `Answer::Unknown`. Their rules are checked locally with the API's 422 entries: an image in the request, `image` naming one of them (required with two or more), and the units; a point or box without instructions is the API's 400. `systemone` refuses both types locally, like number questions.
 - Videos sent as the frames the caller sampled: `Video` (`Video::new(id)` with `frame`, `frames`, `fps`, `start` and `end`) and `VideoFrame` (`bytes`, `bytes_with_type`, `base64`), and `DecideRequest::video` / `videos` and `CallOptions::video` / `videos`. A `serde_json::Value` in the wire form converts into either and is checked by the same rules. `systemone`, the helpers, `decide_many`, batch requests and `check_decide` take videos as `decide` does. Frames always go inline: they are never uploaded, cached, resized or re-encoded.
 - The API's video rules are checked before anything is sent, with the API's own message: at most 4 videos, an id that is present and unique across images and videos, at least one frame, frame times at least 0 and strictly increasing, a JPEG, PNG or WebP media type for every frame, `fps` above 0 and at most 4, `start` and `end` at least 0 and `end` after `start`. The number of frames, their sizes and their pixels are left to the server.
 - `Usage::video_frames` and `Usage::video_seconds`, `None` for a request without videos, and `Decision::warnings`, the server's notes exactly as sent, empty when there are none.

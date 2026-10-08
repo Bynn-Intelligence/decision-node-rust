@@ -158,13 +158,29 @@ pub(crate) fn check_nesting(depth: usize) -> Result<()> {
 
 /// Checks a request body (its images already counted in `depth` by the
 /// caller): the nesting limit, every `422` entry, then the first `400`.
-/// `extra` holds `422` entries found before the questions.
+/// `extra` holds `422` entries found before the questions. The point and box
+/// rules on the request's images are left out: [`check_body`] runs them.
+#[cfg(any(feature = "sessions", test))]
 pub(crate) fn check_request(
     body: &Map<String, Value>,
     depth: usize,
     profile: Profile,
     limits: &Limits,
     extra: Vec<Value>,
+) -> Result<()> {
+    check_body(body, depth, profile, limits, extra, None)
+}
+
+/// [`check_request`] with the request's image ids, which a point or box
+/// question must name among; `None` where a request carries no images of its
+/// own (a session's open).
+pub(crate) fn check_body(
+    body: &Map<String, Value>,
+    depth: usize,
+    profile: Profile,
+    limits: &Limits,
+    extra: Vec<Value>,
+    image_ids: Option<&[&str]>,
 ) -> Result<()> {
     check_nesting(depth)?;
     let mut entries = extra;
@@ -175,7 +191,7 @@ pub(crate) fn check_request(
         }
     }
     for (id, q) in body.get("questions").and_then(Value::as_object).into_iter().flatten() {
-        check_question(id, q, &mut entries, &mut deferred, profile, limits);
+        check_question(id, q, &mut entries, &mut deferred, profile, limits, image_ids);
     }
     if !entries.is_empty() {
         return Err(Error::local_entries(entries));
@@ -186,6 +202,62 @@ pub(crate) fn check_request(
     }
 }
 
+/// A point or box question: its image among the request's (the `422`
+/// entries), its units (a `422` entry), then its instructions (the plain
+/// `400`). Without image ids (a session's open) the image rules are skipped.
+#[allow(clippy::too_many_arguments)]
+fn check_place(
+    id: &str,
+    qtype: &str,
+    obj: &Map<String, Value>,
+    q: &Value,
+    loc: &[Value],
+    entries: &mut Vec<Value>,
+    deferred: &mut Vec<Error>,
+    image_ids: Option<&[&str]>,
+) {
+    if let Some(ids) = image_ids {
+        let image = obj.get("image").filter(|v| !v.is_null());
+        match image {
+            _ if ids.is_empty() => entries.push(entry(
+                "image_required",
+                loc,
+                format!("A {qtype} question needs an image in the request"),
+                q,
+                None,
+            )),
+            None if ids.len() >= 2 => entries.push(entry("missing", &with(loc, "image"), "Field required", q, None)),
+            None => {}
+            Some(Value::String(name)) if !ids.contains(&name.as_str()) => entries.push(entry(
+                "unknown_image",
+                &with(loc, "image"),
+                "Input should be the id of an image of the request",
+                &Value::String(name.clone()),
+                None,
+            )),
+            Some(Value::String(_)) => {}
+            Some(other) => {
+                entries.push(entry("string_type", &with(loc, "image"), "Input should be a valid string", other, None))
+            }
+        }
+    }
+    if let Some(units) = obj.get("units").filter(|v| !v.is_null()) {
+        if !matches!(units.as_str(), Some("pixels" | "normalized")) {
+            entries.push(entry(
+                "literal_error",
+                &with(loc, "units"),
+                "Input should be 'pixels' or 'normalized'",
+                units,
+                Some(json!({"expected": "'pixels' or 'normalized'"})),
+            ));
+        }
+    }
+    if obj.get("instructions").is_none_or(Value::is_null) {
+        let name = if qtype == "point" { "Point" } else { "Box" };
+        deferred.push(bad_request(None, format!("{name} question must have instructions: {id}")));
+    }
+}
+
 fn check_question(
     id: &str,
     q: &Value,
@@ -193,6 +265,7 @@ fn check_question(
     deferred: &mut Vec<Error>,
     profile: Profile,
     limits: &Limits,
+    image_ids: Option<&[&str]>,
 ) {
     let base = [json!("body"), json!("questions"), json!(id)];
     let Some(obj) = q.as_object() else {
@@ -204,7 +277,7 @@ fn check_question(
         return;
     };
     let known: &[&str] = match profile {
-        Profile::Decide => &["truth", "noul", "choice", "score", "number"],
+        Profile::Decide => &["truth", "noul", "choice", "score", "number", "point", "box"],
         Profile::Systemone => &["noul", "choice", "score"],
     };
     let Some(qtype) = qtype.as_str().filter(|t| known.contains(t)) else {
@@ -220,6 +293,7 @@ fn check_question(
     }
     let criteria = obj.get("criteria").filter(|v| !v.is_null());
     match qtype {
+        "point" | "box" => check_place(id, qtype, obj, q, &loc, entries, deferred, image_ids),
         "number" => {
             if limits.is_zero(&["number_max_grid_values"]) {
                 deferred.push(usage_error(format!("Model {} does not answer number questions.", limits.model)));

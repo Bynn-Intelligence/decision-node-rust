@@ -14,7 +14,7 @@ use reqwest::Method;
 use serde::Serialize;
 use serde_json::{Map, Value};
 
-use crate::check::{check_request, object_depth, Limits, Profile};
+use crate::check::{check_body, object_depth, Limits, Profile};
 use crate::error::{header, retry_after, Error, ErrorKind, Result};
 use crate::http::HttpSettings;
 use crate::image::{check_images, Image};
@@ -209,7 +209,9 @@ impl DecideRequest {
         // the body's object and the videos array.
         let videos_depth = self.videos.iter().map(|v| v.depth() + 2).max().unwrap_or(0);
         let depth = object_depth(&body).max(if self.images.is_empty() { 0 } else { 3 }).max(videos_depth);
-        check_request(&body, depth, profile, &limits, Vec::new())?;
+        // A point or box question looks in one of the request's images.
+        let image_ids: Vec<&str> = self.images.iter().map(Image::id).collect();
+        check_body(&body, depth, profile, &limits, Vec::new(), Some(&image_ids))?;
         check_images(&self.images, &limits)?;
         if !self.videos.is_empty() {
             // Frames always go inline: they are never uploaded or cached.
@@ -1314,6 +1316,38 @@ mod tests {
         );
         // A body without videos has no videos member.
         assert!(super::tests::body(DecideRequest::new().question("q", truth("?"))).unwrap().get("videos").is_none());
+    }
+
+    #[test]
+    fn point_and_box_rules_on_the_request_images() {
+        use crate::question::{bounding_box, point};
+        let entries = |r: DecideRequest| -> Vec<(String, Value)> {
+            let e = super::tests::body(r).unwrap_err();
+            assert_eq!(e.kind(), ErrorKind::Validation);
+            e.entries().unwrap().iter().map(|x| (x["type"].as_str().unwrap().to_owned(), x["loc"].clone())).collect()
+        };
+        let none = entries(DecideRequest::new().question("pick", point("Where?")));
+        assert_eq!(none, vec![("image_required".to_owned(), json!(["body", "questions", "pick", "point"]))]);
+        let two = DecideRequest::new()
+            .image(Image::url("belt", "https://e.com/a.jpg"))
+            .image(Image::url("dock", "https://e.com/b.jpg"))
+            .video(crate::Video::new("cam").frame(crate::VideoFrame::base64(0.0, "AA==", "image/png")))
+            .question("pick", point("Where?").image("cam").units("inches"))
+            .question("any", truth("Damaged?"))
+            .question("damage", bounding_box("Where?"))
+            .question("raw", json!({"type": "box", "instructions": "?", "image": 7}));
+        let got = entries(two);
+        let kinds: Vec<&str> = got.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(kinds, ["unknown_image", "literal_error", "missing", "string_type"]);
+        assert_eq!(got[2].1, json!(["body", "questions", "damage", "box", "image"]));
+        // One image: no image field needed; missing instructions are the plain 400.
+        let one = || DecideRequest::new().image(Image::url("belt", "https://e.com/a.jpg"));
+        assert!(super::tests::body(one().question("pick", point("Where?"))).is_ok());
+        let e = super::tests::body(one().question("pick", crate::Point::new())).unwrap_err();
+        assert_eq!(
+            (e.kind(), e.error_type(), e.message()),
+            (ErrorKind::BadRequest, None, "Point question must have instructions: pick")
+        );
     }
 
     #[test]

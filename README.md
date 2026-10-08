@@ -1,6 +1,6 @@
 # DecisionNode Rust SDK
 
-The official Rust client for the [DecisionNode](https://decisionnode.com) API: typed `truth`, `choice`, `score` and `number` decisions over any state, with up to 16 images, videos sent as frames, sessions, batches, retries and typed errors. Async on [reqwest](https://docs.rs/reqwest) and Tokio, with an optional blocking client.
+The official Rust client for the [DecisionNode](https://decisionnode.com) API: typed `truth`, `choice`, `score`, `number`, `point` and `box` decisions over any state, with up to 16 images, videos sent as frames, sessions, batches, retries and typed errors. Async on [reqwest](https://docs.rs/reqwest) and Tokio, with an optional blocking client.
 
 The client checks every request against the API's fixed rules before it sends anything, reuses its connections, and picks the fastest form for each image, so a call costs one round trip wherever one is enough.
 
@@ -111,6 +111,8 @@ A client is cheap to clone and safe to share between tasks and threads; clones s
 | `choice(instructions, options)` | `{"type": "choice", "instructions": ..., "criteria": {name: description}}` |
 | `score(instructions, levels)` | `{"type": "score", "instructions": ..., "criteria": [levels, low to high]}` |
 | `number(instructions)`, `.min(...)`, `.max(...)`, `.step(...)` | `{"type": "number", "instructions": ..., "min": ..., "max": ..., "step": ...}`, each bound left out unless given, so the API's defaults apply (0, 255, 1) |
+| `point(instructions)`, `.image(...)`, `.units(...)` | `{"type": "point", "instructions": ..., "image": ..., "units": ...}`, `image` and `units` left out unless given |
+| `bounding_box(instructions)`, `.image(...)`, `.units(...)` | `{"type": "box", ...}`, built like `point` (`box` is a reserved word in Rust) |
 
 The state, instructions, descriptions and levels take a string or any value that implements `serde::Serialize`. Options are a list of names (`["billing", "bug"]`), name and description pairs, or a map. `Truth::new()`, `Choice::new(options)` and `Score::new(levels)` build a question without instructions. A `serde_json::Value` in the wire form is accepted wherever a builder is:
 
@@ -119,6 +121,26 @@ let request = DecideRequest::new()
     .state("Is hotdog a sandwich?")
     .question("q", json!({"type": "truth", "criteria": {"true": "bread around a filling", "false": null}}));
 ```
+
+A point or a box is a place in one of the request's images:
+
+```rust
+use decisionnode::{bounding_box, point, Image};
+
+let d = dn
+    .decide(
+        DecideRequest::new()
+            .image(Image::url("belt", "https://files.example.com/line-3/cam-2/0917.jpg"))
+            .question("pick", point("Point to the yellow package closest to the robot arm."))
+            .question("damage", bounding_box("Draw a box around the damaged package.").image("belt"))
+            .question("any_damage", truth("Is any package on the belt damaged?")),
+    )
+    .await?;
+let pick = d["pick"].as_point().unwrap(); // x 812, y 455, present 0.97
+let damage = d["damage"].as_box().unwrap(); // x1 300, y1 120, x2 520, y2 410
+```
+
+`x` and `y` are measured from the top-left corner of the image, `x` to the right and `y` down; a box runs from its top-left corner (`x1`, `y1`) to its bottom-right corner (`x2`, `y2`). `units` is `"pixels"` (the default: pixels of the image as sent) or `"normalized"` (fractions of the width and the height). `present` is the probability that what the instructions describe is in the image at all; `confidence` the probability that the place is right if it is. `image`, `width` and `height` name the image looked in and its size in pixels. The request needs an image, and `.image(id)` names the one to look in when it carries two or more. `systemone` takes neither type.
 
 A question id is any string and comes back as the key of its answer. Without a state the request sends `""`.
 
@@ -132,6 +154,8 @@ A question id is any string and comes back as the key of its answer. Without a s
 | `Answer::Choice(ChoiceAnswer)` | `choice`, `confidence`, `probabilities` (by option name, exactly as sent) |
 | `Answer::Score(ScoreAnswer)` | `score`, `confidence`, `probabilities` (by level index), `legend` (level index to the level as sent) |
 | `Answer::Number(NumberAnswer)` | `number`, `expected`, `confidence`, `probabilities` (by the value exactly as the API writes it, `"7"`, `"3.5"`) |
+| `Answer::Point(PointAnswer)` | `x`, `y`, `present`, `confidence`, `image`, `width`, `height` |
+| `Answer::Box(BoxAnswer)` | `x1`, `y1`, `x2`, `y2`, `present`, `confidence`, `image`, `width`, `height` |
 | `Answer::Unknown(UnknownAnswer)` | `answer_type` and `raw`, for a question type this version does not know, or a known type whose fields are missing or of the wrong type. Such an answer never fails the decision. |
 
 `model` is read from the body; `request_id`, `latency_ms` and `safety` from the `x-request-id`, `x-decisionnode-latency-ms` and `x-decisionnode-safety` headers. A value the response does not carry is `None`: the token counts are `Option<u64>` and `latency_ms` is `Option<f64>`, never 0 in place of a missing value. For a request with videos, `usage.video_frames` is the number of frames read and `usage.video_seconds` the seconds of the windows read (`None` without videos), and `warnings` holds the server's notes exactly as sent when it read a video at a lower rate or resolution than asked (empty when there are none).
@@ -305,7 +329,7 @@ Only 200 to 299 is a success. Redirects are never followed, whatever transport s
 
 `decide` never fails over one odd answer: an answer with missing or wrongly typed fields comes back as `Answer::Unknown`. `check`, `classify` and `score` promise a typed answer, so when theirs is missing or malformed they return a `Server` error with the response's status, request id and `reason()` instead.
 
-The error's own message, its `Display`, is the server's `message` exactly (`detail.message`, or `detail` when it is a string), or the client's description when there was no response; it is `""` when the server sent none. `message()` returns the same text, `""` and never missing when there is none. Every error also has `kind()`, `status()`, `error_type()`, `request_id()` and `reason()`: the server's explanation in words, from the `x-decisionnode-error` header. `{:?}` prints all of them. A `ContextLimit` error is also a `BadRequest` and a `SessionLimit` error a `RateLimit`: `error.is(ErrorKind::BadRequest)` is true for both. Before sending, a call fails with `Authentication` when no key is set. Arguments the client refuses before sending anything are errors of the base kind, `Other`, without a status (`error.is_argument()` is true; there is no separate error kind for them): an empty question map, a value that cannot be serialised, an image file that cannot be read, a base URL that is not `https`, a timeout of 0 or below, a negative `max_retries` or `inline_threshold`, a `decide_many_with` concurrency below 1, or a `run_batch_with` poll interval below 10 seconds. A request that breaks one of the API's fixed rules fails before sending, with what the server would answer and no status (`is_local()`): the same kind, the same `error_type`, the documented message, and for a 422 a `Validation` error whose `entries()` are the server's list. That covers the 128-level nesting limit; question types, missing or mistyped fields, option and level counts, truth and number text and number grids; a state of the wrong type; images (count, ids, format, 10 MB, 40 megapixels, an upload reference's media type), videos (count, ids, frames, frame times and media types, `fps`, `start` and `end`) and image URLs (`https`, 2,048 characters, no user information, port 443, no literal private address); a session's `window` and `ttl_seconds`; a session frame, which `Session::send` refuses with nothing written and no `seq` used; `batches().list` paging; and batch `custom_id` rules. After a `models()` call the client also checks the limits that list states for the model a request names, found by its name or by the alias or pinned version an entry states. The same checks run alone, sending nothing, with `check_decide`, `check_systemone`, `check_session`, `check_batch`, `check_batch_add` and `Session::check_frame`. `decide_many` and batch calls check every request first, so one invalid request fails the call and nothing is sent. Limits that depend on the model, such as tokens, are the server's to judge.
+The error's own message, its `Display`, is the server's `message` exactly (`detail.message`, or `detail` when it is a string), or the client's description when there was no response; it is `""` when the server sent none. `message()` returns the same text, `""` and never missing when there is none. Every error also has `kind()`, `status()`, `error_type()`, `request_id()` and `reason()`: the server's explanation in words, from the `x-decisionnode-error` header. `{:?}` prints all of them. A `ContextLimit` error is also a `BadRequest` and a `SessionLimit` error a `RateLimit`: `error.is(ErrorKind::BadRequest)` is true for both. Before sending, a call fails with `Authentication` when no key is set. Arguments the client refuses before sending anything are errors of the base kind, `Other`, without a status (`error.is_argument()` is true; there is no separate error kind for them): an empty question map, a value that cannot be serialised, an image file that cannot be read, a base URL that is not `https`, a timeout of 0 or below, a negative `max_retries` or `inline_threshold`, a `decide_many_with` concurrency below 1, or a `run_batch_with` poll interval below 10 seconds. A request that breaks one of the API's fixed rules fails before sending, with what the server would answer and no status (`is_local()`): the same kind, the same `error_type`, the documented message, and for a 422 a `Validation` error whose `entries()` are the server's list. That covers the 128-level nesting limit; question types, missing or mistyped fields, option and level counts, truth, number, point and box text, number grids, and a point's or box's image and units; a state of the wrong type; images (count, ids, format, 10 MB, 40 megapixels, an upload reference's media type), videos (count, ids, frames, frame times and media types, `fps`, `start` and `end`) and image URLs (`https`, 2,048 characters, no user information, port 443, no literal private address); a session's `window` and `ttl_seconds`; a session frame, which `Session::send` refuses with nothing written and no `seq` used; `batches().list` paging; and batch `custom_id` rules. After a `models()` call the client also checks the limits that list states for the model a request names, found by its name or by the alias or pinned version an entry states. The same checks run alone, sending nothing, with `check_decide`, `check_systemone`, `check_session`, `check_batch`, `check_batch_add` and `Session::check_frame`. `decide_many` and batch calls check every request first, so one invalid request fails the call and nothing is sent. Limits that depend on the model, such as tokens, are the server's to judge.
 
 ```rust
 use decisionnode::ErrorKind;
@@ -361,7 +385,7 @@ The SDK sends no telemetry and logs no state or questions. Its only added header
 cargo test --all-features
 ```
 
-The integration tests run the DecisionNode SDK conformance suite (every request, response, error, behaviour and constant case, with both clients) against its mock server, from the suite `DECISIONNODE_CONFORMANCE_DIR` points at; they need `python3` for the mock. Without the variable the conformance test fails rather than skipping. CI checks the suite out at one pinned commit, set in a single place at the top of `.github/workflows/ci.yml`, and pins every action to a commit SHA. This crate implements DecisionNode SDK specification version 1.2, exported as `decisionnode::SPEC_VERSION`, and passes conformance suite 1.7.
+The integration tests run the DecisionNode SDK conformance suite (every request, response, error, behaviour and constant case, with both clients) against its mock server, from the suite `DECISIONNODE_CONFORMANCE_DIR` points at; they need `python3` for the mock. Without the variable the conformance test fails rather than skipping. CI checks the suite out at one pinned commit, set in a single place at the top of `.github/workflows/ci.yml`, and pins every action to a commit SHA. This crate implements DecisionNode SDK specification version 1.2, exported as `decisionnode::SPEC_VERSION`, and passes conformance suite 1.8.
 
 ## License
 

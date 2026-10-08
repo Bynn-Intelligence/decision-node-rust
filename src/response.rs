@@ -31,6 +31,10 @@ pub enum Answer {
     Score(ScoreAnswer),
     /// The answer to a `number` question.
     Number(NumberAnswer),
+    /// The answer to a `point` question.
+    Point(PointAnswer),
+    /// The answer to a `box` question.
+    Box(BoxAnswer),
     /// An answer of a type this version does not know, or a known type with
     /// missing or wrongly typed fields.
     Unknown(UnknownAnswer),
@@ -101,6 +105,60 @@ pub struct NumberAnswer {
     pub raw: Value,
 }
 
+/// The answer to a `point` question: one spot in an image. Every number is
+/// exactly as sent: whole pixels, or fractions of the width and the height
+/// with `units` `"normalized"`.
+#[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
+pub struct PointAnswer {
+    /// The spot, from the top-left corner of the image, `x` to the right.
+    pub x: f64,
+    /// The spot, `y` down from the top.
+    pub y: f64,
+    /// The probability that what the instructions describe is in the image
+    /// at all. Under a low `present` the spot is only the best guess.
+    pub present: f64,
+    /// The probability that the spot lies on the thing, if it is there.
+    pub confidence: f64,
+    /// The id of the image looked in.
+    pub image: String,
+    /// The image's width in pixels.
+    pub width: f64,
+    /// The image's height in pixels.
+    pub height: f64,
+    /// The answer object as received.
+    pub raw: Value,
+}
+
+/// The answer to a `box` question: a rectangle in an image, in the units of a
+/// [`PointAnswer`].
+#[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
+pub struct BoxAnswer {
+    /// The top-left corner, from the left.
+    pub x1: f64,
+    /// The top-left corner, from the top.
+    pub y1: f64,
+    /// The bottom-right corner, from the left.
+    pub x2: f64,
+    /// The bottom-right corner, from the top.
+    pub y2: f64,
+    /// The probability that what the instructions describe is in the image
+    /// at all.
+    pub present: f64,
+    /// The probability that the box overlaps the thing's true box by an
+    /// intersection over union of 0.5 or more, if it is there.
+    pub confidence: f64,
+    /// The id of the image looked in.
+    pub image: String,
+    /// The image's width in pixels.
+    pub width: f64,
+    /// The image's height in pixels.
+    pub height: f64,
+    /// The answer object as received.
+    pub raw: Value,
+}
+
 /// An answer of a type this version of the SDK does not know, or of a known
 /// type whose fields are missing or of the wrong type.
 #[derive(Clone, Debug, PartialEq)]
@@ -114,13 +172,16 @@ pub struct UnknownAnswer {
 
 impl Answer {
     /// The type of the answer: `truth` (a `noul` answer included), `choice`,
-    /// `score`, `number` or, for an [`Answer::Unknown`], its `type` field.
+    /// `score`, `number`, `point`, `box` or, for an [`Answer::Unknown`], its
+    /// `type` field.
     pub fn answer_type(&self) -> Option<&str> {
         match self {
             Answer::Truth(_) => Some("truth"),
             Answer::Choice(_) => Some("choice"),
             Answer::Score(_) => Some("score"),
             Answer::Number(_) => Some("number"),
+            Answer::Point(_) => Some("point"),
+            Answer::Box(_) => Some("box"),
             Answer::Unknown(o) => o.answer_type.as_deref(),
         }
     }
@@ -132,7 +193,25 @@ impl Answer {
             Answer::Choice(a) => &a.raw,
             Answer::Score(a) => &a.raw,
             Answer::Number(a) => &a.raw,
+            Answer::Point(a) => &a.raw,
+            Answer::Box(a) => &a.raw,
             Answer::Unknown(a) => &a.raw,
+        }
+    }
+
+    /// The point answer, if this is one.
+    pub fn as_point(&self) -> Option<&PointAnswer> {
+        match self {
+            Answer::Point(a) => Some(a),
+            _ => None,
+        }
+    }
+
+    /// The box answer, if this is one.
+    pub fn as_box(&self) -> Option<&BoxAnswer> {
+        match self {
+            Answer::Box(a) => Some(a),
+            _ => None,
         }
     }
 
@@ -188,12 +267,14 @@ impl Answer {
         self.as_score().map(|a| a.score)
     }
 
-    /// The confidence of a choice, score or number answer.
+    /// The confidence of a choice, score, number, point or box answer.
     pub fn confidence(&self) -> Option<f64> {
         match self {
             Answer::Choice(a) => Some(a.confidence),
             Answer::Score(a) => Some(a.confidence),
             Answer::Number(a) => Some(a.confidence),
+            Answer::Point(a) => Some(a.confidence),
+            Answer::Box(a) => Some(a.confidence),
             _ => None,
         }
     }
@@ -209,6 +290,8 @@ impl Answer {
             Some("choice") => Self::parse_choice(obj),
             Some("score") => Self::parse_score(obj),
             Some("number") => Self::parse_number(obj),
+            Some("point") => Self::parse_point(obj),
+            Some("box") => Self::parse_box(obj),
             _ => None,
         });
         known.unwrap_or(Answer::Unknown(UnknownAnswer { answer_type, raw: Value::Null })).with_raw(raw)
@@ -229,6 +312,36 @@ impl Answer {
             .map(|(k, v)| v.as_f64().map(|p| (k.clone(), p)))
             .collect::<Option<_>>()?;
         Some(Answer::Number(NumberAnswer { number, expected, confidence, probabilities, raw: Value::Null }))
+    }
+
+    fn parse_point(obj: &Map<String, Value>) -> Option<Answer> {
+        let n = |k: &str| obj.get(k).and_then(Value::as_f64);
+        Some(Answer::Point(PointAnswer {
+            x: n("x")?,
+            y: n("y")?,
+            present: n("present")?,
+            confidence: n("confidence")?,
+            image: obj.get("image")?.as_str()?.to_owned(),
+            width: n("width")?,
+            height: n("height")?,
+            raw: Value::Null,
+        }))
+    }
+
+    fn parse_box(obj: &Map<String, Value>) -> Option<Answer> {
+        let n = |k: &str| obj.get(k).and_then(Value::as_f64);
+        Some(Answer::Box(BoxAnswer {
+            x1: n("x1")?,
+            y1: n("y1")?,
+            x2: n("x2")?,
+            y2: n("y2")?,
+            present: n("present")?,
+            confidence: n("confidence")?,
+            image: obj.get("image")?.as_str()?.to_owned(),
+            width: n("width")?,
+            height: n("height")?,
+            raw: Value::Null,
+        }))
     }
 
     fn parse_choice(obj: &Map<String, Value>) -> Option<Answer> {
@@ -267,6 +380,8 @@ impl Answer {
             Answer::Choice(a) => a.raw = raw,
             Answer::Score(a) => a.raw = raw,
             Answer::Number(a) => a.raw = raw,
+            Answer::Point(a) => a.raw = raw,
+            Answer::Box(a) => a.raw = raw,
             Answer::Unknown(a) => a.raw = raw,
         }
         self
@@ -503,6 +618,28 @@ mod tests {
         assert_eq!(d.usage.video_frames, Some(20));
         assert_eq!(d.usage.video_seconds, Some(10.000000000000002));
         assert_eq!(d.warnings, vec!["Video 'dock' was read at 1 frame a second.".to_owned()]);
+    }
+
+    #[test]
+    fn point_and_box_answers() {
+        let body = json!({"answers": {
+            "pick": {"type": "point", "x": 812, "y": 455, "present": 0.97, "confidence": 0.91, "image": "belt", "width": 1920, "height": 1080},
+            "damage": {"type": "box", "x1": 0.1563, "y1": 0.1111, "x2": 0.2708, "y2": 0.3796, "present": 0.95, "confidence": 0.88,
+                "image": "belt", "width": 1920, "height": 1080},
+            "odd": {"type": "point", "x": true, "y": 455, "present": 0.97, "confidence": 0.91, "image": "belt", "width": 1920, "height": 1080},
+            "no_image": {"type": "box", "x1": 1, "y1": 1, "x2": 2, "y2": 2, "present": 0.5, "confidence": 0.5, "image": 3, "width": 4, "height": 4},
+        }});
+        let d = Decision::from_response(body, 200, &HeaderMap::new()).unwrap();
+        let p = d["pick"].as_point().unwrap();
+        assert_eq!(
+            (p.x, p.y, p.present, p.confidence, p.image.as_str(), p.width, p.height),
+            (812.0, 455.0, 0.97, 0.91, "belt", 1920.0, 1080.0)
+        );
+        let b = d["damage"].as_box().unwrap();
+        assert_eq!((b.x1, b.y1, b.x2, b.y2), (0.1563, 0.1111, 0.2708, 0.3796));
+        assert_eq!(d["damage"].answer_type(), Some("box"));
+        assert!(matches!(d["odd"], Answer::Unknown(_)));
+        assert!(matches!(d["no_image"], Answer::Unknown(_)));
     }
 
     #[test]
