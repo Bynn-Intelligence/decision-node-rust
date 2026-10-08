@@ -1,9 +1,9 @@
 //! A synchronous client, enabled with the `blocking` feature.
 //!
 //! It has the same methods as the asynchronous [`crate::DecisionNode`] and
-//! returns their results directly. It runs them on a small runtime of its own,
-//! so it must not be used from inside an asynchronous context: use the
-//! asynchronous client there.
+//! returns their results directly: decisions and uploads. It runs them on a small runtime of its own, so it
+//! must not be used from inside an asynchronous context: use the asynchronous
+//! client there.
 //!
 //! ```no_run
 //! use decisionnode::blocking::DecisionNode;
@@ -22,8 +22,9 @@ use serde_json::Value;
 
 use crate::client::{CallOptions, ClientBuilder, DecideRequest};
 use crate::error::{Error, ErrorKind, Result};
-use crate::question::{Choice, Score, Truth};
-use crate::response::{ChoiceAnswer, Decision, DecisionResult, ModelInfo, ScoreAnswer, TruthAnswer};
+use crate::image::Image;
+use crate::question::{Choice, Number, Score, Truth};
+use crate::response::{ChoiceAnswer, Decision, DecisionResult, ModelInfo, NumberAnswer, ScoreAnswer, TruthAnswer};
 
 /// The synchronous DecisionNode client.
 ///
@@ -156,5 +157,25 @@ impl DecisionNode {
     /// See [`crate::DecisionNode::decide_raw`].
     pub fn decide_raw(&self, body: impl Serialize) -> Result<Value> {
         self.run(self.client.decide_raw(body))
+    }
+
+    /// See [`crate::DecisionNode::systemone`].
+    pub fn systemone(&self, request: DecideRequest) -> Result<Decision> {
+        self.run(self.client.systemone(request))
+    }
+
+    /// See [`crate::DecisionNode::number`].
+    pub fn number(&self, state: impl Serialize, question: Number) -> Result<NumberAnswer> {
+        self.run(self.client.number(state, question))
+    }
+
+    /// See [`crate::DecisionNode::number_with`].
+    pub fn number_with(&self, state: impl Serialize, question: Number, options: CallOptions) -> Result<NumberAnswer> {
+        self.run(self.client.number_with(state, question, options))
+    }
+
+    /// See [`crate::DecisionNode::upload`].
+    pub fn upload(&self, images: impl IntoIterator<Item = Image>) -> Result<Vec<String>> {
+        self.run(self.client.upload(images))
     }
 }

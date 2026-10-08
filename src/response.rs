@@ -29,12 +29,18 @@ pub enum Answer {
     Choice(ChoiceAnswer),
     /// The answer to a `score` question.
     Score(ScoreAnswer),
+    /// The answer to a `number` question.
+    Number(NumberAnswer),
     /// An answer of a type this version does not know, or a known type with
     /// missing or wrongly typed fields.
     Unknown(UnknownAnswer),
 }
 
 /// The answer to a `truth` question.
+///
+/// An answer the API sends as `{"type": "noul", "noul": 0.94}` (the form
+/// `/v1/systemone` answers in, and the answer to a question sent raw as
+/// `noul`) is read into a `TruthAnswer` too, with `truth` from `noul`.
 #[derive(Clone, Debug, PartialEq)]
 #[non_exhaustive]
 pub struct TruthAnswer {
@@ -75,6 +81,26 @@ pub struct ScoreAnswer {
     pub raw: Value,
 }
 
+/// The answer to a `number` question.
+#[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
+pub struct NumberAnswer {
+    /// The most likely value of the grid, exactly as sent (a whole number or
+    /// the grid value's digits).
+    pub number: f64,
+    /// The expected value over the whole grid, as sent.
+    pub expected: f64,
+    /// The probability of `number`.
+    pub confidence: f64,
+    /// The probability of each likely value, keyed by the value exactly as the
+    /// API writes it (`"7"`, `"3.5"`, `"-2.25"`), in ascending order of value.
+    /// Values at or below 0.001 are left out, so the entries may sum to less
+    /// than 1.
+    pub probabilities: IndexMap<String, f64>,
+    /// The answer object as received.
+    pub raw: Value,
+}
+
 /// An answer of a type this version of the SDK does not know, or of a known
 /// type whose fields are missing or of the wrong type.
 #[derive(Clone, Debug, PartialEq)]
@@ -87,12 +113,14 @@ pub struct UnknownAnswer {
 }
 
 impl Answer {
-    /// The `type` of the answer: `truth`, `choice`, `score` or another type.
+    /// The type of the answer: `truth` (a `noul` answer included), `choice`,
+    /// `score`, `number` or, for an [`Answer::Unknown`], its `type` field.
     pub fn answer_type(&self) -> Option<&str> {
         match self {
             Answer::Truth(_) => Some("truth"),
             Answer::Choice(_) => Some("choice"),
             Answer::Score(_) => Some("score"),
+            Answer::Number(_) => Some("number"),
             Answer::Unknown(o) => o.answer_type.as_deref(),
         }
     }
@@ -103,8 +131,22 @@ impl Answer {
             Answer::Truth(a) => &a.raw,
             Answer::Choice(a) => &a.raw,
             Answer::Score(a) => &a.raw,
+            Answer::Number(a) => &a.raw,
             Answer::Unknown(a) => &a.raw,
         }
+    }
+
+    /// The number answer, if this is one.
+    pub fn as_number(&self) -> Option<&NumberAnswer> {
+        match self {
+            Answer::Number(a) => Some(a),
+            _ => None,
+        }
+    }
+
+    /// The most likely value of a number answer.
+    pub fn number(&self) -> Option<f64> {
+        self.as_number().map(|a| a.number)
     }
 
     /// The truth answer, if this is one.
@@ -146,11 +188,12 @@ impl Answer {
         self.as_score().map(|a| a.score)
     }
 
-    /// The confidence of a choice or score answer.
+    /// The confidence of a choice, score or number answer.
     pub fn confidence(&self) -> Option<f64> {
         match self {
             Answer::Choice(a) => Some(a.confidence),
             Answer::Score(a) => Some(a.confidence),
+            Answer::Number(a) => Some(a.confidence),
             _ => None,
         }
     }
@@ -161,16 +204,31 @@ impl Answer {
     pub(crate) fn parse(raw: Value) -> Answer {
         let answer_type = raw.get("type").and_then(Value::as_str).map(str::to_owned);
         let known = raw.as_object().and_then(|obj| match answer_type.as_deref() {
-            Some("truth") => Self::parse_truth(obj),
+            Some("truth") => Self::parse_truth(obj, "truth"),
+            Some("noul") => Self::parse_truth(obj, "noul"),
             Some("choice") => Self::parse_choice(obj),
             Some("score") => Self::parse_score(obj),
+            Some("number") => Self::parse_number(obj),
             _ => None,
         });
         known.unwrap_or(Answer::Unknown(UnknownAnswer { answer_type, raw: Value::Null })).with_raw(raw)
     }
 
-    fn parse_truth(obj: &Map<String, Value>) -> Option<Answer> {
-        Some(Answer::Truth(TruthAnswer { truth: obj.get("truth")?.as_f64()?, raw: Value::Null }))
+    fn parse_truth(obj: &Map<String, Value>, field: &str) -> Option<Answer> {
+        Some(Answer::Truth(TruthAnswer { truth: obj.get(field)?.as_f64()?, raw: Value::Null }))
+    }
+
+    fn parse_number(obj: &Map<String, Value>) -> Option<Answer> {
+        let number = obj.get("number")?.as_f64()?;
+        let expected = obj.get("expected")?.as_f64()?;
+        let confidence = obj.get("confidence")?.as_f64()?;
+        let probabilities = obj
+            .get("probabilities")?
+            .as_object()?
+            .iter()
+            .map(|(k, v)| v.as_f64().map(|p| (k.clone(), p)))
+            .collect::<Option<_>>()?;
+        Some(Answer::Number(NumberAnswer { number, expected, confidence, probabilities, raw: Value::Null }))
     }
 
     fn parse_choice(obj: &Map<String, Value>) -> Option<Answer> {
@@ -208,6 +266,7 @@ impl Answer {
             Answer::Truth(a) => a.raw = raw,
             Answer::Choice(a) => a.raw = raw,
             Answer::Score(a) => a.raw = raw,
+            Answer::Number(a) => a.raw = raw,
             Answer::Unknown(a) => a.raw = raw,
         }
         self
@@ -223,6 +282,15 @@ pub struct Usage {
     pub input_tokens: Option<u64>,
     /// The output tokens.
     pub output_tokens: Option<u64>,
+}
+
+impl Usage {
+    /// Reads a `usage` object; a count it does not carry is `None`.
+    pub(crate) fn from_body(usage: Option<&Value>) -> Usage {
+        let usage = usage.and_then(Value::as_object);
+        let tokens = |k: &str| usage.and_then(|u| u.get(k)).and_then(Value::as_u64);
+        Usage { input_tokens: tokens("input_tokens"), output_tokens: tokens("output_tokens") }
+    }
 }
 
 /// The result of one `POST /v1/decide`.
@@ -261,11 +329,9 @@ impl Decision {
             None | Some(Value::Null) => IndexMap::new(),
             Some(_) => return Err(invalid("answers is not an object")),
         };
-        let usage = obj.get("usage").and_then(Value::as_object);
-        let tokens = |k: &str| usage.and_then(|u| u.get(k)).and_then(Value::as_u64);
         Ok(Decision {
             model: obj.get("model").and_then(Value::as_str).map(str::to_owned),
-            usage: Usage { input_tokens: tokens("input_tokens"), output_tokens: tokens("output_tokens") },
+            usage: Usage::from_body(obj.get("usage")),
             answers,
             latency_ms: header(headers, "x-decisionnode-latency-ms").and_then(|v| v.trim().parse::<f64>().ok()),
             safety: header(headers, "x-decisionnode-safety").map(|v| Safety::parse(&v)),
@@ -426,6 +492,31 @@ mod tests {
         assert_eq!(d["n"].answer_type(), None);
         assert_eq!(d["n"].raw(), &json!(7));
         assert_eq!(d["ok"].truth(), Some(0.5));
+    }
+
+    #[test]
+    fn noul_reads_as_truth_and_number_answers_parse() {
+        let body = json!({"answers": {
+            "n": {"type": "noul", "noul": 0.25},
+            "bad_noul": {"type": "noul", "truth": 0.25},
+            "cars": {"type": "number", "number": 7, "expected": 7.0, "confidence": 0.78,
+                     "probabilities": {"6": 0.105, "7": 0.783, "8": 0.098}},
+            "fine": {"type": "number", "number": -2.5, "expected": -2.35, "confidence": 0.5,
+                     "probabilities": {"-2.5": 0.5, "0.000001": 0.002}},
+            "bad_number": {"type": "number", "number": "7", "expected": 7.0, "confidence": 0.78, "probabilities": {}}
+        }});
+        let d = Decision::from_response(body, 200, &HeaderMap::new()).unwrap();
+        assert_eq!(d["n"].truth(), Some(0.25));
+        assert_eq!(d["n"].answer_type(), Some("truth"));
+        assert_eq!(d["n"].raw()["type"], "noul");
+        assert!(matches!(d["bad_noul"], Answer::Unknown(_)));
+        assert_eq!(d["bad_noul"].answer_type(), Some("noul"));
+        let cars = d["cars"].as_number().unwrap();
+        assert_eq!(cars.number, 7.0);
+        assert_eq!(cars.probabilities.keys().collect::<Vec<_>>(), ["6", "7", "8"]);
+        assert_eq!(d["fine"].as_number().unwrap().probabilities["0.000001"], 0.002);
+        assert_eq!(d["fine"].number(), Some(-2.5));
+        assert!(matches!(d["bad_number"], Answer::Unknown(_)));
     }
 
     #[test]

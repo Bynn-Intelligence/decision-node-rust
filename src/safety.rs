@@ -1,6 +1,7 @@
 //! The safety check result carried by every decision on the hosted API.
 
 use indexmap::IndexMap;
+use serde_json::Value;
 
 /// What the hosted API's safety check found for a request, parsed from the
 /// `x-decisionnode-safety` response header.
@@ -84,6 +85,33 @@ impl Safety {
         safety
     }
 
+    /// Reads the body form of the check, as session replies and the
+    /// `x-decisionnode-safety-body` field carry it: `{"checked": true,
+    /// "harm": 0.0021, "self_harm": 0.0008, "flagged": []}`, or
+    /// `{"checked": false, "reason": "<code>"}`. Other number fields are kept
+    /// in [`Safety::categories`].
+    pub fn from_body(body: &Value) -> Option<Safety> {
+        let obj = body.as_object()?;
+        let checked = obj.get("checked").and_then(Value::as_bool).unwrap_or(true);
+        let categories: IndexMap<String, f64> =
+            obj.iter().filter_map(|(k, v)| Some((k.clone(), v.as_f64()?))).collect();
+        Some(Safety {
+            checked,
+            harm: categories.get("harm").copied(),
+            self_harm: categories.get("self_harm").copied(),
+            flagged: obj
+                .get("flagged")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect(),
+            reason: obj.get("reason").and_then(Value::as_str).map(str::to_owned),
+            categories,
+        })
+    }
+
     /// True when a category was flagged.
     pub fn is_flagged(&self) -> bool {
         !self.flagged.is_empty()
@@ -117,6 +145,18 @@ mod tests {
         assert!(!s.checked);
         assert_eq!(s.reason.as_deref(), Some("no-model-question"));
         assert_eq!(s.harm, None);
+    }
+
+    #[test]
+    fn body_form() {
+        let s = Safety::from_body(&serde_json::json!({"checked": true, "harm": 0.912, "self_harm": 0.0041, "flagged": ["harm"], "blocked": "harm"})).unwrap();
+        assert!(s.checked);
+        assert_eq!(s.harm, Some(0.912));
+        assert_eq!(s.flagged, vec!["harm"]);
+        let u = Safety::from_body(&serde_json::json!({"checked": false, "reason": "no-model-question"})).unwrap();
+        assert!(!u.checked);
+        assert_eq!(u.reason.as_deref(), Some("no-model-question"));
+        assert!(Safety::from_body(&serde_json::json!(null)).is_none());
     }
 
     #[test]

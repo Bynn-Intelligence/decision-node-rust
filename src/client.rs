@@ -6,17 +6,20 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use bytes::Bytes;
 use futures_util::stream::{self, StreamExt};
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue, ACCEPT, AUTHORIZATION, CONTENT_TYPE, USER_AGENT};
 use reqwest::Method;
 use serde::Serialize;
 use serde_json::{Map, Value};
 
+use crate::check::check_questions;
 use crate::error::{header, retry_after, Error, ErrorKind, Result};
 use crate::http::HttpSettings;
-use crate::image::Image;
-use crate::question::{choice, score, truth, Choice, Question, Score, Truth};
-use crate::response::{ChoiceAnswer, Decision, DecisionResult, ModelInfo, ScoreAnswer, TruthAnswer};
+use crate::image::{check_images, Image};
+use crate::question::{choice, score, truth, Choice, Number, Question, Score, Truth};
+use crate::response::{ChoiceAnswer, Decision, DecisionResult, ModelInfo, NumberAnswer, ScoreAnswer, TruthAnswer};
+use crate::upload::UploadCache;
 
 /// The base URL of the hosted API.
 pub const DEFAULT_BASE_URL: &str = "https://api.decisionnode.com";
@@ -28,8 +31,14 @@ pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 pub const DEFAULT_MAX_RETRIES: u32 = 2;
 /// How many requests [`DecisionNode::decide_many`] sends at a time.
 pub const DEFAULT_CONCURRENCY: usize = 8;
+/// Local images of one request (or session frame, or batch line) that total
+/// fewer bytes than this go inline as base64; at or above it they are
+/// uploaded and sent by upload id. Below about half a megabyte the base64
+/// costs less than the extra round trips of an upload. Set another value with
+/// [`ClientBuilder::inline_threshold`].
+pub const DEFAULT_INLINE_THRESHOLD: usize = 524_288;
 
-const USER_AGENT_VALUE: &str = concat!("decisionnode-rust/", env!("CARGO_PKG_VERSION"));
+pub(crate) const USER_AGENT_VALUE: &str = concat!("decisionnode-rust/", env!("CARGO_PKG_VERSION"));
 
 /// A wait between attempts, see [`ClientBuilder::sleeper`].
 pub type Sleeper = Arc<dyn Fn(Duration) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
@@ -38,6 +47,11 @@ pub type Sleeper = Arc<dyn Fn(Duration) -> Pin<Box<dyn Future<Output = ()> + Sen
 fn given(value: String) -> Option<String> {
     Some(value).filter(|v| !v.is_empty())
 }
+
+/// The `error_type`s of a reference to an upload that is no longer usable.
+/// One the client placed itself is uploaded again and the request resent
+/// once.
+const STALE_UPLOAD: [&str; 4] = ["upload_expired", "upload_consumed", "upload_not_found", "upload_incomplete"];
 
 // --------------------------------------------------------------------------- request
 
@@ -59,6 +73,28 @@ pub struct DecideRequest {
     questions: Vec<(String, Question)>,
     images: Vec<Image>,
     model: Option<String>,
+}
+
+/// A request checked and ready to send: its body without the images, and the
+/// images, whose wire form is chosen when it is sent.
+pub(crate) struct Prepared {
+    pub(crate) body: Map<String, Value>,
+    pub(crate) images: Vec<Image>,
+}
+
+/// Builds a question map, refusing an empty one and a question that cannot
+/// be serialised (argument errors), then checks the API's fixed rules.
+pub(crate) fn build_questions(questions: Vec<(String, Question)>) -> Result<Map<String, Value>> {
+    if questions.is_empty() {
+        return Err(Error::invalid("questions must hold at least one question"));
+    }
+    let mut map = Map::new();
+    for (id, q) in questions {
+        let wire = q.into_value().map_err(|e| Error::invalid(format!("question {id:?}: {e}")))?;
+        map.insert(id, wire);
+    }
+    check_questions(&map)?;
+    Ok(map)
 }
 
 impl DecideRequest {
@@ -100,7 +136,8 @@ impl DecideRequest {
         self
     }
 
-    /// Adds an image.
+    /// Adds an image. Prefer [`Image::url`] when the image is online: nothing
+    /// is uploaded.
     pub fn image(mut self, image: Image) -> DecideRequest {
         self.images.push(image);
         self
@@ -119,29 +156,22 @@ impl DecideRequest {
         self
     }
 
-    fn into_body(self, default_model: &str) -> Result<Value> {
-        if self.questions.is_empty() {
-            return Err(Error::invalid("questions must hold at least one question"));
-        }
+    /// Checks the request and builds its body: an empty question map or a
+    /// value that cannot be serialised is an argument error; a question or
+    /// image the API would refuse is the API's own error, before any request.
+    pub(crate) fn prepare(self, default_model: &str) -> Result<Prepared> {
+        let questions = build_questions(self.questions)?;
         let state = match self.state {
-            None => Value::String(String::new()),
-            Some(Ok(Value::Null)) => Value::String(String::new()),
+            None | Some(Ok(Value::Null)) => Value::String(String::new()),
             Some(Ok(v)) => v,
             Some(Err(e)) => return Err(Error::invalid(e)),
         };
-        let mut questions = Map::new();
-        for (id, q) in self.questions {
-            let wire = q.into_value().map_err(|e| Error::invalid(format!("question {id:?}: {e}")))?;
-            questions.insert(id, wire);
-        }
+        check_images(&self.images)?;
         let mut body = Map::new();
         body.insert("model".into(), Value::String(self.model.unwrap_or_else(|| default_model.to_owned())));
         body.insert("state".into(), state);
         body.insert("questions".into(), Value::Object(questions));
-        if !self.images.is_empty() {
-            body.insert("images".into(), self.images.iter().map(Image::to_wire).collect());
-        }
-        Ok(Value::Object(body))
+        Ok(Prepared { body, images: self.images })
     }
 }
 
@@ -203,6 +233,7 @@ pub struct ClientBuilder {
     model: Option<String>,
     timeout: Option<std::result::Result<Duration, String>>,
     max_retries: Option<std::result::Result<u32, String>>,
+    inline_threshold: Option<std::result::Result<usize, String>>,
     headers: Vec<(String, String)>,
     http: HttpSettings,
     sleeper: Option<Sleeper>,
@@ -216,6 +247,7 @@ impl fmt::Debug for ClientBuilder {
             .field("model", &self.model)
             .field("timeout", &self.timeout)
             .field("max_retries", &self.max_retries)
+            .field("inline_threshold", &self.inline_threshold)
             .finish_non_exhaustive()
     }
 }
@@ -274,9 +306,19 @@ impl ClientBuilder {
         self
     }
 
+    /// The inline threshold in bytes: a request's local images that total
+    /// fewer bytes go inline as base64, at or above it they are uploaded.
+    /// Default: [`DEFAULT_INLINE_THRESHOLD`]. 0 uploads every local image. A
+    /// negative value fails [`ClientBuilder::build`].
+    pub fn inline_threshold<T: TryInto<usize>>(mut self, bytes: T) -> ClientBuilder {
+        self.inline_threshold =
+            Some(bytes.try_into().map_err(|_| "inline_threshold must be a number of bytes, 0 or more".to_owned()));
+        self
+    }
+
     /// A header sent on every request, beside the client's own. For example
     /// `x-decisionnode-safety-body: true` adds the safety result to the
-    /// response body.
+    /// response body. It is never sent to the storage URL of an upload.
     pub fn header(mut self, name: impl Into<String>, value: impl Into<String>) -> ClientBuilder {
         self.headers.push((name.into(), value.into()));
         self
@@ -318,9 +360,11 @@ impl ClientBuilder {
         self
     }
 
-    /// Replaces the wait between attempts. The function gets each wait the
-    /// client schedules and returns the future to await; the default is
-    /// `tokio::time::sleep`. Meant for tests, to record the waits without
+    /// Replaces every wait the client schedules: between attempts, between
+    /// retries of an upload, between the polls of
+    /// [`DecisionNode::run_batch`] and before a session is reopened. The
+    /// function gets each wait and returns the future to await; the default
+    /// is `tokio::time::sleep`. Meant for tests, to record the waits without
     /// spending them.
     ///
     /// ```
@@ -348,7 +392,8 @@ impl ClientBuilder {
     /// Builds the client. Fails, with an error of the base kind and no
     /// status, on a header name or value that is not valid, a base URL that is
     /// not `https` (plain `http` only for `localhost`, `127.0.0.1` and `::1`),
-    /// a timeout of zero or below and a negative `max_retries`. A missing API key is reported by the first call,
+    /// a timeout of zero or below, a negative `max_retries` and a negative
+    /// `inline_threshold`. A missing API key is reported by the first call,
     /// before it sends.
     pub fn build(self) -> Result<DecisionNode> {
         let env = |name: &str| std::env::var(name).ok().filter(|v| !v.is_empty());
@@ -372,6 +417,7 @@ impl ClientBuilder {
             return Err(Error::invalid("timeout must be above 0"));
         }
         let max_retries = self.max_retries.unwrap_or(Ok(DEFAULT_MAX_RETRIES)).map_err(Error::invalid)?;
+        let inline_threshold = self.inline_threshold.unwrap_or(Ok(DEFAULT_INLINE_THRESHOLD)).map_err(Error::invalid)?;
         let http = self.http.build(base_url.starts_with("https:"))?;
         Ok(DecisionNode {
             inner: Arc::new(Inner {
@@ -380,9 +426,11 @@ impl ClientBuilder {
                 model: self.model.or_else(|| env("DECISIONNODE_MODEL")).unwrap_or_else(|| DEFAULT_MODEL.to_owned()),
                 timeout,
                 max_retries,
+                inline_threshold,
                 headers,
                 http,
                 sleeper: self.sleeper,
+                uploads: UploadCache::default(),
             }),
         })
     }
@@ -399,7 +447,7 @@ impl ClientBuilder {
 /// The DecisionNode client.
 ///
 /// Cheap to clone and safe to share between tasks and threads: clones share
-/// one connection pool.
+/// one connection pool and one upload cache.
 ///
 /// ```no_run
 /// use decisionnode::{choice, score, truth, DecideRequest, DecisionNode};
@@ -425,18 +473,20 @@ impl ClientBuilder {
 /// ```
 #[derive(Clone)]
 pub struct DecisionNode {
-    inner: Arc<Inner>,
+    pub(crate) inner: Arc<Inner>,
 }
 
-struct Inner {
-    api_key: Option<String>,
-    base_url: String,
-    model: String,
-    timeout: Duration,
-    max_retries: u32,
-    headers: HeaderMap,
-    http: reqwest::Client,
-    sleeper: Option<Sleeper>,
+pub(crate) struct Inner {
+    pub(crate) api_key: Option<String>,
+    pub(crate) base_url: String,
+    pub(crate) model: String,
+    pub(crate) timeout: Duration,
+    pub(crate) max_retries: u32,
+    pub(crate) inline_threshold: usize,
+    pub(crate) headers: HeaderMap,
+    pub(crate) http: reqwest::Client,
+    pub(crate) sleeper: Option<Sleeper>,
+    pub(crate) uploads: UploadCache,
 }
 
 impl fmt::Debug for DecisionNode {
@@ -447,6 +497,7 @@ impl fmt::Debug for DecisionNode {
             .field("api_key", &self.inner.api_key.as_ref().map(|_| "<set>"))
             .field("timeout", &self.inner.timeout)
             .field("max_retries", &self.inner.max_retries)
+            .field("inline_threshold", &self.inner.inline_threshold)
             .finish()
     }
 }
@@ -483,16 +534,72 @@ impl DecisionNode {
         &self.inner.model
     }
 
-    /// Sends one decision request.
-    pub async fn decide(&self, request: DecideRequest) -> Result<Decision> {
-        let body = request.into_body(&self.inner.model)?;
-        Ok(self.decide_body(body).await?.decision)
+    /// The inline threshold in bytes, see [`ClientBuilder::inline_threshold`].
+    pub fn inline_threshold(&self) -> usize {
+        self.inner.inline_threshold
     }
 
-    async fn decide_body(&self, body: Value) -> Result<Answered> {
-        let reply = self.send(Method::POST, "/v1/decide", Some(&body)).await?;
-        let decision = Decision::from_response(reply.body, reply.status, &reply.headers)?;
-        Ok(Answered { decision, status: reply.status, headers: reply.headers })
+    /// Sends one decision request to `POST /v1/decide`.
+    ///
+    /// The request is checked first: a question or image the API would
+    /// refuse is refused here with the API's own error kind, before anything
+    /// is sent. Local images go inline or are uploaded by the inline
+    /// threshold.
+    pub async fn decide(&self, request: DecideRequest) -> Result<Decision> {
+        let prepared = request.prepare(&self.inner.model)?;
+        Ok(self.decision_call("/v1/decide", prepared).await?.decision)
+    }
+
+    /// Sends one decision request to `POST /v1/systemone`, the strict path:
+    /// the model is always sent, a `truth` question is written with the wire
+    /// type that path takes (`noul`), and its answers are read back into
+    /// [`TruthAnswer`]. Every other question goes as given; the path answers
+    /// `truth`, `choice` and `score` only.
+    pub async fn systemone(&self, request: DecideRequest) -> Result<Decision> {
+        let mut prepared = request.prepare(&self.inner.model)?;
+        if let Some(Value::Object(questions)) = prepared.body.get_mut("questions") {
+            for q in questions.values_mut() {
+                if let Some(t) = q.get_mut("type").filter(|t| *t == "truth") {
+                    *t = Value::String("noul".into());
+                }
+            }
+        }
+        Ok(self.decision_call("/v1/systemone", prepared).await?.decision)
+    }
+
+    /// Sends a checked request, placing its images (inline, cached or
+    /// uploaded). A `400` naming an upload the client placed that is no longer
+    /// usable (expired, consumed, not found or incomplete) drops it from the
+    /// cache, uploads the image again and resends the request once; this is
+    /// not counted as a retry.
+    pub(crate) async fn decision_call(&self, path: &str, prepared: Prepared) -> Result<Answered> {
+        let Prepared { body, images } = prepared;
+        let mut body = Value::Object(body);
+        let mut resent = false;
+        loop {
+            let placed = self.place_images(&images, true, false).await?;
+            if let (false, Value::Object(map)) = (images.is_empty(), &mut body) {
+                map.insert("images".into(), Value::Array(placed.wires));
+            }
+            let reply = self.request_json(Method::POST, path, Some(&body), Policy::Default).await;
+            match reply {
+                Ok(reply) => {
+                    let decision = Decision::from_response(reply.body, reply.status, &reply.headers)?;
+                    return Ok(Answered { decision, status: reply.status, headers: reply.headers });
+                }
+                Err(e)
+                    if !resent
+                        && !placed.uploaded.is_empty()
+                        && e.kind() == ErrorKind::BadRequest
+                        && e.error_type().is_some_and(|t| STALE_UPLOAD.contains(&t)) =>
+                {
+                    log::debug!("{path}: a placed upload is stale ({}); uploading again", e.error_type().unwrap_or(""));
+                    self.inner.uploads.forget(&placed.uploaded);
+                    resent = true;
+                }
+                Err(e) => return Err(e),
+            }
+        }
     }
 
     /// Sends many decision requests, at most 8 at a time. See
@@ -504,16 +611,20 @@ impl DecisionNode {
         self.run_many(requests, DEFAULT_CONCURRENCY).await
     }
 
-    /// Sends many decision requests, at most `concurrency` at a time.
+    /// Sends many decision requests, at most `concurrency` at a time, over
+    /// the client's pooled connections.
     ///
     /// Every request is checked before any is sent: an invalid one (an empty
     /// question map, a state or question that cannot be serialised) is an
-    /// error of the base kind ([`Error::is_argument`]) and nothing is sent. So
-    /// is a `concurrency` below 1 (or one that does not fit a `usize`).
+    /// error of the base kind ([`Error::is_argument`]), and a question or
+    /// image the API would refuse is the API's own error ([`Error::is_local`]);
+    /// either way nothing is sent. So is a `concurrency` below 1 (or one that
+    /// does not fit a `usize`).
     ///
     /// Otherwise returns one result per request, in input order: the
     /// decision, or the error that request ended with. One failure does not
-    /// stop the others.
+    /// stop the others. Requests holding the same large image share one
+    /// upload.
     pub async fn decide_many_with<I, C>(&self, requests: I, concurrency: C) -> Result<Vec<DecisionResult>>
     where
         I: IntoIterator<Item = DecideRequest>,
@@ -527,13 +638,13 @@ impl DecisionNode {
     where
         I: IntoIterator<Item = DecideRequest>,
     {
-        let bodies = requests
+        let prepared = requests
             .into_iter()
             .enumerate()
-            .map(|(i, r)| r.into_body(&self.inner.model).map_err(|e| e.in_request(i)))
+            .map(|(i, r)| r.prepare(&self.inner.model).map_err(|e| if e.is_argument() { e.in_request(i) } else { e }))
             .collect::<Result<Vec<_>>>()?;
-        Ok(stream::iter(bodies)
-            .map(|b| async move { self.decide_body(b).await.map(|a| a.decision) })
+        Ok(stream::iter(prepared)
+            .map(|p| async move { self.decision_call("/v1/decide", p).await.map(|a| a.decision) })
             .buffered(concurrency)
             .collect()
             .await)
@@ -542,8 +653,8 @@ impl DecisionNode {
     /// Sends a one-question helper request and returns its decision with the
     /// response's status and headers, for `take_answer`.
     async fn ask(&self, request: DecideRequest) -> Result<Answered> {
-        let body = request.into_body(&self.inner.model)?;
-        self.decide_body(body).await
+        let prepared = request.prepare(&self.inner.model)?;
+        self.decision_call("/v1/decide", prepared).await
     }
 
     /// Asks one `truth` question, under the id `check`.
@@ -600,6 +711,33 @@ impl DecisionNode {
         take_answer(self.ask(request).await?, "score", crate::Answer::as_score)
     }
 
+    /// Asks one `number` question, under the id `number`.
+    ///
+    /// ```no_run
+    /// # async fn run(dn: decisionnode::DecisionNode) -> decisionnode::Result<()> {
+    /// use decisionnode::number;
+    ///
+    /// let cars = dn.number("Drone frame over row B4.", number("How many cars?").min(0).max(50)).await?;
+    /// println!("{} (expected {})", cars.number, cars.expected);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn number(&self, state: impl Serialize, question: Number) -> Result<NumberAnswer> {
+        self.number_with(state, question, CallOptions::new()).await
+    }
+
+    /// [`DecisionNode::number`] with images and a model, like
+    /// [`DecisionNode::decide`].
+    pub async fn number_with(
+        &self,
+        state: impl Serialize,
+        question: Number,
+        options: CallOptions,
+    ) -> Result<NumberAnswer> {
+        let request = options.apply(DecideRequest::new().state(state).question("number", question));
+        take_answer(self.ask(request).await?, "number", crate::Answer::as_number)
+    }
+
     /// Judges an action before it runs, with three fixed questions, worded
     /// the same in every DecisionNode SDK (see [`gate_questions`]): `risk` (a
     /// score from none to severe), `touches_production` (a truth) and
@@ -629,37 +767,69 @@ impl DecisionNode {
         self.decide(request).await
     }
 
-    /// Lists the models the key may use, with their published limits.
+    /// Lists the models the key may use, with their published limits (the
+    /// number grid, upload, session and batch limits included).
     pub async fn models(&self) -> Result<Vec<ModelInfo>> {
-        let reply = self.send(Method::GET, "/v1/models", None).await?;
+        let reply = self.request_json(Method::GET, "/v1/models", None, Policy::Default).await?;
         ModelInfo::list_from(reply.body, reply.status, &reply.headers)
     }
 
     /// Sends a body to `POST /v1/decide` exactly as given and returns the
     /// response body as parsed JSON. The way to use an API field that this
-    /// version of the SDK does not know yet.
+    /// version of the SDK does not know yet. Nothing is checked or changed.
     pub async fn decide_raw(&self, body: impl Serialize) -> Result<Value> {
         let body = to_value(body, "the body")?;
-        Ok(self.send(Method::POST, "/v1/decide", Some(&body)).await?.body)
+        Ok(self.request_json(Method::POST, "/v1/decide", Some(&body), Policy::Default).await?.body)
     }
 
     // ----------------------------------------------------------------------- transport
 
-    async fn send(&self, method: Method, path: &str, body: Option<&Value>) -> Result<Reply> {
-        let inner = &*self.inner;
-        let key = inner.api_key.as_deref().filter(|k| !k.is_empty()).ok_or_else(|| {
+    /// The `Authorization` value, or the error a call without a key gets
+    /// before it sends.
+    pub(crate) fn authorization(&self) -> Result<HeaderValue> {
+        let key = self.inner.api_key.as_deref().filter(|k| !k.is_empty()).ok_or_else(|| {
             Error::new(ErrorKind::Authentication, "no API key: pass one to the client or set DECISIONNODE_API_KEY")
         })?;
-        let auth = HeaderValue::from_str(&format!("Bearer {key}")).map_err(|e| {
+        let mut value = HeaderValue::from_str(&format!("Bearer {key}")).map_err(|e| {
             Error::invalid("the API key contains characters that cannot be sent in a header").with_source(e)
         })?;
+        value.set_sensitive(true);
+        Ok(value)
+    }
+
+    /// Sends a JSON body (or none) and parses the 2xx response as JSON.
+    pub(crate) async fn request_json(
+        &self,
+        method: Method,
+        path: &str,
+        body: Option<&Value>,
+        policy: Policy,
+    ) -> Result<Reply> {
+        let payload = body.map(Payload::json).transpose()?;
+        let raw = self.request(method, path, payload, policy).await?;
+        match serde_json::from_slice::<Value>(&raw.body) {
+            Ok(body) => Ok(Reply { body, status: raw.status, headers: raw.headers }),
+            Err(e) => Err(Error::new(ErrorKind::Server, "the response is not JSON")
+                .with_response(raw.status, &raw.headers)
+                .with_source(e)),
+        }
+    }
+
+    /// Sends one API call with retries and returns a 2xx response whole.
+    ///
+    /// The timeout covers each attempt from sending to the last byte of the
+    /// body. Only 2xx is a success; redirects are never followed, so a 3xx is
+    /// an error like any other status.
+    pub(crate) async fn request(
+        &self,
+        method: Method,
+        path: &str,
+        payload: Option<Payload>,
+        policy: Policy,
+    ) -> Result<RawReply> {
+        let inner = &*self.inner;
+        let auth = self.authorization()?;
         let url = format!("{}{}", inner.base_url, path);
-        let payload = match body {
-            Some(b) => Some(
-                serde_json::to_vec(b).map_err(|e| Error::invalid("the body cannot be serialised").with_source(e))?,
-            ),
-            None => None,
-        };
 
         let mut attempt: u32 = 0;
         loop {
@@ -672,7 +842,7 @@ impl DecisionNode {
                 .header(USER_AGENT, USER_AGENT_VALUE)
                 .header(ACCEPT, "application/json");
             if let Some(p) = &payload {
-                rb = rb.header(CONTENT_TYPE, "application/json").body(p.clone());
+                rb = rb.header(CONTENT_TYPE, p.content_type).body(p.bytes.clone());
             }
             if !inner.headers.is_empty() {
                 rb = rb.headers(inner.headers.clone());
@@ -704,61 +874,98 @@ impl DecisionNode {
                         err.kind(),
                         attempt + 1
                     );
-                    if !err.is_transport() || attempt >= inner.max_retries {
+                    // A batch call that may have been applied is never repeated
+                    // after an unseen answer.
+                    if !err.is_transport() || attempt >= inner.max_retries || policy == Policy::Mutation {
                         return Err(err);
                     }
                     self.wait(backoff(attempt)).await;
                 }
-                Ok((status, headers, bytes)) => {
+                Ok((status, headers, body)) => {
                     log::debug!(
                         "{method} {path} -> {status} request_id={} in {} ms (attempt {})",
                         header(&headers, "x-request-id").unwrap_or_default(),
                         started.elapsed().as_millis(),
                         attempt + 1
                     );
-                    // Only 2xx is a success. Redirects are never followed, so a 3xx
-                    // arrives here and is an error like any other status.
                     if (200..=299).contains(&status) {
-                        return match serde_json::from_slice::<Value>(&bytes) {
-                            Ok(body) => Ok(Reply { body, status, headers }),
-                            Err(e) => Err(Error::new(ErrorKind::Server, "the response is not JSON")
-                                .with_response(status, &headers)
-                                .with_source(e)),
-                        };
+                        return Ok(RawReply { status, headers, body });
                     }
-                    if is_retryable(status) && attempt < inner.max_retries {
-                        self.wait(retry_after(&headers).unwrap_or_else(|| backoff(attempt))).await;
-                    } else {
-                        return Err(Error::from_response(status, &headers, &bytes));
+                    let retryable = match policy {
+                        Policy::Mutation => matches!(status, 429 | 529),
+                        Policy::Default | Policy::SessionOpen => is_retryable(status),
+                    };
+                    if !retryable || attempt >= inner.max_retries {
+                        return Err(Error::from_response(status, &headers, &body));
                     }
+                    if policy == Policy::SessionOpen && status == 429 {
+                        let err = Error::from_response(status, &headers, &body);
+                        if err.kind() == ErrorKind::SessionLimit {
+                            return Err(err);
+                        }
+                    }
+                    self.wait(retry_after(&headers).unwrap_or_else(|| backoff(attempt))).await;
                 }
             }
             attempt += 1;
         }
     }
-}
 
-/// A 2xx response whose body is JSON.
-struct Reply {
-    body: Value,
-    status: u16,
-    headers: HeaderMap,
-}
-
-/// A decision with the status and headers of its response.
-struct Answered {
-    decision: Decision,
-    status: u16,
-    headers: HeaderMap,
-}
-
-impl DecisionNode {
-    async fn wait(&self, duration: Duration) {
+    /// Waits through the client's sleeper (tests replace it).
+    pub(crate) async fn wait(&self, duration: Duration) {
         match &self.inner.sleeper {
             Some(sleeper) => sleeper(duration).await,
             None => tokio::time::sleep(duration).await,
         }
     }
+}
+
+/// Which failures an API call retries.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Policy {
+    /// 408, 429, every 5xx, timeouts and connection errors.
+    Default,
+    /// Batch create, add and finalize: only 429 and 529, which the API never
+    /// applies; never after a timeout, a lost answer or a 5xx.
+    Mutation,
+    /// Opening a session: as `Default`, except that a 429
+    /// `session_limit_exceeded` is never retried.
+    SessionOpen,
+}
+
+/// A request body and its content type.
+pub(crate) struct Payload {
+    pub(crate) bytes: Bytes,
+    pub(crate) content_type: &'static str,
+}
+
+impl Payload {
+    pub(crate) fn json(body: &Value) -> Result<Payload> {
+        let bytes =
+            serde_json::to_vec(body).map_err(|e| Error::invalid("the body cannot be serialised").with_source(e))?;
+        Ok(Payload { bytes: bytes.into(), content_type: "application/json" })
+    }
+}
+
+/// A 2xx response, its body unread.
+pub(crate) struct RawReply {
+    pub(crate) status: u16,
+    pub(crate) headers: HeaderMap,
+    pub(crate) body: Bytes,
+}
+
+/// A 2xx response whose body is JSON.
+pub(crate) struct Reply {
+    pub(crate) body: Value,
+    pub(crate) status: u16,
+    pub(crate) headers: HeaderMap,
+}
+
+/// A decision with the status and headers of its response.
+pub(crate) struct Answered {
+    pub(crate) decision: Decision,
+    status: u16,
+    headers: HeaderMap,
 }
 
 /// `https`, or `http` to the local machine only, so a key never travels
@@ -768,12 +975,17 @@ fn check_base_url(base_url: &str) -> Result<()> {
         .map_err(|e| Error::invalid(format!("base_url {base_url:?} is not a valid URL: {e}")).with_source(e))?;
     match url.scheme() {
         "https" => Ok(()),
-        "http" if matches!(url.host_str(), Some("localhost" | "127.0.0.1" | "[::1]")) => Ok(()),
+        "http" if is_loopback(&url) => Ok(()),
         "http" => Err(Error::invalid(format!(
             "base_url {base_url:?} uses plain http; use https (http is accepted only for localhost, 127.0.0.1 and ::1)"
         ))),
         other => Err(Error::invalid(format!("base_url {base_url:?}: the scheme must be https, not {other}"))),
     }
+}
+
+/// The hosts `localhost`, `127.0.0.1` and `::1`, compared whole.
+pub(crate) fn is_loopback(url: &reqwest::Url) -> bool {
+    matches!(url.host_str(), Some("localhost" | "127.0.0.1" | "[::1]"))
 }
 
 pub(crate) fn check_concurrency<C: TryInto<usize>>(concurrency: C) -> Result<usize> {
@@ -783,7 +995,7 @@ pub(crate) fn check_concurrency<C: TryInto<usize>>(concurrency: C) -> Result<usi
     }
 }
 
-fn to_value(value: impl Serialize, what: &str) -> Result<Value> {
+pub(crate) fn to_value(value: impl Serialize, what: &str) -> Result<Value> {
     serde_json::to_value(value).map_err(|e| Error::invalid(format!("{what} cannot be serialised to JSON: {e}")))
 }
 
@@ -798,7 +1010,7 @@ fn take_answer<T: Clone>(a: Answered, id: &str, pick: fn(&crate::Answer) -> Opti
     })
 }
 
-fn transport_error(e: reqwest::Error, timeout: Duration) -> Error {
+pub(crate) fn transport_error(e: reqwest::Error, timeout: Duration) -> Error {
     if e.is_timeout() {
         Error::new(ErrorKind::Timeout, format!("no response within {:.1} s", timeout.as_secs_f64())).with_source(e)
     } else if e.is_builder() {
@@ -855,6 +1067,10 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    fn body(request: DecideRequest) -> Result<Value> {
+        request.prepare("decisionnode-latest").map(|p| Value::Object(p.body))
+    }
+
     #[test]
     fn retryable_statuses() {
         for s in [408, 429, 500, 502, 503, 504, 520, 529, 599] {
@@ -879,7 +1095,7 @@ mod tests {
 
     #[test]
     fn body_defaults() {
-        let body = DecideRequest::new().question("q", truth("?")).into_body("decisionnode-latest").unwrap();
+        let body = body(DecideRequest::new().question("q", truth("?"))).unwrap();
         assert_eq!(
             body,
             json!({"model": "decisionnode-latest", "state": "", "questions": {"q": {"type": "truth", "instructions": "?"}}})
@@ -888,13 +1104,14 @@ mod tests {
 
     #[test]
     fn body_with_model_state_and_replaced_question() {
-        let body = DecideRequest::new()
-            .state(json!(["a", 1]))
-            .question("q", truth("first"))
-            .question("q", truth("second"))
-            .model("decisionnode-1.0-flash")
-            .into_body("decisionnode-latest")
-            .unwrap();
+        let body = body(
+            DecideRequest::new()
+                .state(json!(["a", 1]))
+                .question("q", truth("first"))
+                .question("q", truth("second"))
+                .model("decisionnode-1.0-flash"),
+        )
+        .unwrap();
         assert_eq!(body["model"], "decisionnode-1.0-flash");
         assert_eq!(body["state"], json!(["a", 1]));
         assert_eq!(body["questions"]["q"]["instructions"], "second");
@@ -903,9 +1120,20 @@ mod tests {
 
     #[test]
     fn empty_questions_are_refused_before_sending() {
-        let err = DecideRequest::new().state("s").into_body("m").unwrap_err();
+        let err = body(DecideRequest::new().state("s")).unwrap_err();
         assert!(err.is_argument());
         assert_eq!(err.kind(), ErrorKind::Other);
+    }
+
+    #[test]
+    fn question_and_image_faults_are_the_apis_errors() {
+        let err = body(DecideRequest::new().question("q", crate::Truth::new())).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::BadRequest);
+        assert!(err.is_local());
+        let err =
+            body(DecideRequest::new().question("q", truth("?")).image(Image::bytes("g", &b"GIF89a"[..]))).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::BadRequest);
+        assert_eq!(err.status(), None);
     }
 
     #[tokio::test]
@@ -924,9 +1152,11 @@ mod tests {
             model: dn.inner.model.clone(),
             timeout: dn.inner.timeout,
             max_retries: dn.inner.max_retries,
+            inline_threshold: dn.inner.inline_threshold,
             headers: dn.inner.headers.clone(),
             http: dn.inner.http.clone(),
             sleeper: None,
+            uploads: UploadCache::default(),
         }
     }
 
@@ -958,10 +1188,14 @@ mod tests {
     }
 
     #[test]
-    fn max_retries_must_not_be_negative() {
+    fn max_retries_and_inline_threshold_must_not_be_negative() {
         assert!(DecisionNode::builder().max_retries(-1).build().unwrap_err().is_argument());
         assert!(DecisionNode::builder().max_retries(0).build().is_ok());
         assert!(DecisionNode::builder().max_retries(4u64).build().is_ok());
+        assert!(DecisionNode::builder().inline_threshold(-1).build().unwrap_err().is_argument());
+        let dn = DecisionNode::builder().inline_threshold(0).build().unwrap();
+        assert_eq!(dn.inline_threshold(), 0);
+        assert_eq!(DecisionNode::builder().build().unwrap().inline_threshold(), DEFAULT_INLINE_THRESHOLD);
     }
 
     #[tokio::test]
@@ -1044,6 +1278,11 @@ mod tests {
         assert!(err.is_argument());
         assert!(err.message().starts_with("request 2: "), "{}", err.message());
         assert!(dn.decide_many(requests).await.unwrap_err().is_argument());
+        let bad_image = vec![
+            DecideRequest::new().question("q", truth("a?")),
+            DecideRequest::new().question("q", truth("b?")).image(Image::bytes("g", &b"GIF89a"[..])),
+        ];
+        assert_eq!(dn.decide_many(bad_image).await.unwrap_err().kind(), ErrorKind::BadRequest);
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 0);
     }

@@ -2,7 +2,7 @@
 name = "bynn-decisionnode"
 version = "0.1.0"
 edition = "2021"
-description = "The official Rust client for the DecisionNode API: typed truth, choice and score decisions."
+description = "The official Rust client for the DecisionNode API: typed truth, choice, score and number decisions, and image uploads."
 license = "MIT"
 authors = ["Bynn Intelligence, Inc."]
 repository = "https://github.com/Bynn-Intelligence/decision-node-rust"
@@ -27,14 +27,17 @@ native-tls = ["reqwest/native-tls"]
 
 [dependencies]
 base64 = "0.22"
+bytes = "1"
 fastrand = "2"
-futures-util = { version = "0.3", default-features = false, features = ["std"] }
+futures-util = { version = "0.3", default-features = false, features = ["std", "sink"] }
 indexmap = "2"
 log = "0.4"
+md-5 = "0.11.0"
 reqwest = { version = "0.12", default-features = false, features = ["charset", "http2"] }
 serde = "1"
 serde_json = { version = "1", features = ["preserve_order", "float_roundtrip"] }
-tokio = { version = "1", features = ["time"] }
+sha2 = "0.11.0"
+tokio = { version = "1", features = ["time", "sync", "rt"] }
 
 [dev-dependencies]
 regex = "1"

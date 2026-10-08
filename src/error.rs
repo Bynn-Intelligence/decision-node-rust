@@ -26,7 +26,10 @@ pub type DecisionNodeError = Error;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum ErrorKind {
-    /// 400: the request is well formed but not usable.
+    /// 400: the request is well formed but not usable. Also raised before
+    /// sending, without a status, for a request that breaks one of the API's
+    /// fixed rules (an image of an unknown format, more than 4 images, a
+    /// choice of more than 255 options): see [`Error::is_local`].
     BadRequest,
     /// 400 with `error_type` `max_tokens_exceeded`: the request is over the
     /// model's context limit. A special case of [`ErrorKind::BadRequest`].
@@ -43,10 +46,16 @@ pub enum ErrorKind {
     PermissionDenied,
     /// 404: unknown path.
     NotFound,
-    /// 422: the request body failed validation. See [`Error::entries`].
+    /// 422: the request body failed validation. See [`Error::entries`]. Also
+    /// raised before sending, without a status, for a number grid the API
+    /// would refuse with a 422 and for a score without levels.
     Validation,
     /// 429: rate limited. See [`Error::retry_after`].
     RateLimit,
+    /// 429 with `error_type` `session_limit_exceeded`: the key holds as many
+    /// open sessions as it may. Never retried, since a count frees when a
+    /// session ends. A special case of [`ErrorKind::RateLimit`].
+    SessionLimit,
     /// 529: the service is overloaded. See [`Error::retry_after`].
     Overloaded,
     /// Any other 5xx, or a 2xx response whose body is not JSON or not a valid
@@ -80,6 +89,7 @@ impl ErrorKind {
             ErrorKind::NotFound => "NotFoundError",
             ErrorKind::Validation => "ValidationError",
             ErrorKind::RateLimit => "RateLimitError",
+            ErrorKind::SessionLimit => "SessionLimitError",
             ErrorKind::Overloaded => "OverloadedError",
             ErrorKind::Server => "ServerError",
             ErrorKind::Other => "DecisionNodeError",
@@ -89,10 +99,12 @@ impl ErrorKind {
     }
 
     /// The more general kind this one is a case of, if any:
-    /// [`ErrorKind::ContextLimit`] is a [`ErrorKind::BadRequest`].
+    /// [`ErrorKind::ContextLimit`] is a [`ErrorKind::BadRequest`] and
+    /// [`ErrorKind::SessionLimit`] a [`ErrorKind::RateLimit`].
     pub fn parent(self) -> Option<ErrorKind> {
         match self {
             ErrorKind::ContextLimit => Some(ErrorKind::BadRequest),
+            ErrorKind::SessionLimit => Some(ErrorKind::RateLimit),
             _ => None,
         }
     }
@@ -154,6 +166,28 @@ impl Error {
         Error::new(ErrorKind::Other, message)
     }
 
+    /// A request the API would refuse, refused before anything is sent: the
+    /// API's own kind, `error_type` and message, with no status and no request
+    /// id.
+    pub(crate) fn local(kind: ErrorKind, error_type: Option<&str>, message: impl Into<String>) -> Error {
+        let mut e = Error::new(kind, message);
+        e.inner.error_type = error_type.map(str::to_owned);
+        e
+    }
+
+    /// A storage `PUT` that failed: the base kind with the storage's status,
+    /// `error_type` `upload_failed` and the storage's error code in `reason`.
+    pub(crate) fn upload_failed(status: u16, body: &[u8]) -> Error {
+        let text = String::from_utf8_lossy(body);
+        let code =
+            text.split_once("<Code>").and_then(|(_, rest)| rest.split_once("</Code>")).map(|(code, _)| code.to_owned());
+        let mut e = Error::new(ErrorKind::Other, format!("the upload to storage failed with {status}"));
+        e.inner.status = Some(status);
+        e.inner.error_type = Some("upload_failed".into());
+        e.inner.reason = code;
+        e
+    }
+
     pub(crate) fn with_source(mut self, source: impl std::error::Error + Send + Sync + 'static) -> Error {
         self.inner.source = Some(Box::new(source));
         self
@@ -204,6 +238,7 @@ impl Error {
             403 => ErrorKind::PermissionDenied,
             404 => ErrorKind::NotFound,
             422 => ErrorKind::Validation,
+            429 if error_type.as_deref() == Some("session_limit_exceeded") => ErrorKind::SessionLimit,
             429 => ErrorKind::RateLimit,
             529 => ErrorKind::Overloaded,
             500..=599 => ErrorKind::Server,
@@ -215,8 +250,11 @@ impl Error {
         } else {
             None
         };
-        let retry_after =
-            if matches!(kind, ErrorKind::RateLimit | ErrorKind::Overloaded) { retry_after(headers) } else { None };
+        let retry_after = if matches!(kind, ErrorKind::RateLimit | ErrorKind::SessionLimit | ErrorKind::Overloaded) {
+            retry_after(headers)
+        } else {
+            None
+        };
 
         Error {
             inner: Box::new(Inner {
@@ -293,7 +331,8 @@ impl Error {
         self.inner.entries.as_deref()
     }
 
-    /// For a [`ErrorKind::RateLimit`] or [`ErrorKind::Overloaded`]: how long the
+    /// For a [`ErrorKind::RateLimit`], [`ErrorKind::SessionLimit`] or
+    /// [`ErrorKind::Overloaded`]: how long the
     /// server asks you to wait, from `retry-after-ms`, else `Retry-After` in
     /// seconds or as an HTTP date, capped at 60 seconds.
     pub fn retry_after(&self) -> Option<Duration> {
@@ -309,6 +348,13 @@ impl Error {
     /// error of the base kind ([`ErrorKind::Other`]) without a status.
     pub fn is_argument(&self) -> bool {
         self.inner.kind == ErrorKind::Other && self.inner.status.is_none()
+    }
+
+    /// True for a request refused before anything was sent because it breaks
+    /// one of the API's fixed rules: an error of the API's own kind (usually
+    /// [`ErrorKind::BadRequest`]) with no status.
+    pub fn is_local(&self) -> bool {
+        self.inner.status.is_none() && matches!(self.inner.kind, ErrorKind::BadRequest | ErrorKind::Validation)
     }
 
     /// True for a failure without a response: a timeout or a connection error.
@@ -436,6 +482,14 @@ pub(crate) fn parse_http_date(text: &str) -> Option<SystemTime> {
     {
         return None;
     }
+    civil_time(year, mon, day, h, mi, se)
+}
+
+/// A UTC date and time as a `SystemTime`.
+fn civil_time(year: i64, mon: u32, day: u32, h: u64, mi: u64, se: u64) -> Option<SystemTime> {
+    if !(1..=12).contains(&mon) || !(1..=31).contains(&day) || h > 23 || mi > 59 || se > 60 {
+        return None;
+    }
     // Days since 1970-01-01 in the proleptic Gregorian calendar.
     let (y, m) = if mon <= 2 { (year - 1, mon + 9) } else { (year, mon - 3) };
     let era = y.div_euclid(400);
@@ -445,6 +499,37 @@ pub(crate) fn parse_http_date(text: &str) -> Option<SystemTime> {
     let days = era * 146_097 + doe - 719_468;
     let secs = u64::try_from(days).ok()? * 86_400 + h * 3600 + mi * 60 + se;
     UNIX_EPOCH.checked_add(Duration::from_secs(secs))
+}
+
+/// Parses an RFC 3339 time as the API writes it (`2026-10-08T13:04:05Z`),
+/// with optional fractions of a second and a numeric offset.
+pub(crate) fn parse_rfc3339(text: &str) -> Option<SystemTime> {
+    let text = text.trim();
+    let (date, rest) = text.split_once(['T', 't', ' '])?;
+    let mut d = date.splitn(3, '-');
+    let year = d.next()?.parse::<i64>().ok()?;
+    let mon = d.next()?.parse::<u32>().ok()?;
+    let day = d.next()?.parse::<u32>().ok()?;
+    let (time, offset) = if let Some(t) = rest.strip_suffix(['Z', 'z']) {
+        (t, 0i64)
+    } else {
+        let at = rest.rfind(['+', '-'])?;
+        let (t, off) = rest.split_at(at);
+        let sign = if off.starts_with('-') { -1 } else { 1 };
+        let (oh, om) = off[1..].split_once(':')?;
+        (t, sign * (oh.parse::<i64>().ok()? * 3600 + om.parse::<i64>().ok()? * 60))
+    };
+    let time = time.split('.').next()?;
+    let mut t = time.splitn(3, ':');
+    let h = t.next()?.parse::<u64>().ok()?;
+    let mi = t.next()?.parse::<u64>().ok()?;
+    let se = t.next()?.parse::<u64>().ok()?;
+    let local = civil_time(year, mon, day, h, mi, se)?;
+    if offset >= 0 {
+        local.checked_sub(Duration::from_secs(offset as u64))
+    } else {
+        local.checked_add(Duration::from_secs(offset.unsigned_abs()))
+    }
 }
 
 #[cfg(test)]
@@ -477,6 +562,7 @@ mod tests {
             (408, r#"{}"#, ErrorKind::Other),
             (422, r#"{"detail":[]}"#, ErrorKind::Validation),
             (429, r#"{}"#, ErrorKind::RateLimit),
+            (429, r#"{"detail":{"error_type":"session_limit_exceeded"}}"#, ErrorKind::SessionLimit),
             (500, r#"{}"#, ErrorKind::Server),
             (502, "<html></html>", ErrorKind::Server),
             (529, r#"{}"#, ErrorKind::Overloaded),
@@ -506,6 +592,36 @@ mod tests {
         let e = Error::from_response(422, &h, br#"{"detail":[{"type":"missing"}]}"#);
         assert_eq!(e.entries().unwrap().len(), 1);
         assert_eq!(e.message(), "");
+    }
+
+    #[test]
+    fn session_limit_is_a_rate_limit() {
+        let h = headers(&[("retry-after", "3")]);
+        let e = Error::from_response(429, &h, br#"{"detail":{"error_type":"session_limit_exceeded","message":"x"}}"#);
+        assert_eq!(e.kind(), ErrorKind::SessionLimit);
+        assert!(e.is(ErrorKind::RateLimit));
+        assert_eq!(e.retry_after(), Some(Duration::from_secs(3)));
+    }
+
+    #[test]
+    fn storage_failures_carry_the_code() {
+        let e = Error::upload_failed(400, b"<?xml version=\"1.0\"?><Error><Code>BadDigest</Code></Error>");
+        assert_eq!(e.kind(), ErrorKind::Other);
+        assert_eq!(e.status(), Some(400));
+        assert_eq!(e.error_type(), Some("upload_failed"));
+        assert_eq!(e.reason(), Some("BadDigest"));
+        assert!(!e.is_argument());
+        assert_eq!(Error::upload_failed(307, b"").reason(), None);
+    }
+
+    #[test]
+    fn local_errors_have_no_status() {
+        let e = Error::local(ErrorKind::BadRequest, Some("api_usage_error"), "Too many images.");
+        assert!(e.is_local());
+        assert!(!e.is_argument());
+        assert_eq!(e.status(), None);
+        assert_eq!(e.error_type(), Some("api_usage_error"));
+        assert_eq!(e.to_string(), "Too many images.");
     }
 
     #[test]
@@ -546,6 +662,17 @@ mod tests {
         assert_eq!(retry_after_at(&h("Sun, 06 Nov 1994 08:49:40 GMT"), now), Some(Duration::from_secs(3)));
         assert_eq!(retry_after_at(&h("Sun, 06 Nov 1994 09:49:37 GMT"), now), Some(MAX_RETRY_AFTER));
         assert_eq!(retry_after_at(&h("Sun, 06 Nov 1994 08:00:00 GMT"), now), Some(Duration::ZERO));
+    }
+
+    #[test]
+    fn reads_rfc3339_times() {
+        let at = |t: &str| parse_rfc3339(t).map(|t| t.duration_since(UNIX_EPOCH).unwrap().as_secs());
+        assert_eq!(at("1994-11-06T08:49:37Z"), Some(784_111_777));
+        assert_eq!(at("1994-11-06T08:49:37.250Z"), Some(784_111_777));
+        assert_eq!(at("1994-11-06T10:49:37+02:00"), Some(784_111_777));
+        assert_eq!(at("1994-11-06T07:49:37-01:00"), Some(784_111_777));
+        assert_eq!(at("1994-13-06T08:49:37Z"), None);
+        assert_eq!(at("soon"), None);
     }
 
     #[test]

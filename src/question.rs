@@ -1,4 +1,4 @@
-//! Question builders: [`truth`], [`choice`] and [`score`].
+//! Question builders: [`truth`], [`choice`], [`score`] and [`number`].
 //!
 //! Each builder produces the wire form of one question. Instructions, option
 //! descriptions and levels take a string or any value that serialises to JSON,
@@ -15,8 +15,8 @@ fn to_json<T: Serialize>(value: T) -> Result<Value, String> {
     serde_json::to_value(value).map_err(|e| format!("a value cannot be serialised to JSON: {e}"))
 }
 
-/// One question, in its wire form. Built from [`Truth`], [`Choice`], [`Score`]
-/// or a [`serde_json::Value`].
+/// One question, in its wire form. Built from [`Truth`], [`Choice`], [`Score`],
+/// [`Number`] or a [`serde_json::Value`].
 #[derive(Clone, Debug, PartialEq)]
 pub struct Question {
     inner: Result<Value, String>,
@@ -54,6 +54,12 @@ impl From<Choice> for Question {
 impl From<Score> for Question {
     fn from(s: Score) -> Question {
         Question { inner: s.build() }
+    }
+}
+
+impl From<Number> for Question {
+    fn from(n: Number) -> Question {
+        Question { inner: n.build() }
     }
 }
 
@@ -384,6 +390,80 @@ impl Score {
     }
 }
 
+// --------------------------------------------------------------------------- number
+
+/// A `number` question: read or estimate a value on a grid from `min` to
+/// `max` in steps of `step`. Answered by the most likely value, the expected
+/// value and the probability of each likely value.
+///
+/// `min`, `max` and `step` are left out of the wire form unless given, so the
+/// API's defaults apply: 0, 255 and 1. A grid holds at most 4,096 values.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Number {
+    instructions: Option<Result<Value, String>>,
+    min: Option<Result<Value, String>>,
+    max: Option<Result<Value, String>>,
+    step: Option<Result<Value, String>>,
+}
+
+/// A `number` question with these instructions.
+///
+/// ```
+/// use decisionnode::number;
+///
+/// let cars = number("How many cars are visible in the image?").min(0).max(50);
+/// let rating = number("Rate the review from 0 to 5.").max(5).step(0.5);
+/// ```
+pub fn number(instructions: impl Serialize) -> Number {
+    Number::new().instructions(instructions)
+}
+
+impl Number {
+    /// A `number` question without instructions. The API needs them, so add
+    /// them with [`Number::instructions`].
+    pub fn new() -> Number {
+        Number::default()
+    }
+
+    /// What to count or read: a string, or any value that serialises to JSON.
+    pub fn instructions(mut self, instructions: impl Serialize) -> Number {
+        self.instructions = Some(to_json(instructions));
+        self
+    }
+
+    /// The lowest value. Default 0.
+    pub fn min(mut self, min: impl Serialize) -> Number {
+        self.min = Some(to_json(min));
+        self
+    }
+
+    /// The highest value the grid may reach; it need not be on the grid.
+    /// Default 255.
+    pub fn max(mut self, max: impl Serialize) -> Number {
+        self.max = Some(to_json(max));
+        self
+    }
+
+    /// The spacing of the grid, above 0. Default 1.
+    pub fn step(mut self, step: impl Serialize) -> Number {
+        self.step = Some(to_json(step));
+        self
+    }
+
+    fn build(self) -> Result<Value, String> {
+        let mut q = Map::new();
+        q.insert("type".into(), "number".into());
+        for (name, value) in
+            [("instructions", self.instructions), ("min", self.min), ("max", self.max), ("step", self.step)]
+        {
+            if let Some(v) = value {
+                q.insert(name.into(), v?);
+            }
+        }
+        Ok(Value::Object(q))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -453,6 +533,16 @@ mod tests {
     fn wire_maps_pass_through() {
         let raw = json!({"type": "truth", "instructions": "?", "criteria": {"true": "yes", "false": null}});
         assert_eq!(wire(raw.clone()), raw);
+    }
+
+    #[test]
+    fn number_leaves_out_what_is_not_given() {
+        assert_eq!(wire(number("How many?")), json!({"type": "number", "instructions": "How many?"}));
+        assert_eq!(
+            wire(number("Rating?").min(-2.5).max(5).step(0.25)),
+            json!({"type": "number", "instructions": "Rating?", "min": -2.5, "max": 5, "step": 0.25})
+        );
+        assert_eq!(wire(Number::new().min(0).max(10)), json!({"type": "number", "min": 0, "max": 10}));
     }
 
     #[test]
