@@ -9,7 +9,9 @@
 //!
 //! Beside [`DecisionNode::decide`] it covers every public call: the strict
 //! [`DecisionNode::systemone`] path, [`DecisionNode::models`], image uploads
-//! ([`DecisionNode::upload`], also chosen for you by size), and the Batch API ([`DecisionNode::batches`],
+//! ([`DecisionNode::upload`], also chosen for you by size), sessions
+//! ([`DecisionNode::open_session`], [`DecisionNode::supervise`], behind the
+//! default `sessions` feature) and the Batch API ([`DecisionNode::batches`],
 //! [`DecisionNode::run_batch`]).
 //!
 //! ```no_run
@@ -52,6 +54,8 @@ mod image;
 pub mod question;
 mod response;
 mod safety;
+#[cfg(feature = "sessions")]
+mod session;
 mod upload;
 
 pub use batch::{
@@ -71,6 +75,8 @@ pub use response::{
     Usage,
 };
 pub use safety::Safety;
+#[cfg(feature = "sessions")]
+pub use session::{Frame, FrameError, Reply, Session, SessionClosed, SessionEvent, SessionOptions, REOPEN_CODES};
 
 pub use indexmap;
 pub use reqwest;

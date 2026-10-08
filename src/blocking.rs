@@ -2,7 +2,8 @@
 //!
 //! It has the same methods as the asynchronous [`crate::DecisionNode`] and
 //! returns their results directly: decisions, uploads, the Batch API through
-//! [`DecisionNode::batches`]. It runs them on a small runtime of its own, so it
+//! [`DecisionNode::batches`] and, with the `sessions` feature, sessions with a
+//! blocking [`Session`]. It runs them on a small runtime of its own, so it
 //! must not be used from inside an asynchronous context: use the asynchronous
 //! client there.
 //!
@@ -246,3 +247,119 @@ impl Batches<'_> {
         self.client.run(self.client.client.batches().cancel(batch_id))
     }
 }
+
+#[cfg(feature = "sessions")]
+mod sessions {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use crate::error::Result;
+    use crate::session::{Frame, SessionClosed, SessionEvent, SessionOptions};
+
+    use super::DecisionNode;
+
+    /// A session of a blocking client. Its data (id, answers, limits) is read
+    /// through [`crate::Session`], which it dereferences to; its calls block.
+    pub struct Session {
+        session: crate::Session,
+        runtime: Arc<tokio::runtime::Runtime>,
+    }
+
+    impl std::fmt::Debug for Session {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_tuple("blocking::Session").field(&self.session).finish()
+        }
+    }
+
+    impl std::ops::Deref for Session {
+        type Target = crate::Session;
+
+        fn deref(&self) -> &crate::Session {
+            &self.session
+        }
+    }
+
+    impl Session {
+        /// See [`crate::Session::connect`].
+        pub fn connect(&self) -> Result<()> {
+            self.runtime.block_on(self.session.connect())
+        }
+
+        /// See [`crate::Session::send`].
+        pub fn send(&self, frame: Frame) -> Result<u64> {
+            self.runtime.block_on(self.session.send(frame))
+        }
+
+        /// See [`crate::Session::next_event`].
+        pub fn next_event(&self) -> Result<SessionEvent> {
+            self.runtime.block_on(self.session.next_event())
+        }
+
+        /// See [`crate::Session::next_event_timeout`].
+        pub fn next_event_timeout(&self, timeout: Duration) -> Result<Option<SessionEvent>> {
+            self.runtime.block_on(self.session.next_event_timeout(timeout))
+        }
+
+        /// The events as an iterator, ending after [`SessionEvent::Closed`].
+        pub fn replies(&self) -> impl Iterator<Item = SessionEvent> + '_ {
+            let mut done = false;
+            std::iter::from_fn(move || {
+                if done {
+                    return None;
+                }
+                let event = self.next_event().ok()?;
+                done = matches!(event, SessionEvent::Closed(_));
+                Some(event)
+            })
+        }
+
+        /// See [`crate::Session::end`].
+        pub fn end(&self) -> Result<()> {
+            self.runtime.block_on(self.session.end())
+        }
+
+        /// See [`crate::Session::close`].
+        pub fn close(&self) {
+            self.runtime.block_on(self.session.close())
+        }
+
+        /// The asynchronous session this one wraps.
+        pub fn as_async(&self) -> &crate::Session {
+            &self.session
+        }
+    }
+
+    impl DecisionNode {
+        /// See [`crate::DecisionNode::open_session`].
+        pub fn open_session(&self, options: SessionOptions) -> Result<Session> {
+            let session = self.run(self.client.open_session(options))?;
+            Ok(Session { session, runtime: self.runtime.clone() })
+        }
+
+        /// See [`crate::DecisionNode::supervise`]. The feed is read on a
+        /// thread of its own, so it may block between readings.
+        pub fn supervise<I, F>(&self, options: SessionOptions, feed: I, on_reply: F) -> Result<Option<SessionClosed>>
+        where
+            I: IntoIterator<Item = Frame>,
+            I::IntoIter: Send,
+            F: FnMut(SessionEvent),
+        {
+            let feed = feed.into_iter();
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<Frame>(1);
+            std::thread::scope(|scope| {
+                scope.spawn(move || {
+                    for frame in feed {
+                        if tx.blocking_send(frame).is_err() {
+                            break;
+                        }
+                    }
+                });
+                let stream = futures_util::stream::poll_fn(move |cx| rx.poll_recv(cx));
+                self.run(self.client.supervise(options, stream, on_reply))
+            })
+        }
+    }
+}
+
+#[cfg(feature = "sessions")]
+pub use sessions::Session;

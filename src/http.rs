@@ -18,6 +18,10 @@ type Step = Box<dyn FnOnce(reqwest::ClientBuilder) -> reqwest::ClientBuilder + S
 /// setting that turns them off, and a client certificate or extra root
 /// certificates add to the checks rather than replace them.
 ///
+/// The settings apply to every HTTP call, uploads to storage included. A
+/// session's WebSocket connects directly with the platform's root
+/// certificates.
+///
 /// ```
 /// use std::time::Duration;
 /// use decisionnode::{reqwest, HttpSettings};
