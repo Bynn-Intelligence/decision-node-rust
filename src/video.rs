@@ -5,9 +5,9 @@ use std::fmt::Write as _;
 
 use base64::Engine;
 use bytes::Bytes;
-use serde_json::{Map, Number, Value};
+use serde_json::{json, Map, Number, Value};
 
-use crate::check::{nesting_depth, Limits};
+use crate::check::{entry, nesting_depth, Limits};
 use crate::error::{Error, ErrorKind, Result};
 use crate::image::{sniff_media_type, Image};
 
@@ -232,7 +232,7 @@ impl Video {
 
     /// The video's wire form: `{"id", "fps", "start", "end", "frames"}`, the
     /// optional numbers only when given.
-    fn wire(&self) -> Value {
+    pub(crate) fn wire(&self) -> Value {
         match &self.source {
             VideoSource::Wire(v) => v.clone(),
             VideoSource::Typed { id, frames, fps, start, end } => {
@@ -308,9 +308,36 @@ fn decimal(x: f64) -> String {
     trim(&format!("{x:.*}", (5 - exp) as usize))
 }
 
-/// The API's video rules, checked before any request, after the images: at
-/// most 4 videos (a held `videos.max_videos` replaces the bound), then each
-/// video in turn: an id present and unique across the images and the videos,
+/// The API's `422` `too_long` entries for more images (16, or the held limit)
+/// or more videos (4, or the held `videos.max_videos`) than a request takes,
+/// listed after the request's other entries, the images' first. Each entry's
+/// input is the list in its wire form, a local image without its bytes.
+pub(crate) fn count_entries(images: &[Image], videos: &[Video], limits: &Limits) -> Vec<Value> {
+    let mut out = Vec::new();
+    let most_videos = limits.count(&["videos", "max_videos"]).map_or(MAX_VIDEOS, |n| n as usize);
+    for (name, n, most) in
+        [("images", images.len(), crate::image::max_images(limits)), ("videos", videos.len(), most_videos)]
+    {
+        if n > most {
+            let given: Vec<Value> = match name {
+                "images" => images.iter().map(Image::input).collect(),
+                _ => videos.iter().map(Video::wire).collect(),
+            };
+            out.push(entry(
+                "too_long",
+                &[json!("body"), json!(name)],
+                format!("List should have at most {most} items after validation, not {n}"),
+                &Value::Array(given),
+                Some(json!({"field_type": "List", "max_length": most, "actual_length": n})),
+            ));
+        }
+    }
+    out
+}
+
+/// The API's video rules, checked before any request, after the images (their
+/// count is one of the request's `422` entries, [`count_entries`]): each video
+/// in turn: an id present and unique across the images and the videos,
 /// at least one frame, frame times at least 0 and strictly increasing, a JPEG,
 /// PNG or WebP media type for every frame, `fps` above 0 and at most 4,
 /// `start` and `end` at least 0 and `end` after `start`. Frame counts, bytes
@@ -318,14 +345,7 @@ fn decimal(x: f64) -> String {
 /// [`ErrorKind::BadRequest`] error with no status, as the API would answer; a
 /// wire-form video that is not an object is an argument error. Returns the
 /// videos' wire forms.
-pub(crate) fn check_videos(videos: &[Video], images: &[Image], limits: &Limits) -> Result<Vec<Value>> {
-    let most = limits.count(&["videos", "max_videos"]).map_or(MAX_VIDEOS, |n| n as usize);
-    if videos.len() > most {
-        return Err(refuse(
-            format!("Too many videos: {}, the limit is {most}.", videos.len()),
-            format!("{} videos, the limit is {most}", videos.len()),
-        ));
-    }
+pub(crate) fn check_videos(videos: &[Video], images: &[Image]) -> Result<Vec<Value>> {
     let mut seen: Vec<String> = images.iter().map(|i| i.id().to_owned()).collect();
     let mut wires = Vec::with_capacity(videos.len());
     for (i, video) in videos.iter().enumerate() {
@@ -434,7 +454,7 @@ mod tests {
     const JPEG: &[u8] = &[0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10];
 
     fn refused(videos: &[Video], images: &[Image]) -> String {
-        let e = check_videos(videos, images, &Limits::default()).unwrap_err();
+        let e = check_videos(videos, images).unwrap_err();
         assert_eq!(e.kind(), ErrorKind::BadRequest);
         assert_eq!(e.error_type(), Some("api_usage_error"));
         assert_eq!(e.status(), None);
@@ -452,7 +472,7 @@ mod tests {
             .start(30.0)
             .frame(VideoFrame::bytes(30.0, vec![0xFF, 0xD8, 0xFF]))
             .frame(VideoFrame::base64(30.5, "AAEC", "image/webp"));
-        let wires = check_videos(&[v], &[], &Limits::default()).unwrap();
+        let wires = check_videos(&[v], &[]).unwrap();
         assert_eq!(
             wires[0],
             json!({"id": "dock", "fps": 2.0, "start": 30.0, "frames": [
@@ -461,7 +481,7 @@ mod tests {
             ]})
         );
         let raw = json!({"id": "yard", "frames": [{"t": 1, "media_type": "image/png", "data": "AA=="}]});
-        assert_eq!(check_videos(&[Video::from(raw.clone())], &[], &Limits::default()).unwrap()[0], raw);
+        assert_eq!(check_videos(&[Video::from(raw.clone())], &[]).unwrap()[0], raw);
         let built =
             Video::from(json!({"id": "yard"})).fps(1.0).frame(json!({"t": 0, "media_type": "image/png", "data": ""}));
         assert_eq!(
@@ -474,8 +494,15 @@ mod tests {
     fn local_checks() {
         let five: Vec<Video> =
             ["a", "b", "c", "d", "e"].iter().map(|id| Video::new(*id).frame(VideoFrame::bytes(0.0, JPEG))).collect();
-        assert_eq!(refused(&five, &[]), "Too many videos: 5, the limit is 4.");
-        assert!(check_videos(&five[..4], &[], &Limits::default()).is_ok());
+        // Five videos are a 422 entry of the request (count_entries), not a 400 here.
+        assert!(check_videos(&five, &[]).is_ok());
+        let counts = count_entries(&[], &five, &Limits::default());
+        assert_eq!(counts.len(), 1);
+        assert_eq!(counts[0]["loc"], json!(["body", "videos"]));
+        assert_eq!(counts[0]["msg"], "List should have at most 4 items after validation, not 5");
+        assert_eq!(counts[0]["ctx"], json!({"field_type": "List", "max_length": 4, "actual_length": 5}));
+        assert_eq!(counts[0]["input"][4]["id"], "e");
+        assert!(count_entries(&[], &five[..4], &Limits::default()).is_empty());
         assert_eq!(refused(&[Video::new("").frame(VideoFrame::bytes(0.0, JPEG))], &[]), "Video 0 needs an id.");
         let twice = "Video id 'dock' is used twice (ids are unique across images and videos).";
         assert_eq!(refused(&[dock(), dock()], &[]), twice);
@@ -498,7 +525,7 @@ mod tests {
         let fps = "Video 'dock': fps must be a number above 0 and at most 4.";
         assert_eq!(refused(&[dock().fps(4.5)], &[]), fps);
         assert_eq!(refused(&[dock().fps(0.0)], &[]), fps);
-        assert!(check_videos(&[dock().fps(4.0)], &[], &Limits::default()).is_ok());
+        assert!(check_videos(&[dock().fps(4.0)], &[]).is_ok());
         assert_eq!(refused(&[dock().start(-1.0)], &[]), "Video 'dock': start must be a number of seconds, at least 0.");
         assert_eq!(refused(&[dock().end(0.0)], &[]), "Video 'dock': end must be after start.");
         assert_eq!(refused(&[dock().start(3.0).end(2.0)], &[]), "Video 'dock': end must be after start.");
@@ -528,11 +555,11 @@ mod tests {
             wire(json!({"id": "cam", "fps": "2", "frames": [{"t": 0, "media_type": "image/png", "data": ""}]})),
             "Video 'cam': fps must be a number above 0 and at most 4."
         );
-        assert!(check_videos(&[Video::from(json!("dock.mp4"))], &[], &Limits::default()).unwrap_err().is_argument());
+        assert!(check_videos(&[Video::from(json!("dock.mp4"))], &[]).unwrap_err().is_argument());
         // Not checked locally: the frame count and the bytes against their type.
         let many = Video::new("dock")
             .frames((0..65).map(|i| VideoFrame::bytes_with_type(f64::from(i) / 2.0, &b"x"[..], "image/png")));
-        assert!(check_videos(&[many], &[], &Limits::default()).is_ok());
+        assert!(check_videos(&[many], &[]).is_ok());
     }
 
     #[test]

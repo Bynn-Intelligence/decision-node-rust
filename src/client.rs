@@ -21,7 +21,7 @@ use crate::image::{check_images, Image};
 use crate::question::{choice, score, truth, Choice, Number, Question, Score, Truth};
 use crate::response::{ChoiceAnswer, Decision, DecisionResult, ModelInfo, NumberAnswer, ScoreAnswer, TruthAnswer};
 use crate::upload::UploadCache;
-use crate::video::{check_videos, Video};
+use crate::video::{check_videos, count_entries, Video};
 
 /// The base URL of the hosted API.
 pub const DEFAULT_BASE_URL: &str = "https://api.decisionnode.com";
@@ -211,11 +211,13 @@ impl DecideRequest {
         let depth = object_depth(&body).max(if self.images.is_empty() { 0 } else { 3 }).max(videos_depth);
         // A point or box question looks in one of the request's images.
         let image_ids: Vec<&str> = self.images.iter().map(Image::id).collect();
-        check_body(&body, depth, profile, &limits, Vec::new(), Some(&image_ids))?;
+        // The image and video counts are 422 entries after the questions'.
+        let counts = count_entries(&self.images, &self.videos, &limits);
+        check_body(&body, depth, profile, &limits, Vec::new(), Some(&image_ids), counts)?;
         check_images(&self.images, &limits)?;
         if !self.videos.is_empty() {
             // Frames always go inline: they are never uploaded or cached.
-            let videos = check_videos(&self.videos, &self.images, &limits)?;
+            let videos = check_videos(&self.videos, &self.images)?;
             body.insert("videos".into(), Value::Array(videos));
         }
         Ok(Prepared { body, images: self.images })
@@ -1314,6 +1316,15 @@ mod tests {
             super::tests::body(req).unwrap_err().message(),
             "Video 'x': frames must be a non-empty list of frames."
         );
+        // Seventeen images are a 422 entry after the questions' entries.
+        let mut many = DecideRequest::new().question("route", json!({"type": "choice", "instructions": "?"}));
+        for i in 0..17 {
+            many = many.image(Image::url(format!("u{i}"), "https://e.com/a.jpg"));
+        }
+        let e = super::tests::body(many).unwrap_err();
+        let kinds: Vec<&str> = e.entries().unwrap().iter().map(|x| x["type"].as_str().unwrap()).collect();
+        assert_eq!(kinds, ["missing", "too_long"]);
+        assert_eq!(e.entries().unwrap()[1]["input"][16], json!({"id": "u16", "url": "https://e.com/a.jpg"}));
         // A body without videos has no videos member.
         assert!(super::tests::body(DecideRequest::new().question("q", truth("?"))).unwrap().get("videos").is_none());
     }

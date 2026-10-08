@@ -21,6 +21,8 @@ use crate::image::{check_images, Image, Local};
 const CACHE_ENTRIES: usize = 256;
 /// An entry is used until this long before the upload's `expires_at`.
 const CACHE_MARGIN: Duration = Duration::from_secs(300);
+/// The most files one `POST /v1/uploads` takes.
+const MAX_UPLOAD_FILES: usize = 16;
 
 /// The SHA-256 of the bytes and the media type.
 type Key = ([u8; 32], String);
@@ -358,6 +360,14 @@ impl DecisionNode {
     /// URL image is an argument error, since the API fetches it itself.
     pub async fn upload(&self, images: impl IntoIterator<Item = Image>) -> Result<Vec<String>> {
         let images: Vec<Image> = images.into_iter().collect();
+        if images.len() > MAX_UPLOAD_FILES {
+            // One presign takes 1 to 16 files: its own 400, before anything is sent.
+            return Err(Error::local(
+                ErrorKind::BadRequest,
+                Some("api_usage_error"),
+                format!("files: 1 to {MAX_UPLOAD_FILES} files, got {}.", images.len()),
+            ));
+        }
         for image in &images {
             if image.is_url() {
                 return Err(Error::invalid(format!(

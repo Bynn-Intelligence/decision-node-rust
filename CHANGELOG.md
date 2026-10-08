@@ -4,19 +4,19 @@ All notable changes to this crate are listed here. The format follows [Keep a Ch
 
 ## [0.2.0] - Unreleased
 
-Implements DecisionNode SDK specification version 1.2 (`SPEC_VERSION`): sixteen images, videos as frames, and the point and box question types, checked against conformance suite 1.8 with the async and the blocking client.
+Implements DecisionNode SDK specification version 1.2 (`SPEC_VERSION`): sixteen images, videos as frames, and the point and box question types, checked against conformance suite 1.9 with the async and the blocking client.
 
 ### Added
 
 - Point and box questions: `point` and `bounding_box` (named for the wire type `box`, a reserved word in Rust), with `.image(id)` and `.units(...)`, and the answers `Answer::Point(PointAnswer)` (`x`, `y`, `present`, `confidence`, `image`, `width`, `height`) and `Answer::Box(BoxAnswer)` (`x1`, `y1`, `x2`, `y2` and the same), read with `as_point` and `as_box`. An answer with a field missing or of the wrong type is `Answer::Unknown`. Their rules are checked locally with the API's 422 entries: an image in the request, `image` naming one of them (required with two or more), and the units; a point or box without instructions is the API's 400. `systemone` refuses both types locally, like number questions.
 - Videos sent as the frames the caller sampled: `Video` (`Video::new(id)` with `frame`, `frames`, `fps`, `start` and `end`) and `VideoFrame` (`bytes`, `bytes_with_type`, `base64`), and `DecideRequest::video` / `videos` and `CallOptions::video` / `videos`. A `serde_json::Value` in the wire form converts into either and is checked by the same rules. `systemone`, the helpers, `decide_many`, batch requests and `check_decide` take videos as `decide` does. Frames always go inline: they are never uploaded, cached, resized or re-encoded.
-- The API's video rules are checked before anything is sent, with the API's own message: at most 4 videos, an id that is present and unique across images and videos, at least one frame, frame times at least 0 and strictly increasing, a JPEG, PNG or WebP media type for every frame, `fps` above 0 and at most 4, `start` and `end` at least 0 and `end` after `start`. The number of frames, their sizes and their pixels are left to the server.
+- The API's video rules are checked before anything is sent, with the API's own message: an id that is present and unique across images and videos, at least one frame, frame times at least 0 and strictly increasing, a JPEG, PNG or WebP media type for every frame, `fps` above 0 and at most 4, `start` and `end` at least 0 and `end` after `start`. The number of frames, their sizes and their pixels are left to the server.
 - `Usage::video_frames` and `Usage::video_seconds`, `None` for a request without videos, and `Decision::warnings`, the server's notes exactly as sent, empty when there are none.
 
 ### Changed
 
 - `SPEC_VERSION` is `"1.2"`.
-- Up to 16 images a request, all of a request's uploads in one presign of up to 16 files. The 17th image is refused locally with "Too many images: 17, the limit is 16.".
+- Up to 16 images a request, all of a request's uploads in one presign of up to 16 files. More than 16 images, or more than 4 videos, is refused locally as the API's 422: a `Validation` error with a `too_long` entry on `["body", "images"]` or `["body", "videos"]`, listed after the request's other entries. `upload` with more than 16 images returns the presign's own 400, "files: 1 to 16 files, got 17.".
 - A model's image and video limits held from `models()` are also read where the API publishes them, in its `images` and `videos` objects.
 - `Usage` is no longer `Eq`, since `video_seconds` is a floating-point number.
 

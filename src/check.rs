@@ -94,7 +94,7 @@ pub(crate) fn usage_error(message: impl Into<String>) -> Error {
     bad_request(Some("api_usage_error"), message)
 }
 
-fn entry(kind: &str, loc: &[Value], msg: impl Into<String>, input: &Value, ctx: Option<Value>) -> Value {
+pub(crate) fn entry(kind: &str, loc: &[Value], msg: impl Into<String>, input: &Value, ctx: Option<Value>) -> Value {
     let mut e = Map::new();
     e.insert("type".into(), kind.into());
     e.insert("loc".into(), Value::Array(loc.to_vec()));
@@ -168,12 +168,13 @@ pub(crate) fn check_request(
     limits: &Limits,
     extra: Vec<Value>,
 ) -> Result<()> {
-    check_body(body, depth, profile, limits, extra, None)
+    check_body(body, depth, profile, limits, extra, None, Vec::new())
 }
 
 /// [`check_request`] with the request's image ids, which a point or box
-/// question must name among; `None` where a request carries no images of its
-/// own (a session's open).
+/// question must name among (`None` where a request carries no images of its
+/// own, a session's open), and the `422` entries that follow the questions'
+/// (`tail`: the image and video counts).
 pub(crate) fn check_body(
     body: &Map<String, Value>,
     depth: usize,
@@ -181,6 +182,7 @@ pub(crate) fn check_body(
     limits: &Limits,
     extra: Vec<Value>,
     image_ids: Option<&[&str]>,
+    tail: Vec<Value>,
 ) -> Result<()> {
     check_nesting(depth)?;
     let mut entries = extra;
@@ -193,6 +195,7 @@ pub(crate) fn check_body(
     for (id, q) in body.get("questions").and_then(Value::as_object).into_iter().flatten() {
         check_question(id, q, &mut entries, &mut deferred, profile, limits, image_ids);
     }
+    entries.extend(tail);
     if !entries.is_empty() {
         return Err(Error::local_entries(entries));
     }

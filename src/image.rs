@@ -257,6 +257,22 @@ impl Image {
         Value::Object(out)
     }
 
+    /// The image as a `422` entry lists it: its wire form, a local image's
+    /// bytes left out (`{"id", "media_type"}`).
+    pub(crate) fn input(&self) -> Value {
+        match &self.source {
+            Source::Local(l) => {
+                let mut out = Map::new();
+                out.insert("id".into(), Value::String(self.id.clone()));
+                if let Some(t) = l.sniffed.or(l.declared.as_deref()) {
+                    out.insert("media_type".into(), Value::String(t.to_owned()));
+                }
+                Value::Object(out)
+            }
+            _ => self.wire(true),
+        }
+    }
+
     /// The wire form naming an upload.
     pub(crate) fn wire_upload(&self, upload_id: &str, with_id: bool) -> Value {
         let mut out = Map::new();
@@ -463,9 +479,14 @@ fn check_url(id: &str, url: &str) -> Result<()> {
     }
 }
 
-/// The API's image rules, checked before any request: at most 16 images
-/// (URLs included; a held `max_images`, or `images.max_images`, replaces the
-/// bound); ids present and
+/// The most images one held `/v1/models` entry lets a request carry: its
+/// `max_images`, else its `images.max_images`, else 16.
+pub(crate) fn max_images(limits: &Limits) -> usize {
+    limits.count(&["max_images"]).or_else(|| limits.count(&["images", "max_images"])).map_or(MAX_IMAGES, |n| n as usize)
+}
+
+/// The API's image rules, checked before any request (their count is one of
+/// the request's `422` entries, see `video::count_entries`): ids present and
 /// unique; a URL by [`check_url`]; an upload reference's media type one of
 /// the three; local bytes JPEG, PNG or WebP by their first bytes (a declared
 /// type must match), at most 10 MB (or the held `max_image_bytes`) and at
@@ -473,11 +494,7 @@ fn check_url(id: &str, url: &str) -> Result<()> {
 /// [`ErrorKind::BadRequest`] error with no status, as the API would answer.
 pub(crate) fn check_images(images: &[Image], limits: &Limits) -> Result<()> {
     let held = |key: &str| limits.count(&[key]).or_else(|| limits.count(&["images", key]));
-    let most = held("max_images").map_or(MAX_IMAGES, |n| n as usize);
     let biggest = held("max_image_bytes").map_or(MAX_IMAGE_BYTES, |n| n as usize);
-    if images.len() > most {
-        return Err(refuse(format!("Too many images: {}, the limit is {most}.", images.len())));
-    }
     for (n, image) in images.iter().enumerate() {
         if image.id.is_empty() {
             return Err(refuse(format!("Image {n} needs an id.")));
@@ -635,8 +652,9 @@ mod tests {
         padded.resize(MAX_IMAGE_BYTES + 1, 0);
         refused(&[Image::bytes("over", padded)]);
         let many: Vec<Image> = (0..17).map(|i| Image::url(format!("u{i}"), "https://example.com/x.png")).collect();
-        assert!(check_images_default(&many[..16]).is_ok());
-        assert_eq!(refused(&many).message(), "Too many images: 17, the limit is 16.");
+        assert!(check_images_default(&many).is_ok(), "the count is a 422 entry of the request, not checked here");
+        assert_eq!(Image::bytes("p", PNG_2X2).input(), json!({"id": "p", "media_type": "image/png"}));
+        assert_eq!(Image::bytes("g", &b"GIF89a"[..]).input(), json!({"id": "g"}));
         assert_eq!(refused(&[Image::url("u", "http://example.com/x.png")]).error_type(), Some("api_usage_error"));
         for bad in [
             format!("https://example.com/{}", "a".repeat(2040)),
