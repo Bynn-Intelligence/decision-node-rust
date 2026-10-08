@@ -261,6 +261,14 @@ impl SessionHandle {
         }
     }
 
+    fn check_frame(&self, frame: &Frame) -> Result<(), Error> {
+        match self {
+            SessionHandle::Async(s) => s.check_frame(frame),
+            #[cfg(feature = "blocking")]
+            SessionHandle::Blocking(s) => s.check_frame(frame),
+        }
+    }
+
     fn send(&self, ctx: &Ctx, frame: Frame) -> Result<u64, Error> {
         match self {
             SessionHandle::Async(s) => ctx.runtime.block_on(s.send(frame)),
@@ -307,6 +315,8 @@ enum Outcome {
     Session(SessionHandle),
     #[cfg(feature = "sessions")]
     Supervised(Vec<SessionEvent>, Option<SessionClosed>),
+    /// A check that found nothing.
+    Checked,
     Error(Error),
 }
 
@@ -361,6 +371,19 @@ fn resolve(value: &Value, refs: &Refs) -> Value {
         Some(("$text", t)) => {
             let times = t["times"].as_u64().unwrap_or(0) as usize;
             Value::String(t["repeat"].as_str().unwrap_or_default().repeat(times))
+        }
+        Some(("$list", l)) => {
+            // `count` copies of `item`, `{i}` in each string replaced by the index.
+            fn fill_index(v: &Value, i: usize) -> Value {
+                match v {
+                    Value::String(t) => Value::String(t.replace("{i}", &i.to_string())),
+                    Value::Array(a) => Value::Array(a.iter().map(|x| fill_index(x, i)).collect()),
+                    Value::Object(m) => Value::Object(m.iter().map(|(k, x)| (k.clone(), fill_index(x, i))).collect()),
+                    other => other.clone(),
+                }
+            }
+            let item = resolve(&l["item"], refs);
+            Value::Array((0..l["count"].as_u64().unwrap_or(0) as usize).map(|i| fill_index(&item, i)).collect())
         }
         Some(("$nest", n)) => {
             // The value inside `depth` arrays: [[[...value...]]].
@@ -640,6 +663,30 @@ fn prepare(root: &Path, call: &Value, refs: &Refs) -> Result<Prepared, Error> {
     })
 }
 
+fn check_call(client: &Client, p: Prepared) -> Result<(), Error> {
+    match client {
+        Client::Async(c) => match p {
+            Prepared::Decide(r) => c.check_decide(&r),
+            Prepared::Systemone(r) => c.check_systemone(&r),
+            #[cfg(feature = "sessions")]
+            Prepared::OpenSession(o) => c.check_session(&o),
+            Prepared::BatchCreate(rs) => c.check_batch(&rs),
+            Prepared::BatchAdd(_, rs) => c.check_batch_add(&rs),
+            _ => panic!("no check for this call"),
+        },
+        #[cfg(feature = "blocking")]
+        Client::Blocking(c) => match p {
+            Prepared::Decide(r) => c.check_decide(&r),
+            Prepared::Systemone(r) => c.check_systemone(&r),
+            #[cfg(feature = "sessions")]
+            Prepared::OpenSession(o) => c.check_session(&o),
+            Prepared::BatchCreate(rs) => c.check_batch(&rs),
+            Prepared::BatchAdd(_, rs) => c.check_batch_add(&rs),
+            _ => panic!("no check for this call"),
+        },
+    }
+}
+
 fn wrap<T>(r: Result<T, Error>, f: impl FnOnce(T) -> Outcome) -> Outcome {
     match r {
         Ok(v) => f(v),
@@ -647,8 +694,9 @@ fn wrap<T>(r: Result<T, Error>, f: impl FnOnce(T) -> Outcome) -> Outcome {
     }
 }
 
-fn collect_results(r: Result<decisionnode::BatchResults, Error>) -> Result<Vec<BatchResult>, Error> {
-    r?.collect()
+async fn collect_stream(r: Result<decisionnode::BatchResultStream, Error>) -> Result<Vec<BatchResult>, Error> {
+    use futures_util::TryStreamExt;
+    r?.try_collect().await
 }
 
 fn batch_run(r: Result<decisionnode::BatchRun, Error>) -> Outcome {
@@ -666,6 +714,10 @@ fn invoke(ctx: &Ctx, client: &Client, call: &Value, refs: &Refs) -> Outcome {
         Ok(p) => p,
         Err(e) => return Outcome::Error(e),
     };
+    if call.get("check").and_then(Value::as_bool) == Some(true) {
+        // Not made: the same arguments go to the SDK's check, which sends nothing.
+        return wrap(check_call(client, prepared), |()| Outcome::Checked);
+    }
     match client {
         Client::Async(c) => ctx.runtime.block_on(invoke_async(c, prepared)),
         #[cfg(feature = "blocking")]
@@ -707,7 +759,9 @@ async fn invoke_async(c: &DecisionNode, p: Prepared) -> Outcome {
         Prepared::BatchFinalize(id) => wrap(c.batches().finalize(&id).await, Outcome::Batch),
         Prepared::BatchGet(id) => wrap(c.batches().get(&id).await, Outcome::Batch),
         Prepared::BatchList(o, l) => wrap(c.batches().list(o, l).await, Outcome::BatchPage),
-        Prepared::BatchResults(id) => wrap(collect_results(c.batches().results(&id).await), Outcome::BatchResults),
+        Prepared::BatchResults(id) => {
+            wrap(collect_stream(c.batches().stream_results(&id).await).await, Outcome::BatchResults)
+        }
         Prepared::BatchCancel(id) => wrap(c.batches().cancel(&id).await, Outcome::Batch),
         Prepared::RunBatch(rs, poll) => {
             batch_run(c.run_batch_with(rs, poll, decisionnode::DEFAULT_BATCH_TIMEOUT).await)
@@ -749,7 +803,9 @@ fn invoke_blocking(c: &decisionnode::blocking::DecisionNode, p: Prepared) -> Out
         Prepared::BatchFinalize(id) => wrap(c.batches().finalize(&id), Outcome::Batch),
         Prepared::BatchGet(id) => wrap(c.batches().get(&id), Outcome::Batch),
         Prepared::BatchList(o, l) => wrap(c.batches().list(o, l), Outcome::BatchPage),
-        Prepared::BatchResults(id) => wrap(collect_results(c.batches().results(&id)), Outcome::BatchResults),
+        Prepared::BatchResults(id) => {
+            wrap(c.batches().stream_results(&id).and_then(|r| r.collect()), Outcome::BatchResults)
+        }
         Prepared::BatchCancel(id) => wrap(c.batches().cancel(&id), Outcome::Batch),
         Prepared::RunBatch(rs, poll) => batch_run(c.run_batch_with(rs, poll, decisionnode::DEFAULT_BATCH_TIMEOUT)),
     }
@@ -797,6 +853,9 @@ fn make_client_inner(case: &Value, mock_url: &str, extra: &[(&str, String)]) -> 
     }
     if let Some(t) = opt(&spec, "inline_threshold").and_then(Value::as_i64) {
         b = b.inline_threshold(t);
+    }
+    if let Some(t) = opt(&spec, "upload_timeout").and_then(Value::as_f64) {
+        b = b.upload_timeout_secs(t);
     }
     match spec.get("base_url") {
         None => b = b.base_url(mock_url),
@@ -1011,13 +1070,39 @@ fn describe(o: &Outcome) -> String {
     }
 }
 
+/// The results of a `batch_results` or `batch_run` outcome: the whole list,
+/// or `count` and `batch_results_sample` (results by their index).
+fn check_results_outcome(spec: &Value, results: &[BatchResult], path: &str) -> Result<(), Fail> {
+    if let Some(all) = spec.get("batch_results") {
+        check_batch_results(all, results, &format!("{path}.batch_results"))?;
+    }
+    if let Some(n) = spec.get("count").and_then(Value::as_u64) {
+        if results.len() as u64 != n {
+            return Err(Fail(format!("{path}: expected {n} results, got {}", results.len())));
+        }
+    }
+    for sample in spec.get("batch_results_sample").and_then(Value::as_array).into_iter().flatten() {
+        let i = sample["index"].as_u64().unwrap() as usize;
+        let r = results.get(i).ok_or_else(|| Fail(format!("{path}: no result {i}")))?;
+        check_batch_result(sample, r, &format!("{path}.batch_results[{i}]"))?;
+    }
+    Ok(())
+}
+
 fn check_batch_results(spec: &Value, results: &[BatchResult], path: &str) -> Result<(), Fail> {
     let expected = spec.as_array().cloned().unwrap_or_default();
     if expected.len() != results.len() {
         return Err(Fail(format!("{path}: expected {} results, got {}", expected.len(), results.len())));
     }
     for (i, (spec, r)) in expected.iter().zip(results).enumerate() {
-        let at = format!("{path}[{i}]");
+        check_batch_result(spec, r, &format!("{path}[{i}]"))?;
+    }
+    Ok(())
+}
+
+fn check_batch_result(spec: &Value, r: &BatchResult, at: &str) -> Result<(), Fail> {
+    {
+        let at = at.to_owned();
         if let Some(c) = spec.get("custom_id") {
             if c != r.custom_id.as_str() {
                 return Err(Fail(format!("{at}.custom_id: expected {c}, got {}", r.custom_id)));
@@ -1134,16 +1219,12 @@ fn check_outcome(spec: &Value, result: &OutcomeRef<'_>, path: &str) -> Result<()
         ("batch_page", Outcome::BatchPage(p)) => {
             matches(spec.get("batch_page").unwrap_or(&empty), &p.raw, &format!("{path}.batch_page"))
         }
-        ("batch_results", Outcome::BatchResults(r)) => {
-            check_batch_results(&spec["batch_results"], r, &format!("{path}.batch_results"))
-        }
+        ("batch_results", Outcome::BatchResults(r)) => check_results_outcome(spec, r, path),
         ("batch_run", Outcome::BatchRun(b, r)) => {
             matches(spec.get("batch").unwrap_or(&empty), &b.raw, &format!("{path}.batch"))?;
-            match spec.get("batch_results") {
-                Some(exp) => check_batch_results(exp, r, &format!("{path}.batch_results")),
-                None => Ok(()),
-            }
+            check_results_outcome(spec, r, path)
         }
+        ("checked", Outcome::Checked) => Ok(()),
         #[cfg(feature = "sessions")]
         ("session", Outcome::Session(s)) => {
             matches(spec.get("session").unwrap_or(&empty), &norm_session(s), &format!("{path}.session"))
@@ -1599,6 +1680,11 @@ fn session_step(ctx: &Ctx, step: &Value, refs: &Refs, events: &mut Vec<Value>, a
         let send = resolve(send, refs);
         let s = session_of(refs, send["session"].as_str().unwrap(), at)?;
         let f = frame(&ctx.root, &send).map_err(|e| Fail(format!("{at}: frame: {e}")))?;
+        if step.get("check").and_then(Value::as_bool) == Some(true) {
+            let outcome = wrap(s.check_frame(&f), |()| Outcome::Checked);
+            let spec = step.get("outcome").cloned().unwrap_or_else(|| json!({"result": "checked"}));
+            return check_outcome(&spec, &OutcomeRef::Other(&outcome), &format!("{at}.outcome"));
+        }
         match (s.send(ctx, f), step.get("outcome")) {
             (Ok(_), None) => Ok(()),
             (Err(e), None) => Err(Fail(format!("{at}: send failed: {} ({e})", e.kind()))),
