@@ -362,6 +362,14 @@ fn resolve(value: &Value, refs: &Refs) -> Value {
             let times = t["times"].as_u64().unwrap_or(0) as usize;
             Value::String(t["repeat"].as_str().unwrap_or_default().repeat(times))
         }
+        Some(("$nest", n)) => {
+            // The value inside `depth` arrays: [[[...value...]]].
+            let mut out = resolve(&n["value"], refs);
+            for _ in 0..n["depth"].as_u64().unwrap_or(0) {
+                out = Value::Array(vec![out]);
+            }
+            out
+        }
         _ => match value {
             Value::Object(m) => Value::Object(m.iter().map(|(k, v)| (k.clone(), resolve(v, refs))).collect()),
             Value::Array(a) => Value::Array(a.iter().map(|v| resolve(v, refs)).collect()),
@@ -492,7 +500,13 @@ fn batch_requests(root: &Path, args: &Value) -> Result<Vec<BatchRequest>, Error>
         .as_array()
         .into_iter()
         .flatten()
-        .map(|r| Ok(BatchRequest::new(r["custom_id"].as_str().unwrap_or_default(), decide_request(root, r)?)))
+        .map(|r| {
+            let request = decide_request(root, r)?;
+            Ok(match r.get("custom_id").and_then(Value::as_str) {
+                Some(id) => BatchRequest::new(id, request),
+                None => BatchRequest::from(request),
+            })
+        })
         .collect()
 }
 
@@ -517,10 +531,10 @@ fn session_options(args: &Value) -> SessionOptions {
     if let Some(m) = opt(args, "model").and_then(Value::as_str) {
         o = o.model(m);
     }
-    if let Some(w) = opt(args, "window").and_then(Value::as_u64) {
+    if let Some(w) = opt(args, "window").and_then(Value::as_i64) {
         o = o.window(w);
     }
-    if let Some(t) = opt(args, "ttl_seconds").and_then(Value::as_u64) {
+    if let Some(t) = opt(args, "ttl_seconds").and_then(Value::as_i64) {
         o = o.ttl_seconds(t);
     }
     o
@@ -541,7 +555,7 @@ fn frame(root: &Path, args: &Value) -> Result<Frame, Error> {
     if let Some(r) = opt(args, "reset").and_then(Value::as_bool) {
         f = f.reset(r);
     }
-    if let Some(s) = opt(args, "seq").and_then(Value::as_u64) {
+    if let Some(s) = opt(args, "seq").and_then(Value::as_i64) {
         f = f.seq(s);
     }
     Ok(f)
@@ -567,7 +581,7 @@ enum Prepared {
     BatchAdd(String, Vec<BatchRequest>),
     BatchFinalize(String),
     BatchGet(String),
-    BatchList(Option<u64>, Option<u64>),
+    BatchList(Option<i64>, Option<i64>),
     BatchResults(String),
     BatchCancel(String),
     RunBatch(Vec<BatchRequest>, Duration),
@@ -613,7 +627,7 @@ fn prepare(root: &Path, call: &Value, refs: &Refs) -> Result<Prepared, Error> {
         "batches.finalize" => Prepared::BatchFinalize(batch_id()),
         "batches.get" => Prepared::BatchGet(batch_id()),
         "batches.list" => {
-            Prepared::BatchList(opt(args, "offset").and_then(Value::as_u64), opt(args, "limit").and_then(Value::as_u64))
+            Prepared::BatchList(opt(args, "offset").and_then(Value::as_i64), opt(args, "limit").and_then(Value::as_i64))
         }
         "batches.results" => Prepared::BatchResults(batch_id()),
         "batches.cancel" => Prepared::BatchCancel(batch_id()),
@@ -743,6 +757,21 @@ fn invoke_blocking(c: &decisionnode::blocking::DecisionNode, p: Prepared) -> Out
 
 /// Builds the client of a case: the environment first, then the arguments.
 fn make_client(case: &Value, mock_url: &str, extra: &[(&str, String)]) -> ClientBuilder {
+    let session = extra.iter().find(|(k, _)| *k == "x-mock-session").map(|(_, v)| v.clone()).unwrap_or_default();
+    let mut b = make_client_inner(case, mock_url, extra);
+    if case.get("client").and_then(|c| c.get("clock")).and_then(Value::as_str) == Some("mock") {
+        // The SDK's clock reads the mock's clock for this session, so a case
+        // that moves the mock's time moves the client's with it.
+        let mock = Mock::connect(mock_url);
+        b = b.clock(move || {
+            let secs = mock.clock_now(&session);
+            std::time::UNIX_EPOCH + Duration::from_secs_f64(secs.max(0.0))
+        });
+    }
+    b
+}
+
+fn make_client_inner(case: &Value, mock_url: &str, extra: &[(&str, String)]) -> ClientBuilder {
     for var in ENV_VARS {
         std::env::remove_var(var);
     }
@@ -1570,7 +1599,13 @@ fn session_step(ctx: &Ctx, step: &Value, refs: &Refs, events: &mut Vec<Value>, a
         let send = resolve(send, refs);
         let s = session_of(refs, send["session"].as_str().unwrap(), at)?;
         let f = frame(&ctx.root, &send).map_err(|e| Fail(format!("{at}: frame: {e}")))?;
-        s.send(ctx, f).map(|_| ()).map_err(|e| Fail(format!("{at}: send failed: {} ({e})", e.kind())))
+        match (s.send(ctx, f), step.get("outcome")) {
+            (Ok(_), None) => Ok(()),
+            (Err(e), None) => Err(Fail(format!("{at}: send failed: {} ({e})", e.kind()))),
+            // A frame that breaks a fixed rule is refused locally and nothing is sent.
+            (Err(e), Some(spec)) => check_error(spec, &e, &format!("{at}.outcome")),
+            (Ok(_), Some(spec)) => Err(Fail(format!("{at}: expected {}, the frame was sent", spec["error"]))),
+        }
     } else if let Some(read) = step.get("read") {
         let s = session_of(refs, read["session"].as_str().unwrap(), at)?;
         let mut count = read.get("count").and_then(Value::as_u64);

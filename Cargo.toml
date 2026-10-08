@@ -44,7 +44,8 @@ tokio-tungstenite = { version = "0.30.0", default-features = false, features = [
 
 [dev-dependencies]
 regex = "1"
-serde_json = { version = "1", features = ["preserve_order", "float_roundtrip"] }
+# The suite's request log echoes bodies nested 128 levels deep.
+serde_json = { version = "1", features = ["preserve_order", "float_roundtrip", "unbounded_depth"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "fs", "net", "io-util"] }
 
 [[test]]

@@ -65,6 +65,11 @@ impl Mock {
         out
     }
 
+    /// The session's clock on the mock, in seconds since the epoch.
+    pub fn clock_now(&self, session: &str) -> f64 {
+        self.get(&format!("/_mock/clock?session={session}"))["epoch_seconds"].as_f64().unwrap_or(0.0)
+    }
+
     /// Moves the session's clock on the mock.
     pub fn clock(&self, session: &str, body: &Value) {
         self.send("POST", &format!("/_mock/clock?session={session}"), Some(body));
@@ -100,7 +105,9 @@ impl Mock {
         let mut raw = Vec::new();
         stream.read_to_end(&mut raw).unwrap();
         let split = raw.windows(4).position(|w| w == b"\r\n\r\n").expect("an HTTP response");
-        serde_json::from_slice(&raw[split + 4..]).expect("a JSON body from the mock")
+        let mut de = serde_json::Deserializer::from_slice(&raw[split + 4..]);
+        de.disable_recursion_limit();
+        serde::Deserialize::deserialize(&mut de).expect("a JSON body from the mock")
     }
 }
 
