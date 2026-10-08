@@ -169,11 +169,6 @@ impl DecisionNode {
         self.client.check_decide(request)
     }
 
-    /// See [`crate::DecisionNode::check_systemone`].
-    pub fn check_systemone(&self, request: &DecideRequest) -> Result<()> {
-        self.client.check_systemone(request)
-    }
-
     /// See [`crate::DecisionNode::check_batch`].
     pub fn check_batch(&self, requests: &[BatchRequest]) -> Result<()> {
         self.client.check_batch(requests)
@@ -182,11 +177,6 @@ impl DecisionNode {
     /// See [`crate::DecisionNode::check_batch_add`].
     pub fn check_batch_add(&self, requests: &[BatchRequest]) -> Result<()> {
         self.client.check_batch_add(requests)
-    }
-
-    /// See [`crate::DecisionNode::systemone`].
-    pub fn systemone(&self, request: DecideRequest) -> Result<Decision> {
-        self.run(self.client.systemone(request))
     }
 
     /// See [`crate::DecisionNode::number`].

@@ -14,7 +14,7 @@ use reqwest::Method;
 use serde::Serialize;
 use serde_json::{Map, Value};
 
-use crate::check::{check_body, object_depth, Limits, Profile};
+use crate::check::{check_body, object_depth, Limits};
 use crate::error::{header, retry_after, Error, ErrorKind, Result};
 use crate::http::HttpSettings;
 use crate::image::{check_images, Image};
@@ -182,18 +182,9 @@ impl DecideRequest {
 
     /// Checks the request and builds its body: an empty question map or a
     /// value that cannot be serialised is an argument error; a request the
-    /// API would refuse is the API's own error, before any request. On
-    /// `/v1/systemone` a `truth` question is written as `noul`, that path's
-    /// type, before the checks.
-    pub(crate) fn prepare(self, client: &DecisionNode, profile: Profile) -> Result<Prepared> {
-        let mut questions = build_questions(self.questions)?;
-        if profile == Profile::Systemone {
-            for q in questions.values_mut() {
-                if let Some(t) = q.get_mut("type").filter(|t| *t == "truth") {
-                    *t = Value::String("noul".into());
-                }
-            }
-        }
+    /// API would refuse is the API's own error, before any request.
+    pub(crate) fn prepare(self, client: &DecisionNode) -> Result<Prepared> {
+        let questions = build_questions(self.questions)?;
         let state = match self.state {
             None | Some(Ok(Value::Null)) => Value::String(String::new()),
             Some(Ok(v)) => v,
@@ -213,7 +204,7 @@ impl DecideRequest {
         let image_ids: Vec<&str> = self.images.iter().map(Image::id).collect();
         // The image and video counts are 422 entries after the questions'.
         let counts = count_entries(&self.images, &self.videos, &limits);
-        check_body(&body, depth, profile, &limits, Vec::new(), Some(&image_ids), counts)?;
+        check_body(&body, depth, &limits, Vec::new(), Some(&image_ids), counts)?;
         check_images(&self.images, &limits)?;
         if !self.videos.is_empty() {
             // Frames always go inline: they are never uploaded or cached.
@@ -668,12 +659,7 @@ impl DecisionNode {
     /// the error sending would return. Sends and uploads nothing; `Ok(())`
     /// means the request would be sent.
     pub fn check_decide(&self, request: &DecideRequest) -> Result<()> {
-        request.clone().prepare(self, Profile::Decide).map(drop)
-    }
-
-    /// [`DecisionNode::check_decide`] for [`DecisionNode::systemone`].
-    pub fn check_systemone(&self, request: &DecideRequest) -> Result<()> {
-        request.clone().prepare(self, Profile::Systemone).map(drop)
+        request.clone().prepare(self).map(drop)
     }
 
     /// Sends one decision request to `POST /v1/decide`.
@@ -683,18 +669,8 @@ impl DecisionNode {
     /// is sent. Local images go inline or are uploaded by the inline
     /// threshold.
     pub async fn decide(&self, request: DecideRequest) -> Result<Decision> {
-        let prepared = request.prepare(self, Profile::Decide)?;
+        let prepared = request.prepare(self)?;
         Ok(self.decision_call("/v1/decide", prepared).await?.decision)
-    }
-
-    /// Sends one decision request to `POST /v1/systemone`, the strict path:
-    /// the model is always sent, a `truth` question is written with the wire
-    /// type that path takes (`noul`), and its answers are read back into
-    /// [`TruthAnswer`]. Every other question goes as given; the path answers
-    /// `truth`, `choice` and `score` only.
-    pub async fn systemone(&self, request: DecideRequest) -> Result<Decision> {
-        let prepared = request.prepare(self, Profile::Systemone)?;
-        Ok(self.decision_call("/v1/systemone", prepared).await?.decision)
     }
 
     /// Sends a checked request, placing its images (inline, cached or
@@ -771,9 +747,7 @@ impl DecisionNode {
         let prepared = requests
             .into_iter()
             .enumerate()
-            .map(|(i, r)| {
-                r.prepare(self, Profile::Decide).map_err(|e| if e.is_argument() { e.in_request(i) } else { e })
-            })
+            .map(|(i, r)| r.prepare(self).map_err(|e| if e.is_argument() { e.in_request(i) } else { e }))
             .collect::<Result<Vec<_>>>()?;
         Ok(stream::iter(prepared)
             .map(|p| async move { self.decision_call("/v1/decide", p).await.map(|a| a.decision) })
@@ -785,7 +759,7 @@ impl DecisionNode {
     /// Sends a one-question helper request and returns its decision with the
     /// response's status and headers, for `take_answer`.
     async fn ask(&self, request: DecideRequest) -> Result<Answered> {
-        let prepared = request.prepare(self, Profile::Decide)?;
+        let prepared = request.prepare(self)?;
         self.decision_call("/v1/decide", prepared).await
     }
 
@@ -1266,7 +1240,7 @@ mod tests {
 
     fn body(request: DecideRequest) -> Result<Value> {
         let dn = DecisionNode::builder().model("decisionnode-latest").build().unwrap();
-        request.prepare(&dn, Profile::Decide).map(|p| Value::Object(p.body))
+        request.prepare(&dn).map(|p| Value::Object(p.body))
     }
 
     #[test]
@@ -1400,10 +1374,8 @@ mod tests {
         let dn = DecisionNode::builder().api_key("k").base_url("http://127.0.0.1:9").build().unwrap();
         let ok = DecideRequest::new().question("q", truth("?")).image(Image::url("u", "https://example.com/a.png"));
         assert!(dn.check_decide(&ok).is_ok());
-        assert!(dn.check_systemone(&ok).is_ok());
         let bad = DecideRequest::new().question("n", crate::number("How many?").min(60).max(50));
         assert_eq!(dn.check_decide(&bad).unwrap_err().kind(), ErrorKind::Validation);
-        assert_eq!(dn.check_systemone(&bad).unwrap_err().message(), "Invalid request.");
         assert!(dn.check_decide(&DecideRequest::new()).unwrap_err().is_argument());
     }
 

@@ -33,13 +33,6 @@ const TWO_53: i128 = 1 << 53;
 /// The most decimals of a grid's `min` and `step`.
 const MAX_NUMBER_DECIMALS: u32 = 6;
 
-/// The path a request goes to: `/v1/systemone` takes fewer question types.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Profile {
-    Decide,
-    Systemone,
-}
-
 /// The `/v1/models` entry of the model a request names, when the client holds
 /// it from an earlier `models()` call. A rule whose value only `/v1/models`
 /// states is checked against it, and skipped without it.
@@ -161,14 +154,8 @@ pub(crate) fn check_nesting(depth: usize) -> Result<()> {
 /// `extra` holds `422` entries found before the questions. The point and box
 /// rules on the request's images are left out: [`check_body`] runs them.
 #[cfg(any(feature = "sessions", test))]
-pub(crate) fn check_request(
-    body: &Map<String, Value>,
-    depth: usize,
-    profile: Profile,
-    limits: &Limits,
-    extra: Vec<Value>,
-) -> Result<()> {
-    check_body(body, depth, profile, limits, extra, None, Vec::new())
+pub(crate) fn check_request(body: &Map<String, Value>, depth: usize, limits: &Limits, extra: Vec<Value>) -> Result<()> {
+    check_body(body, depth, limits, extra, None, Vec::new())
 }
 
 /// [`check_request`] with the request's image ids, which a point or box
@@ -178,7 +165,6 @@ pub(crate) fn check_request(
 pub(crate) fn check_body(
     body: &Map<String, Value>,
     depth: usize,
-    profile: Profile,
     limits: &Limits,
     extra: Vec<Value>,
     image_ids: Option<&[&str]>,
@@ -193,7 +179,7 @@ pub(crate) fn check_body(
         }
     }
     for (id, q) in body.get("questions").and_then(Value::as_object).into_iter().flatten() {
-        check_question(id, q, &mut entries, &mut deferred, profile, limits, image_ids);
+        check_question(id, q, &mut entries, &mut deferred, limits, image_ids);
     }
     entries.extend(tail);
     if !entries.is_empty() {
@@ -266,7 +252,6 @@ fn check_question(
     q: &Value,
     entries: &mut Vec<Value>,
     deferred: &mut Vec<Error>,
-    profile: Profile,
     limits: &Limits,
     image_ids: Option<&[&str]>,
 ) {
@@ -279,13 +264,10 @@ fn check_question(
         entries.push(entry("missing", &with(&base, "type"), "Field required", q, None));
         return;
     };
-    let known: &[&str] = match profile {
-        Profile::Decide => &["truth", "noul", "choice", "score", "number", "point", "box"],
-        Profile::Systemone => &["noul", "choice", "score"],
-    };
+    // The older name of truth is still taken for a question in its wire form.
+    let known = ["truth", "noul", "choice", "score", "number", "point", "box"];
     let Some(qtype) = qtype.as_str().filter(|t| known.contains(t)) else {
-        // An unknown type is the 400 "Invalid request."; on /v1/systemone a
-        // number question is unknown from the start, its fields unread.
+        // An unknown type is the 400 "Invalid request.".
         deferred.push(usage_error("Invalid request.").with_reason(format!("question '{id}': unknown type {qtype}")));
         return;
     };
@@ -340,10 +322,8 @@ fn check_question(
             };
             let levels: Vec<&Value> = match criteria {
                 Value::Array(a) => a.iter().collect(),
-                // The object form keyed "0" to "K-1" is a list on /v1/decide only.
-                Value::Object(m)
-                    if profile == Profile::Decide && (0..m.len()).all(|i| m.contains_key(&i.to_string())) =>
-                {
+                // The object form keyed "0" to "K-1" is read as the list.
+                Value::Object(m) if (0..m.len()).all(|i| m.contains_key(&i.to_string())) => {
                     (0..m.len()).map(|i| &m[&i.to_string()]).collect()
                 }
                 other => {
@@ -687,7 +667,7 @@ pub(crate) fn check_session_open(body: &Map<String, Value>, depth: usize, limits
     if let Some(q) = body.get("questions") {
         questions.insert("questions".into(), q.clone());
     }
-    check_request(&questions, 0, Profile::Decide, limits, entries)?;
+    check_request(&questions, 0, limits, entries)?;
     if limits.is_false(&["sessions", "enabled"]) {
         return Err(usage_error(format!("Model {} does not serve sessions.", limits.model)));
     }
@@ -701,7 +681,7 @@ mod tests {
     fn check(q: Value) -> Result<()> {
         let body = json!({"questions": {"q": q}});
         let depth = nesting_depth(&body);
-        check_request(body.as_object().unwrap(), depth, Profile::Decide, &Limits::default(), Vec::new())
+        check_request(body.as_object().unwrap(), depth, &Limits::default(), Vec::new())
     }
 
     fn kind(q: Value) -> Option<ErrorKind> {
@@ -804,8 +784,7 @@ mod tests {
             "a": {"type": "choice", "criteria": options},
             "b": {"type": "score", "criteria": []},
         }});
-        let e =
-            check_request(body.as_object().unwrap(), 3, Profile::Decide, &Limits::default(), Vec::new()).unwrap_err();
+        let e = check_request(body.as_object().unwrap(), 3, &Limits::default(), Vec::new()).unwrap_err();
         assert_eq!(e.kind(), ErrorKind::Validation);
     }
 
@@ -839,19 +818,6 @@ mod tests {
     }
 
     #[test]
-    fn systemone_takes_three_types() {
-        let body = json!({"questions": {"n": {"type": "number", "instructions": "?"},
-                                        "s": {"type": "score", "criteria": {"0": "a"}}}});
-        let e = check_request(body.as_object().unwrap(), 3, Profile::Systemone, &Limits::default(), Vec::new())
-            .unwrap_err();
-        assert_eq!(e.kind(), ErrorKind::Validation); // the score object, a 422, comes first
-        let body = json!({"questions": {"n": {"type": "number", "instructions": "?"}}});
-        let e = check_request(body.as_object().unwrap(), 3, Profile::Systemone, &Limits::default(), Vec::new())
-            .unwrap_err();
-        assert_eq!(e.message(), "Invalid request.");
-    }
-
-    #[test]
     fn nesting() {
         let mut v = json!("s");
         for _ in 0..127 {
@@ -871,10 +837,10 @@ mod tests {
         held.insert("m".to_owned(), entry.as_object().unwrap().clone());
         let limits = Limits::of("m", &held);
         let body = json!({"questions": {"c": {"type": "choice", "criteria": {"a": null, "b": null, "c": null}}}});
-        let e = check_request(body.as_object().unwrap(), 4, Profile::Decide, &limits, Vec::new()).unwrap_err();
+        let e = check_request(body.as_object().unwrap(), 4, &limits, Vec::new()).unwrap_err();
         assert_eq!(e.message(), "Too many choices. Must have at most 2 choices.");
         let body = json!({"questions": {"n": {"type": "number", "instructions": "?"}}});
-        let e = check_request(body.as_object().unwrap(), 3, Profile::Decide, &limits, Vec::new()).unwrap_err();
+        let e = check_request(body.as_object().unwrap(), 3, &limits, Vec::new()).unwrap_err();
         assert_eq!(e.message(), "Model m does not answer number questions.");
         let open = json!({"window": 5, "questions": {"t": {"type": "truth", "instructions": "?"}}});
         let e = check_session_open(open.as_object().unwrap(), 3, &limits).unwrap_err();

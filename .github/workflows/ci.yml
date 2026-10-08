@@ -12,10 +12,10 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -D warnings
-  # The conformance suite commit this crate targets (suite 1.9, for
+  # The conformance suite commit this crate targets (suite 1.10, for
   # specification 1.2). Moving to a newer suite is a reviewed change to this
   # one line.
-  CONFORMANCE_REF: 797cc053e340ccc78a85c5a38fb6c9170f18e065
+  CONFORMANCE_REF: bc70755015a4de3dc5e5014611e8d1dd2d97c362
 
 # Every action is pinned to a full commit SHA, with its tag or branch in a
 # comment, and no checkout leaves credentials in the working copy.

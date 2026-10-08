@@ -8,8 +8,8 @@
 //! and returns typed answers and typed errors. It adds no behaviour of its own
 //! to a decision: the values you read are the values the API sent.
 //!
-//! Beside [`DecisionNode::decide`] it covers every public call: the strict
-//! [`DecisionNode::systemone`] path, [`DecisionNode::models`], image uploads
+//! Beside [`DecisionNode::decide`] it covers every public call:
+//! [`DecisionNode::models`], image uploads
 //! ([`DecisionNode::upload`], also chosen for you by size), videos sent as
 //! frames ([`Video`]), sessions
 //! ([`DecisionNode::open_session`], [`DecisionNode::supervise`], behind the

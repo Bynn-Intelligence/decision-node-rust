@@ -13,7 +13,7 @@ use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use reqwest::Method;
 use serde_json::{Map, Value};
 
-use crate::check::{usage_error, Profile};
+use crate::check::usage_error;
 use futures_util::Stream;
 
 use crate::client::{transport_error, DecideRequest, DecisionNode, Payload, Policy, Prepared};
@@ -545,13 +545,8 @@ impl DecisionNode {
             .into_iter()
             .enumerate()
             .map(|(i, r)| {
-                let prepared = r.request.prepare(self, Profile::Decide).map_err(|e| {
-                    if e.is_argument() {
-                        e.in_request(i)
-                    } else {
-                        e
-                    }
-                })?;
+                let prepared =
+                    r.request.prepare(self).map_err(|e| if e.is_argument() { e.in_request(i) } else { e })?;
                 Ok(Line { custom_id: r.custom_id.unwrap_or_default(), prepared })
             })
             .collect()

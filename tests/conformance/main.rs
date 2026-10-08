@@ -665,7 +665,6 @@ fn frame(root: &Path, args: &Value) -> Result<Frame, Error> {
 
 enum Prepared {
     Decide(DecideRequest),
-    Systemone(DecideRequest),
     Many(Vec<DecideRequest>, Option<i64>),
     Check(Value, Truth, CallOptions),
     Classify(Value, Choice, CallOptions),
@@ -702,7 +701,6 @@ fn prepare(root: &Path, call: &Value, refs: &Refs) -> Result<Prepared, Error> {
     let batch_id = || args["batch_id"].as_str().unwrap_or_default().to_owned();
     Ok(match method {
         "decide" => Prepared::Decide(decide_request(root, args)?),
-        "systemone" => Prepared::Systemone(decide_request(root, args)?),
         "decide_many" => Prepared::Many(
             args["requests"].as_array().unwrap().iter().map(|r| decide_request(root, r)).collect::<Result<_, _>>()?,
             opt(args, "concurrency").and_then(Value::as_i64),
@@ -746,7 +744,6 @@ fn check_call(client: &Client, p: Prepared) -> Result<(), Error> {
     match client {
         Client::Async(c) => match p {
             Prepared::Decide(r) => c.check_decide(&r),
-            Prepared::Systemone(r) => c.check_systemone(&r),
             #[cfg(feature = "sessions")]
             Prepared::OpenSession(o) => c.check_session(&o),
             Prepared::BatchCreate(rs) => c.check_batch(&rs),
@@ -756,7 +753,6 @@ fn check_call(client: &Client, p: Prepared) -> Result<(), Error> {
         #[cfg(feature = "blocking")]
         Client::Blocking(c) => match p {
             Prepared::Decide(r) => c.check_decide(&r),
-            Prepared::Systemone(r) => c.check_systemone(&r),
             #[cfg(feature = "sessions")]
             Prepared::OpenSession(o) => c.check_session(&o),
             Prepared::BatchCreate(rs) => c.check_batch(&rs),
@@ -807,7 +803,6 @@ fn invoke(ctx: &Ctx, client: &Client, call: &Value, refs: &Refs) -> Outcome {
 async fn invoke_async(c: &DecisionNode, p: Prepared) -> Outcome {
     match p {
         Prepared::Decide(r) => wrap(c.decide(r).await, Outcome::Decision),
-        Prepared::Systemone(r) => wrap(c.systemone(r).await, Outcome::Decision),
         Prepared::Many(rs, None) => wrap(c.decide_many(rs).await, Outcome::Many),
         Prepared::Many(rs, Some(n)) => wrap(c.decide_many_with(rs, n).await, Outcome::Many),
         Prepared::Check(s, q, o) => wrap(c.check_with(s, q, o).await, Outcome::Truth),
@@ -852,7 +847,6 @@ async fn invoke_async(c: &DecisionNode, p: Prepared) -> Outcome {
 fn invoke_blocking(c: &decisionnode::blocking::DecisionNode, p: Prepared) -> Outcome {
     match p {
         Prepared::Decide(r) => wrap(c.decide(r), Outcome::Decision),
-        Prepared::Systemone(r) => wrap(c.systemone(r), Outcome::Decision),
         Prepared::Many(rs, None) => wrap(c.decide_many(rs), Outcome::Many),
         Prepared::Many(rs, Some(n)) => wrap(c.decide_many_with(rs, n), Outcome::Many),
         Prepared::Check(s, q, o) => wrap(c.check_with(s, q, o), Outcome::Truth),

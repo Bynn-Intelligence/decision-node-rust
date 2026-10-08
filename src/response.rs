@@ -41,10 +41,6 @@ pub enum Answer {
 }
 
 /// The answer to a `truth` question.
-///
-/// An answer the API sends as `{"type": "noul", "noul": 0.94}` (the form
-/// `/v1/systemone` answers in, and the answer to a question sent raw as
-/// `noul`) is read into a `TruthAnswer` too, with `truth` from `noul`.
 #[derive(Clone, Debug, PartialEq)]
 #[non_exhaustive]
 pub struct TruthAnswer {
@@ -171,9 +167,8 @@ pub struct UnknownAnswer {
 }
 
 impl Answer {
-    /// The type of the answer: `truth` (a `noul` answer included), `choice`,
-    /// `score`, `number`, `point`, `box` or, for an [`Answer::Unknown`], its
-    /// `type` field.
+    /// The type of the answer: `truth`, `choice`, `score`, `number`, `point`,
+    /// `box` or, for an [`Answer::Unknown`], its `type` field.
     pub fn answer_type(&self) -> Option<&str> {
         match self {
             Answer::Truth(_) => Some("truth"),
