@@ -21,6 +21,7 @@ use crate::image::{check_images, Image};
 use crate::question::{choice, score, truth, Choice, Number, Question, Score, Truth};
 use crate::response::{ChoiceAnswer, Decision, DecisionResult, ModelInfo, NumberAnswer, ScoreAnswer, TruthAnswer};
 use crate::upload::UploadCache;
+use crate::video::{check_videos, Video};
 
 /// The base URL of the hosted API.
 pub const DEFAULT_BASE_URL: &str = "https://api.decisionnode.com";
@@ -81,6 +82,7 @@ pub struct DecideRequest {
     state: Option<std::result::Result<Value, String>>,
     questions: Vec<(String, Question)>,
     images: Vec<Image>,
+    videos: Vec<Video>,
     model: Option<String>,
 }
 
@@ -158,6 +160,19 @@ impl DecideRequest {
         self
     }
 
+    /// Adds a video, sent as its frames: a [`Video`], or a video in its JSON
+    /// wire form. Up to 4 a request.
+    pub fn video(mut self, video: impl Into<Video>) -> DecideRequest {
+        self.videos.push(video.into());
+        self
+    }
+
+    /// Adds several videos.
+    pub fn videos<V: Into<Video>>(mut self, videos: impl IntoIterator<Item = V>) -> DecideRequest {
+        self.videos.extend(videos.into_iter().map(Into::into));
+        self
+    }
+
     /// The model for this request, over the client's. An empty string counts
     /// as not given: the client's model applies.
     pub fn model(mut self, model: impl Into<String>) -> DecideRequest {
@@ -190,10 +205,17 @@ impl DecideRequest {
         body.insert("model".into(), Value::String(model));
         body.insert("state".into(), state);
         body.insert("questions".into(), Value::Object(questions));
-        // The images count toward the nesting as `[{...}]`.
-        let depth = object_depth(&body).max(if self.images.is_empty() { 0 } else { 3 });
+        // The images count toward the nesting as `[{...}]`, each video inside
+        // the body's object and the videos array.
+        let videos_depth = self.videos.iter().map(|v| v.depth() + 2).max().unwrap_or(0);
+        let depth = object_depth(&body).max(if self.images.is_empty() { 0 } else { 3 }).max(videos_depth);
         check_request(&body, depth, profile, &limits, Vec::new())?;
         check_images(&self.images, &limits)?;
+        if !self.videos.is_empty() {
+            // Frames always go inline: they are never uploaded or cached.
+            let videos = check_videos(&self.videos, &self.images, &limits)?;
+            body.insert("videos".into(), Value::Array(videos));
+        }
         Ok(Prepared { body, images: self.images })
     }
 }
@@ -203,6 +225,7 @@ impl DecideRequest {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct CallOptions {
     images: Vec<Image>,
+    videos: Vec<Video>,
     model: Option<String>,
 }
 
@@ -224,6 +247,18 @@ impl CallOptions {
         self
     }
 
+    /// Adds a video, sent as its frames.
+    pub fn video(mut self, video: impl Into<Video>) -> CallOptions {
+        self.videos.push(video.into());
+        self
+    }
+
+    /// Adds several videos.
+    pub fn videos<V: Into<Video>>(mut self, videos: impl IntoIterator<Item = V>) -> CallOptions {
+        self.videos.extend(videos.into_iter().map(Into::into));
+        self
+    }
+
     /// The model for this call, over the client's. An empty string counts as
     /// not given: the client's model applies.
     pub fn model(mut self, model: impl Into<String>) -> CallOptions {
@@ -232,7 +267,7 @@ impl CallOptions {
     }
 
     fn apply(self, mut request: DecideRequest) -> DecideRequest {
-        request = request.images(self.images);
+        request = request.images(self.images).videos(self.videos);
         if let Some(m) = self.model {
             request = request.model(m);
         }
@@ -1250,6 +1285,35 @@ mod tests {
             let late = backoff(30).as_secs_f64();
             assert!((6.0..=8.0).contains(&late), "{late}");
         }
+    }
+
+    #[test]
+    fn body_with_videos_after_the_checks() {
+        use crate::{Video, VideoFrame};
+        let dock = Video::new("dock").fps(2.0).frame(VideoFrame::base64(0.5, "AAEC", "image/jpeg"));
+        let wire = json!({"id": "yard", "frames": [{"t": 1, "media_type": "image/png", "data": "AA=="}]});
+        let body =
+            body(DecideRequest::new().question("q", truth("?")).video(dock.clone()).video(wire.clone())).unwrap();
+        assert_eq!(
+            body["videos"],
+            json!([{"id": "dock", "fps": 2.0, "frames": [{"t": 0.5, "media_type": "image/jpeg", "data": "AAEC"}]}, wire])
+        );
+        assert!(body.get("images").is_none());
+        // Images are checked first, then the videos, ids unique across both.
+        let both =
+            DecideRequest::new().question("q", truth("?")).image(Image::url("dock", "https://example.com/a.png"));
+        let e = super::tests::body(both.video(dock)).unwrap_err();
+        assert_eq!(e.message(), "Video id 'dock' is used twice (ids are unique across images and videos).");
+        // A helper's options carry videos too.
+        let req = CallOptions::new()
+            .video(json!({"id": "x", "frames": []}))
+            .apply(DecideRequest::new().question("q", truth("?")));
+        assert_eq!(
+            super::tests::body(req).unwrap_err().message(),
+            "Video 'x': frames must be a non-empty list of frames."
+        );
+        // A body without videos has no videos member.
+        assert!(super::tests::body(DecideRequest::new().question("q", truth("?"))).unwrap().get("videos").is_none());
     }
 
     #[test]

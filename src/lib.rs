@@ -9,7 +9,8 @@
 //!
 //! Beside [`DecisionNode::decide`] it covers every public call: the strict
 //! [`DecisionNode::systemone`] path, [`DecisionNode::models`], image uploads
-//! ([`DecisionNode::upload`], also chosen for you by size), sessions
+//! ([`DecisionNode::upload`], also chosen for you by size), videos sent as
+//! frames ([`Video`]), sessions
 //! ([`DecisionNode::open_session`], [`DecisionNode::supervise`], behind the
 //! default `sessions` feature) and the Batch API ([`DecisionNode::batches`],
 //! [`DecisionNode::run_batch`]).
@@ -57,6 +58,7 @@ mod safety;
 #[cfg(feature = "sessions")]
 mod session;
 mod upload;
+mod video;
 
 pub use batch::{
     Batch, BatchCounters, BatchPage, BatchRequest, BatchResult, BatchResultStream, BatchResults, BatchRun, BatchStatus,
@@ -78,6 +80,7 @@ pub use response::{
 pub use safety::Safety;
 #[cfg(feature = "sessions")]
 pub use session::{Frame, FrameError, Reply, Session, SessionClosed, SessionEvent, SessionOptions, REOPEN_CODES};
+pub use video::{Video, VideoFrame};
 
 pub use indexmap;
 pub use reqwest;
@@ -87,4 +90,4 @@ pub use serde_json;
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// The version of the DecisionNode SDK specification this crate implements.
-pub const SPEC_VERSION: &str = "1.1";
+pub const SPEC_VERSION: &str = "1.2";

@@ -273,23 +273,34 @@ impl Answer {
     }
 }
 
-/// Token counts of a decision. A count the response does not carry is
-/// `None`, never 0.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+/// Token counts of a decision and, for a request with videos, what was read
+/// of them. A value the response does not carry is `None`, never 0.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 #[non_exhaustive]
 pub struct Usage {
-    /// The tokens of the state, the questions and the images.
+    /// The tokens of the state, the questions, the images and the videos.
     pub input_tokens: Option<u64>,
     /// The output tokens.
     pub output_tokens: Option<u64>,
+    /// The frames read over all the videos. `None` for a request without
+    /// videos.
+    pub video_frames: Option<u64>,
+    /// The seconds of the videos' windows read, summed, as sent. `None` for
+    /// a request without videos.
+    pub video_seconds: Option<f64>,
 }
 
 impl Usage {
-    /// Reads a `usage` object; a count it does not carry is `None`.
+    /// Reads a `usage` object; a value it does not carry is `None`.
     pub(crate) fn from_body(usage: Option<&Value>) -> Usage {
         let usage = usage.and_then(Value::as_object);
-        let tokens = |k: &str| usage.and_then(|u| u.get(k)).and_then(Value::as_u64);
-        Usage { input_tokens: tokens("input_tokens"), output_tokens: tokens("output_tokens") }
+        let field = |k: &str| usage.and_then(|u| u.get(k));
+        Usage {
+            input_tokens: field("input_tokens").and_then(Value::as_u64),
+            output_tokens: field("output_tokens").and_then(Value::as_u64),
+            video_frames: field("video_frames").and_then(Value::as_u64),
+            video_seconds: field("video_seconds").and_then(Value::as_f64),
+        }
     }
 }
 
@@ -312,6 +323,10 @@ pub struct Decision {
     /// What the safety check found, from the `x-decisionnode-safety` header.
     /// `None` on a server without the check.
     pub safety: Option<Safety>,
+    /// The server's notes on a request with videos, exactly as sent: one when
+    /// it read a video at a lower rate or resolution than asked. Empty when
+    /// there are none.
+    pub warnings: Vec<String>,
     /// The parsed response body.
     pub raw: Value,
 }
@@ -335,6 +350,11 @@ impl Decision {
             answers,
             latency_ms: header(headers, "x-decisionnode-latency-ms").and_then(|v| v.trim().parse::<f64>().ok()),
             safety: header(headers, "x-decisionnode-safety").map(|v| Safety::parse(&v)),
+            warnings: obj
+                .get("warnings")
+                .and_then(Value::as_array)
+                .map(|w| w.iter().filter_map(Value::as_str).map(str::to_owned).collect())
+                .unwrap_or_default(),
             request_id,
             raw: body,
         })
@@ -466,12 +486,23 @@ mod tests {
     #[test]
     fn missing_counts_are_none() {
         let d = Decision::from_response(json!({"answers": {}}), 200, &HeaderMap::new()).unwrap();
-        assert_eq!(d.usage, Usage { input_tokens: None, output_tokens: None });
+        assert_eq!(d.usage, Usage::default());
+        assert!(d.warnings.is_empty());
         let d = Decision::from_response(json!({"answers": {}, "usage": {"input_tokens": 5}}), 200, &HeaderMap::new())
             .unwrap();
         assert_eq!(d.usage.input_tokens, Some(5));
         assert_eq!(d.usage.output_tokens, None);
         assert_eq!(d.latency_ms, None);
+    }
+
+    #[test]
+    fn video_usage_and_warnings() {
+        let body = json!({"answers": {}, "usage": {"input_tokens": 1300, "output_tokens": 0, "video_frames": 20, "video_seconds": 10.000000000000002},
+            "warnings": ["Video 'dock' was read at 1 frame a second."]});
+        let d = Decision::from_response(body, 200, &HeaderMap::new()).unwrap();
+        assert_eq!(d.usage.video_frames, Some(20));
+        assert_eq!(d.usage.video_seconds, Some(10.000000000000002));
+        assert_eq!(d.warnings, vec!["Video 'dock' was read at 1 frame a second.".to_owned()]);
     }
 
     #[test]

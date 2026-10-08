@@ -1,6 +1,6 @@
 # DecisionNode Rust SDK
 
-The official Rust client for the [DecisionNode](https://decisionnode.com) API: typed `truth`, `choice`, `score` and `number` decisions over any state, with images, sessions, batches, retries and typed errors. Async on [reqwest](https://docs.rs/reqwest) and Tokio, with an optional blocking client.
+The official Rust client for the [DecisionNode](https://decisionnode.com) API: typed `truth`, `choice`, `score` and `number` decisions over any state, with up to 16 images, videos sent as frames, sessions, batches, retries and typed errors. Async on [reqwest](https://docs.rs/reqwest) and Tokio, with an optional blocking client.
 
 The client checks every request against the API's fixed rules before it sends anything, reuses its connections, and picks the fastest form for each image, so a call costs one round trip wherever one is enough.
 
@@ -79,7 +79,7 @@ println!("{}", answer.truth); // 0.97
 | `check_decide(&request)`, `check_systemone(&request)`, `check_session(&options)`, `check_batch(&requests)`, `check_batch_add(&requests)`, `Session::check_frame(&frame)` | Nothing: every local check the call would run | `Ok(())`, or the error the call would return |
 | `decide_raw(body)` | The body exactly as given | The response body as `serde_json::Value`, for API fields this version does not know yet |
 
-`check_with`, `classify_with`, `score_with`, `number_with` and `gate_with` take `CallOptions` for images and a model, like `decide`:
+`check_with`, `classify_with`, `score_with`, `number_with` and `gate_with` take `CallOptions` for images, videos and a model, like `decide`:
 
 ```rust
 use decisionnode::{CallOptions, Image};
@@ -126,7 +126,7 @@ A question id is any string and comes back as the key of its answer. Without a s
 
 | Type | Fields |
 |---|---|
-| `Decision` | `answers` (by question id, also `decision["id"]` and `decision.get("id")`), `model`, `usage.input_tokens`, `usage.output_tokens`, `request_id`, `latency_ms`, `safety`, `raw` |
+| `Decision` | `answers` (by question id, also `decision["id"]` and `decision.get("id")`), `model`, `usage.input_tokens`, `usage.output_tokens`, `usage.video_frames`, `usage.video_seconds`, `warnings`, `request_id`, `latency_ms`, `safety`, `raw` |
 | `ModelInfo` | `name`, `description`, `release_date`, `limits` (every other field of the entry), `raw` |
 | `Answer::Truth(TruthAnswer)` | `truth`. An answer sent as `{"type": "noul", "noul": 0.94}` (what `systemone` answers) is read into a `TruthAnswer` too |
 | `Answer::Choice(ChoiceAnswer)` | `choice`, `confidence`, `probabilities` (by option name, exactly as sent) |
@@ -134,7 +134,7 @@ A question id is any string and comes back as the key of its answer. Without a s
 | `Answer::Number(NumberAnswer)` | `number`, `expected`, `confidence`, `probabilities` (by the value exactly as the API writes it, `"7"`, `"3.5"`) |
 | `Answer::Unknown(UnknownAnswer)` | `answer_type` and `raw`, for a question type this version does not know, or a known type whose fields are missing or of the wrong type. Such an answer never fails the decision. |
 
-`model` is read from the body; `request_id`, `latency_ms` and `safety` from the `x-request-id`, `x-decisionnode-latency-ms` and `x-decisionnode-safety` headers. A value the response does not carry is `None`: the token counts are `Option<u64>` and `latency_ms` is `Option<f64>`, never 0 in place of a missing value.
+`model` is read from the body; `request_id`, `latency_ms` and `safety` from the `x-request-id`, `x-decisionnode-latency-ms` and `x-decisionnode-safety` headers. A value the response does not carry is `None`: the token counts are `Option<u64>` and `latency_ms` is `Option<f64>`, never 0 in place of a missing value. For a request with videos, `usage.video_frames` is the number of frames read and `usage.video_seconds` the seconds of the windows read (`None` without videos), and `warnings` holds the server's notes exactly as sent when it read a video at a lower rate or resolution than asked (empty when there are none).
 
 Numbers are passed through as received: no rounding and no renormalising, so a probability list may sum to 0.99 or 1.01 and an entry may read `0.8200000000000001`. Read answers by id, never by position.
 
@@ -160,7 +160,7 @@ let request = DecideRequest::new()
 | An image the client uploaded before | Its cached `upload_id`, whatever its size, until 5 minutes before the upload expires |
 | `Image::upload_id(id, upload_id)` | `{"id", "upload_id"}` as given |
 
-The local checks are the API's own: JPEG, PNG or WebP by the first bytes (a declared type must match them), at most 10 MB, at most 40 megapixels read from the image header, at most 4 images in a request (URLs included), ids unique. A file is read when the `Image` is made, so a file that cannot be read fails there. No image is resized or re-encoded.
+The local checks are the API's own: JPEG, PNG or WebP by the first bytes (a declared type must match them), at most 10 MB, at most 40 megapixels read from the image header, at most 16 images in a request (URLs included), ids unique. A file is read when the `Image` is made, so a file that cannot be read fails there. No image is resized or re-encoded.
 
 The upload cache lives in the client's memory only: by SHA-256 of the bytes and the media type, at most 256 entries, never written to disk and never shared between clients. Requests holding the same bytes at the same time share one upload. If the API answers that an upload the client placed has expired, was consumed or is not there, the client uploads the image again and resends the request once.
 
@@ -170,6 +170,40 @@ The `PUT` goes to the storage URL the API returned, with exactly the headers it 
 let ids = dn.upload([Image::path("receipt", "receipt.jpg")?]).await?;
 let again = DecideRequest::new().image(Image::upload_id("receipt", &ids[0])).question("q", truth("Is it paid?"));
 ```
+
+### Videos
+
+A video travels as the frames you already hold, each with its time in seconds, and the server reads them as one video, in order and with their times. Only frames are sent: no video file, no video URL and no sound.
+
+```rust
+use decisionnode::{number, Video, VideoFrame};
+
+let mut dock = Video::new("dock");
+for (i, path) in ["dock-0000.jpg", "dock-0001.jpg", "dock-0002.jpg"].iter().enumerate() {
+    dock = dock.frame(VideoFrame::bytes(i as f64 * 0.5, std::fs::read(path)?)); // 0, 0.5 and 1 s
+}
+
+let d = dn
+    .decide(
+        DecideRequest::new()
+            .state("Warehouse camera 4, loading dock, shift B.")
+            .video(dock)
+            .question("fall", truth("Does a person fall in the video?"))
+            .question("forklifts", number("How many forklifts pass the door?").min(0).max(50)),
+    )
+    .await?;
+println!("{:?} {:?}", d["fall"].truth(), d.warnings);
+```
+
+| Form | What is sent |
+|---|---|
+| `VideoFrame::bytes(t, data)`, `VideoFrame::bytes_with_type(t, data, media_type)` | A frame `t` seconds into the video, its bytes as base64; without a media type it is read from the first bytes (JPEG, PNG or WebP) |
+| `VideoFrame::base64(t, text, media_type)` | A frame given as base64 text, sent as given, with its media type |
+| `Video::new(id)`, `.frame(...)`, `.frames(...)`, `.fps(...)`, `.start(...)`, `.end(...)` | A video: its id (unique across the request's images and videos), its frames with strictly increasing times, and optionally the most frames a second to read (above 0 and at most 4; the API's default is 2) and the window `[start, end)` on the frames' own times |
+
+`DecideRequest::video` takes up to 4 videos, each a `Video` or a `serde_json::Value` in the wire form (`Video::from(json!({...}))`, and `VideoFrame::from` for a frame), checked by the same rules. `systemone`, the helpers' `CallOptions`, `decide_many` and batch requests take videos as `decide` does; sessions do not. Frames always go inline: they are never uploaded or cached, and no frame is resized or re-encoded.
+
+Before anything is sent the client checks the API's video rules and refuses a fault as a `BadRequest` error with the API's message: more than 4 videos, a video without an id or with an id already used by an image or a video, a video without frames, a frame time that is negative or not after the one before it, a frame that is not JPEG, PNG or WebP by its media type, `fps` not above 0 and at most 4, `start` or `end` negative, and `end` not after `start`. How many frames a request may carry, their sizes and their pixels are the server's to judge. To turn a video file into frames, use the `dn` command line tool: `dn --video dock.mp4`.
 
 ### Safety
 
@@ -271,7 +305,7 @@ Only 200 to 299 is a success. Redirects are never followed, whatever transport s
 
 `decide` never fails over one odd answer: an answer with missing or wrongly typed fields comes back as `Answer::Unknown`. `check`, `classify` and `score` promise a typed answer, so when theirs is missing or malformed they return a `Server` error with the response's status, request id and `reason()` instead.
 
-The error's own message, its `Display`, is the server's `message` exactly (`detail.message`, or `detail` when it is a string), or the client's description when there was no response; it is `""` when the server sent none. `message()` returns the same text, `""` and never missing when there is none. Every error also has `kind()`, `status()`, `error_type()`, `request_id()` and `reason()`: the server's explanation in words, from the `x-decisionnode-error` header. `{:?}` prints all of them. A `ContextLimit` error is also a `BadRequest` and a `SessionLimit` error a `RateLimit`: `error.is(ErrorKind::BadRequest)` is true for both. Before sending, a call fails with `Authentication` when no key is set. Arguments the client refuses before sending anything are errors of the base kind, `Other`, without a status (`error.is_argument()` is true; there is no separate error kind for them): an empty question map, a value that cannot be serialised, an image file that cannot be read, a base URL that is not `https`, a timeout of 0 or below, a negative `max_retries` or `inline_threshold`, a `decide_many_with` concurrency below 1, or a `run_batch_with` poll interval below 10 seconds. A request that breaks one of the API's fixed rules fails before sending, with what the server would answer and no status (`is_local()`): the same kind, the same `error_type`, the documented message, and for a 422 a `Validation` error whose `entries()` are the server's list. That covers the 128-level nesting limit; question types, missing or mistyped fields, option and level counts, truth and number text and number grids; a state of the wrong type; images (count, ids, format, 10 MB, 40 megapixels, an upload reference's media type) and image URLs (`https`, 2,048 characters, no user information, port 443, no literal private address); a session's `window` and `ttl_seconds`; a session frame, which `Session::send` refuses with nothing written and no `seq` used; `batches().list` paging; and batch `custom_id` rules. After a `models()` call the client also checks the limits that list states for the model a request names, found by its name or by the alias or pinned version an entry states. The same checks run alone, sending nothing, with `check_decide`, `check_systemone`, `check_session`, `check_batch`, `check_batch_add` and `Session::check_frame`. `decide_many` and batch calls check every request first, so one invalid request fails the call and nothing is sent. Limits that depend on the model, such as tokens, are the server's to judge.
+The error's own message, its `Display`, is the server's `message` exactly (`detail.message`, or `detail` when it is a string), or the client's description when there was no response; it is `""` when the server sent none. `message()` returns the same text, `""` and never missing when there is none. Every error also has `kind()`, `status()`, `error_type()`, `request_id()` and `reason()`: the server's explanation in words, from the `x-decisionnode-error` header. `{:?}` prints all of them. A `ContextLimit` error is also a `BadRequest` and a `SessionLimit` error a `RateLimit`: `error.is(ErrorKind::BadRequest)` is true for both. Before sending, a call fails with `Authentication` when no key is set. Arguments the client refuses before sending anything are errors of the base kind, `Other`, without a status (`error.is_argument()` is true; there is no separate error kind for them): an empty question map, a value that cannot be serialised, an image file that cannot be read, a base URL that is not `https`, a timeout of 0 or below, a negative `max_retries` or `inline_threshold`, a `decide_many_with` concurrency below 1, or a `run_batch_with` poll interval below 10 seconds. A request that breaks one of the API's fixed rules fails before sending, with what the server would answer and no status (`is_local()`): the same kind, the same `error_type`, the documented message, and for a 422 a `Validation` error whose `entries()` are the server's list. That covers the 128-level nesting limit; question types, missing or mistyped fields, option and level counts, truth and number text and number grids; a state of the wrong type; images (count, ids, format, 10 MB, 40 megapixels, an upload reference's media type), videos (count, ids, frames, frame times and media types, `fps`, `start` and `end`) and image URLs (`https`, 2,048 characters, no user information, port 443, no literal private address); a session's `window` and `ttl_seconds`; a session frame, which `Session::send` refuses with nothing written and no `seq` used; `batches().list` paging; and batch `custom_id` rules. After a `models()` call the client also checks the limits that list states for the model a request names, found by its name or by the alias or pinned version an entry states. The same checks run alone, sending nothing, with `check_decide`, `check_systemone`, `check_session`, `check_batch`, `check_batch_add` and `Session::check_frame`. `decide_many` and batch calls check every request first, so one invalid request fails the call and nothing is sent. Limits that depend on the model, such as tokens, are the server's to judge.
 
 ```rust
 use decisionnode::ErrorKind;
@@ -327,7 +361,7 @@ The SDK sends no telemetry and logs no state or questions. Its only added header
 cargo test --all-features
 ```
 
-The integration tests run the DecisionNode SDK conformance suite (every request, response, error, behaviour and constant case, with both clients) against its mock server, from the suite `DECISIONNODE_CONFORMANCE_DIR` points at; they need `python3` for the mock. Without the variable the conformance test fails rather than skipping. CI checks the suite out at one pinned commit, set in a single place at the top of `.github/workflows/ci.yml`, and pins every action to a commit SHA. This crate implements DecisionNode SDK specification version 1.1, exported as `decisionnode::SPEC_VERSION`.
+The integration tests run the DecisionNode SDK conformance suite (every request, response, error, behaviour and constant case, with both clients) against its mock server, from the suite `DECISIONNODE_CONFORMANCE_DIR` points at; they need `python3` for the mock. Without the variable the conformance test fails rather than skipping. CI checks the suite out at one pinned commit, set in a single place at the top of `.github/workflows/ci.yml`, and pins every action to a commit SHA. This crate implements DecisionNode SDK specification version 1.2, exported as `decisionnode::SPEC_VERSION`, and passes conformance suite 1.7.
 
 ## License
 

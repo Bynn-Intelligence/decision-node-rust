@@ -2,6 +2,23 @@
 
 All notable changes to this crate are listed here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the crate follows [Semantic Versioning](https://semver.org/).
 
+## [0.2.0] - Unreleased
+
+Implements DecisionNode SDK specification version 1.2 (`SPEC_VERSION`): sixteen images and videos as frames, checked against conformance suite 1.7 with the async and the blocking client.
+
+### Added
+
+- Videos sent as the frames the caller sampled: `Video` (`Video::new(id)` with `frame`, `frames`, `fps`, `start` and `end`) and `VideoFrame` (`bytes`, `bytes_with_type`, `base64`), and `DecideRequest::video` / `videos` and `CallOptions::video` / `videos`. A `serde_json::Value` in the wire form converts into either and is checked by the same rules. `systemone`, the helpers, `decide_many`, batch requests and `check_decide` take videos as `decide` does. Frames always go inline: they are never uploaded, cached, resized or re-encoded.
+- The API's video rules are checked before anything is sent, with the API's own message: at most 4 videos, an id that is present and unique across images and videos, at least one frame, frame times at least 0 and strictly increasing, a JPEG, PNG or WebP media type for every frame, `fps` above 0 and at most 4, `start` and `end` at least 0 and `end` after `start`. The number of frames, their sizes and their pixels are left to the server.
+- `Usage::video_frames` and `Usage::video_seconds`, `None` for a request without videos, and `Decision::warnings`, the server's notes exactly as sent, empty when there are none.
+
+### Changed
+
+- `SPEC_VERSION` is `"1.2"`.
+- Up to 16 images a request, all of a request's uploads in one presign of up to 16 files. The 17th image is refused locally with "Too many images: 17, the limit is 16.".
+- A model's image and video limits held from `models()` are also read where the API publishes them, in its `images` and `videos` objects.
+- `Usage` is no longer `Eq`, since `video_seconds` is a floating-point number.
+
 ## [0.1.0] - Unreleased
 
 First release, implementing DecisionNode SDK specification version 1.1 (`SPEC_VERSION`): every public call, checked against conformance suite 1.6 with the async and the blocking client.

@@ -15,7 +15,7 @@ use crate::check::Limits;
 use crate::error::{Error, ErrorKind, Result};
 
 /// The most images one request (or one batch line) may carry, URLs included.
-pub(crate) const MAX_IMAGES: usize = 4;
+pub(crate) const MAX_IMAGES: usize = 16;
 /// The largest image the API takes, in bytes.
 pub(crate) const MAX_IMAGE_BYTES: usize = 10 * 1024 * 1024;
 /// The most pixels the API decodes, read from the image header.
@@ -463,18 +463,20 @@ fn check_url(id: &str, url: &str) -> Result<()> {
     }
 }
 
-/// The API's image rules, checked before any request: at most 4 images
-/// (URLs included; a held `max_images` replaces the bound); ids present and
+/// The API's image rules, checked before any request: at most 16 images
+/// (URLs included; a held `max_images`, or `images.max_images`, replaces the
+/// bound); ids present and
 /// unique; a URL by [`check_url`]; an upload reference's media type one of
 /// the three; local bytes JPEG, PNG or WebP by their first bytes (a declared
 /// type must match), at most 10 MB (or the held `max_image_bytes`) and at
 /// most 40 megapixels by their header. A fault is a
 /// [`ErrorKind::BadRequest`] error with no status, as the API would answer.
 pub(crate) fn check_images(images: &[Image], limits: &Limits) -> Result<()> {
-    let most = limits.count(&["max_images"]).map_or(MAX_IMAGES, |n| n as usize);
-    let biggest = limits.count(&["max_image_bytes"]).map_or(MAX_IMAGE_BYTES, |n| n as usize);
+    let held = |key: &str| limits.count(&[key]).or_else(|| limits.count(&["images", key]));
+    let most = held("max_images").map_or(MAX_IMAGES, |n| n as usize);
+    let biggest = held("max_image_bytes").map_or(MAX_IMAGE_BYTES, |n| n as usize);
     if images.len() > most {
-        return Err(refuse(format!("Too many images. Must have at most {most} images.")));
+        return Err(refuse(format!("Too many images: {}, the limit is {most}.", images.len())));
     }
     for (n, image) in images.iter().enumerate() {
         if image.id.is_empty() {
@@ -632,8 +634,9 @@ mod tests {
         let mut padded = PNG_2X2.to_vec();
         padded.resize(MAX_IMAGE_BYTES + 1, 0);
         refused(&[Image::bytes("over", padded)]);
-        let five: Vec<Image> = (0..5).map(|i| Image::url(format!("u{i}"), "https://example.com/x.png")).collect();
-        refused(&five);
+        let many: Vec<Image> = (0..17).map(|i| Image::url(format!("u{i}"), "https://example.com/x.png")).collect();
+        assert!(check_images_default(&many[..16]).is_ok());
+        assert_eq!(refused(&many).message(), "Too many images: 17, the limit is 16.");
         assert_eq!(refused(&[Image::url("u", "http://example.com/x.png")]).error_type(), Some("api_usage_error"));
         for bad in [
             format!("https://example.com/{}", "a".repeat(2040)),

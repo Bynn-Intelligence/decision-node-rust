@@ -29,7 +29,7 @@ use base64::Engine;
 use decisionnode::{
     Batch, BatchPage, BatchRequest, BatchResult, BatchStatus, CallOptions, Choice, ChoiceAnswer, ClientBuilder,
     DecideRequest, Decision, DecisionNode, DecisionResult, Error, Image, Levels, ModelInfo, Number, NumberAnswer,
-    Options, Question, Safety, Score, ScoreAnswer, Truth, TruthAnswer,
+    Options, Question, Safety, Score, ScoreAnswer, Truth, TruthAnswer, Video, VideoFrame,
 };
 use serde_json::{json, Map, Value};
 use sha2::Digest;
@@ -505,6 +505,52 @@ fn images(root: &Path, args: &Value) -> Result<Vec<Image>, Error> {
     args.get("images").and_then(Value::as_array).into_iter().flatten().map(|i| image(root, i)).collect()
 }
 
+/// `{"$frame": {t, path | data_base64 | data_text, media_type}}`, or a frame
+/// in its wire form.
+fn video_frame(root: &Path, value: &Value) -> VideoFrame {
+    let a = match single(value) {
+        Some(("$frame", a)) => a,
+        _ => return VideoFrame::from(value.clone()),
+    };
+    let t = a["t"].as_f64().unwrap();
+    let media_type = a.get("media_type").and_then(Value::as_str);
+    if let Some(text) = a.get("data_text").and_then(Value::as_str) {
+        return VideoFrame::base64(t, text, media_type.unwrap_or_default());
+    }
+    let data = match a.get("path").and_then(Value::as_str) {
+        Some(p) => std::fs::read(root.join(p)).unwrap(),
+        None => base64::engine::general_purpose::STANDARD.decode(a["data_base64"].as_str().unwrap()).unwrap(),
+    };
+    match media_type {
+        Some(m) => VideoFrame::bytes_with_type(t, data, m),
+        None => VideoFrame::bytes(t, data),
+    }
+}
+
+/// `{"$video": {id, frames, fps, start, end}}`, or a video in its wire form.
+fn video(root: &Path, value: &Value) -> Video {
+    let a = match single(value) {
+        Some(("$video", a)) => a,
+        _ => return Video::from(value.clone()),
+    };
+    let mut v = Video::new(a["id"].as_str().unwrap_or_default());
+    v = v.frames(a["frames"].as_array().into_iter().flatten().map(|f| video_frame(root, f)));
+    if let Some(x) = a.get("fps").and_then(Value::as_f64) {
+        v = v.fps(x);
+    }
+    if let Some(x) = a.get("start").and_then(Value::as_f64) {
+        v = v.start(x);
+    }
+    if let Some(x) = a.get("end").and_then(Value::as_f64) {
+        v = v.end(x);
+    }
+    v
+}
+
+fn videos(root: &Path, args: &Value) -> Vec<Video> {
+    args.get("videos").and_then(Value::as_array).into_iter().flatten().map(|v| video(root, v)).collect()
+}
+
 fn decide_request(root: &Path, args: &Value) -> Result<DecideRequest, Error> {
     let mut r = DecideRequest::new();
     if let Some(s) = args.get("state") {
@@ -512,6 +558,7 @@ fn decide_request(root: &Path, args: &Value) -> Result<DecideRequest, Error> {
     }
     r = r.questions(questions(args));
     r = r.images(images(root, args)?);
+    r = r.videos(videos(root, args));
     if let Some(m) = opt(args, "model").and_then(Value::as_str) {
         r = r.model(m);
     }
@@ -533,9 +580,9 @@ fn batch_requests(root: &Path, args: &Value) -> Result<Vec<BatchRequest>, Error>
         .collect()
 }
 
-/// The images and model of a helper call.
+/// The images, videos and model of a helper call.
 fn call_options(root: &Path, args: &Value) -> Result<CallOptions, Error> {
-    let mut o = CallOptions::new().images(images(root, args)?);
+    let mut o = CallOptions::new().images(images(root, args)?).videos(videos(root, args));
     if let Some(m) = opt(args, "model").and_then(Value::as_str) {
         o = o.model(m);
     }
@@ -960,7 +1007,13 @@ fn norm_decision(d: &Decision) -> Value {
         "model": d.model,
         "request_id": d.request_id,
         "latency_ms": d.latency_ms.map(num),
-        "usage": {"input_tokens": d.usage.input_tokens, "output_tokens": d.usage.output_tokens},
+        "usage": {
+            "input_tokens": d.usage.input_tokens,
+            "output_tokens": d.usage.output_tokens,
+            "video_frames": d.usage.video_frames,
+            "video_seconds": d.usage.video_seconds.map(num),
+        },
+        "warnings": d.warnings,
         "safety": norm_safety(&d.safety),
         "answers": norm_answers(&d.answers),
         "raw": d.raw,
@@ -1490,20 +1543,24 @@ fn check_request(exp: &Value, got: &Value, at: &str, any_body: bool) -> Result<(
     Ok(())
 }
 
-/// Every permutation of `0..n`, for the parallel `PUT`s of one upload.
-fn permutations(n: usize) -> Vec<Vec<usize>> {
-    if n == 0 {
-        return vec![vec![]];
-    }
-    let mut out = Vec::new();
-    for p in permutations(n - 1) {
-        for i in 0..=p.len() {
-            let mut q = p.clone();
-            q.insert(i, n - 1);
-            out.push(q);
+/// A perfect matching of expected requests to received ones, by augmenting
+/// paths: `fits[e][g]` says whether received request `g` fits expected `e`.
+/// Returns false when some expected request finds no received one.
+fn perfect_matching(fits: &[Vec<bool>]) -> bool {
+    fn augment(e: usize, fits: &[Vec<bool>], seen: &mut [bool], owner: &mut [Option<usize>]) -> bool {
+        for g in 0..fits[e].len() {
+            if fits[e][g] && !seen[g] {
+                seen[g] = true;
+                if owner[g].is_none_or(|other| augment(other, fits, seen, owner)) {
+                    owner[g] = Some(e);
+                    return true;
+                }
+            }
         }
+        false
     }
-    out
+    let mut owner = vec![None; fits.len()];
+    (0..fits.len()).all(|e| augment(e, fits, &mut vec![false; fits.len()], &mut owner))
 }
 
 fn describe_log(log: &[Value]) -> Vec<String> {
@@ -1534,16 +1591,20 @@ fn check_request_list(expected: &[Value], log: &[Value]) -> Result<(), Fail> {
         // Requests sent in parallel may arrive in any order: one assignment
         // must hold.
         let mut first_reason = None;
-        let ok = permutations(j - i).into_iter().any(|perm| {
-            let r = perm.iter().enumerate().try_for_each(|(k, &g)| {
-                check_request(&expected[i + k], &log[i + g], &format!("requests[{}]", i + k), false)
-            });
-            if let Err(Fail(m)) = &r {
-                first_reason.get_or_insert(m.clone());
-            }
-            r.is_ok()
-        });
-        if !ok {
+        let fits: Vec<Vec<bool>> = (i..j)
+            .map(|k| {
+                (i..j)
+                    .map(|g| match check_request(&expected[k], &log[g], &format!("requests[{k}]"), false) {
+                        Ok(()) => true,
+                        Err(Fail(m)) => {
+                            first_reason.get_or_insert(m);
+                            false
+                        }
+                    })
+                    .collect()
+            })
+            .collect();
+        if !perfect_matching(&fits) {
             return Err(Fail(format!(
                 "no order of the parallel requests matches: {}",
                 first_reason.unwrap_or_default()
