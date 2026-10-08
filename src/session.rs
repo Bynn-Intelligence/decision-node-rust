@@ -6,23 +6,25 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+use base64::Engine;
 use futures_util::stream::{SplitSink, Stream, StreamExt};
 use futures_util::SinkExt;
 use indexmap::IndexMap;
-use reqwest::header::{HeaderValue, AUTHORIZATION, USER_AGENT};
+use reqwest::header::{
+    AUTHORIZATION, CONNECTION, SEC_WEBSOCKET_ACCEPT, SEC_WEBSOCKET_KEY, SEC_WEBSOCKET_VERSION, UPGRADE, USER_AGENT,
+};
 use reqwest::Method;
 use serde::Serialize;
 use serde_json::{Map, Value};
-use tokio::net::TcpStream;
 use tokio::sync::mpsc;
-use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::tungstenite::handshake::derive_accept_key;
 use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
-use tokio_tungstenite::tungstenite::protocol::CloseFrame;
+use tokio_tungstenite::tungstenite::protocol::{CloseFrame, Role};
 use tokio_tungstenite::tungstenite::Message;
-use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
+use tokio_tungstenite::WebSocketStream;
 
 use crate::check::{check_session_open, nesting_depth, object_depth, usage_error, MAX_NESTING};
-use crate::client::{build_questions, is_loopback, DecisionNode, Policy, USER_AGENT_VALUE};
+use crate::client::{build_questions, is_loopback, transport_error, DecisionNode, Policy, USER_AGENT_VALUE};
 use crate::error::{Error, ErrorKind, Result};
 use crate::image::{check_images, Image};
 use crate::question::Question;
@@ -40,7 +42,7 @@ const MAX_SEQ: i64 = (1 << 53) - 1;
 /// once its feed has ended.
 const SUPERVISE_DRAIN: Duration = Duration::from_secs(3);
 
-type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
+type Socket = WebSocketStream<reqwest::Upgraded>;
 
 /// What [`DecisionNode::open_session`] opens: the fixed part of a session.
 ///
@@ -484,9 +486,9 @@ impl Session {
     ///
     /// The key goes only to the API's own host: a stream URL on another host
     /// than the client's base URL, or not `wss` (`ws` only for the local
-    /// machine), is an argument error and nothing is sent. The socket connects
-    /// directly, with the platform's root certificates; the proxy and the
-    /// certificates of [`crate::HttpSettings`] apply to HTTP calls only.
+    /// machine), is an argument error and nothing is sent. The socket opens
+    /// over the client's [`crate::HttpSettings`]: its proxy, root
+    /// certificates and client certificate.
     pub async fn connect(&self) -> Result<()> {
         let inner = &*self.client.inner;
         let url = reqwest::Url::parse(&self.stream_url)
@@ -508,38 +510,9 @@ impl Session {
                 base_host.unwrap_or_default()
             )));
         }
-        let mut request = self
-            .stream_url
-            .as_str()
-            .into_client_request()
-            .map_err(|e| Error::invalid(format!("the stream URL is not valid: {e}")).with_source(e))?;
-        let headers = request.headers_mut();
-        headers.insert(AUTHORIZATION, self.client.authorization()?);
-        headers.insert(USER_AGENT, HeaderValue::from_static(USER_AGENT_VALUE));
-        for (name, value) in &inner.headers {
-            headers.append(name.clone(), value.clone());
-        }
-
-        let handshake = tokio_tungstenite::connect_async_tls_with_config(request, None, true, None);
-        let (socket, _) = match tokio::time::timeout(inner.timeout, handshake).await {
-            Err(_) => {
-                return Err(Error::new(
-                    ErrorKind::Timeout,
-                    format!("no handshake within {:.1} s", inner.timeout.as_secs_f64()),
-                ))
-            }
-            Ok(Err(tokio_tungstenite::tungstenite::Error::Http(response))) => {
-                let status = response.status().as_u16();
-                let body = response.body().clone().unwrap_or_default();
-                return Err(Error::from_response(status, response.headers(), &body));
-            }
-            Ok(Err(e)) => {
-                return Err(
-                    Error::new(ErrorKind::Connection, format!("the session socket could not open: {e}")).with_source(e)
-                )
-            }
-            Ok(Ok(pair)) => pair,
-        };
+        let socket = tokio::time::timeout(inner.timeout, self.handshake(url)).await.unwrap_or_else(|_| {
+            Err(Error::new(ErrorKind::Timeout, format!("no handshake within {:.1} s", inner.timeout.as_secs_f64())))
+        })?;
 
         let (sink, mut stream) = socket.split();
         let (tx, rx) = mpsc::unbounded_channel();
@@ -573,6 +546,50 @@ impl Session {
         Ok(())
     }
 
+    /// The WebSocket handshake, on an HTTP/1.1 client built from the same
+    /// [`crate::HttpSettings`] as the client's own (proxy, root certificates,
+    /// client certificate; never a redirect).
+    async fn handshake(&self, mut url: reqwest::Url) -> Result<Socket> {
+        let inner = &*self.client.inner;
+        let http = match inner.socket_http.get() {
+            Some(c) => c.clone(),
+            None => {
+                let c = inner.http_settings.build(inner.https, true)?;
+                inner.socket_http.get_or_init(|| c).clone()
+            }
+        };
+        let scheme = if url.scheme() == "wss" { "https" } else { "http" };
+        url.set_scheme(scheme).map_err(|()| Error::invalid("the stream URL cannot be reached over HTTP"))?;
+        let key_bytes: [u8; 16] = std::array::from_fn(|_| fastrand::u8(..));
+        let key = base64::engine::general_purpose::STANDARD.encode(key_bytes);
+        let mut rb = http
+            .get(url)
+            .header(CONNECTION, "Upgrade")
+            .header(UPGRADE, "websocket")
+            .header(SEC_WEBSOCKET_VERSION, "13")
+            .header(SEC_WEBSOCKET_KEY, &key)
+            .header(AUTHORIZATION, self.client.authorization()?)
+            .header(USER_AGENT, USER_AGENT_VALUE);
+        if !inner.headers.is_empty() {
+            rb = rb.headers(inner.headers.clone());
+        }
+        let response = rb.send().await.map_err(|e| transport_error(e, inner.timeout))?;
+        let status = response.status().as_u16();
+        if status != 101 {
+            let headers = response.headers().clone();
+            let body = response.bytes().await.unwrap_or_default();
+            return Err(Error::from_response(status, &headers, &body));
+        }
+        let accept = response.headers().get(SEC_WEBSOCKET_ACCEPT).map(|v| v.as_bytes().to_vec());
+        if accept.as_deref() != Some(derive_accept_key(key.as_bytes()).as_bytes()) {
+            return Err(Error::new(ErrorKind::Connection, "the session socket answered the handshake wrongly"));
+        }
+        let upgraded = response.upgrade().await.map_err(|e| {
+            Error::new(ErrorKind::Connection, format!("the session socket could not open: {e}")).with_source(e)
+        })?;
+        Ok(WebSocketStream::from_raw_socket(upgraded, Role::Client, None).await)
+    }
+
     /// Sends one frame and returns its `seq`, without waiting for the reply.
     ///
     /// The `seq` counts from 1 unless the frame sets one. A local image is
@@ -580,7 +597,7 @@ impl Session {
     /// inline threshold; a URL is refused locally, since frames take none.
     pub async fn send(&self, frame: Frame) -> Result<u64> {
         let value = frame.frame.transpose().map_err(Error::invalid)?;
-        self.check_frame(frame.seq, value.as_ref(), frame.image.as_ref(), frame.questions.as_deref())?;
+        self.check_parts(frame.seq, value.as_ref(), frame.image.as_ref(), frame.questions.as_deref())?;
         let seq = match frame.seq {
             Some(s) => s as u64,
             None => self.seq.fetch_add(1, Ordering::Relaxed) + 1,
@@ -612,7 +629,15 @@ impl Session {
     /// A frame's fixed rules, checked before anything is sent: the frame
     /// error the server would send, as a [`ErrorKind::BadRequest`] error
     /// (`api_usage_error`). Nothing goes on the socket and no `seq` is used.
-    fn check_frame(
+    /// Runs every check [`Session::send`] would run on this frame and returns
+    /// the error it would return. Sends and uploads nothing, and uses no
+    /// `seq`; `Ok(())` means the frame would be sent.
+    pub fn check_frame(&self, frame: &Frame) -> Result<()> {
+        let value = frame.frame.clone().transpose().map_err(Error::invalid)?;
+        self.check_parts(frame.seq, value.as_ref(), frame.image.as_ref(), frame.questions.as_deref())
+    }
+
+    fn check_parts(
         &self,
         seq: Option<i64>,
         frame: Option<&Value>,
@@ -733,6 +758,14 @@ impl Session {
 }
 
 impl DecisionNode {
+    /// Runs every local check [`DecisionNode::open_session`] would run on
+    /// these options, with the limits held from [`DecisionNode::models`], and
+    /// returns the error opening would return. Sends nothing; `Ok(())` means
+    /// the session would be opened.
+    pub fn check_session(&self, options: &SessionOptions) -> Result<()> {
+        options.clone().body(self).map(drop)
+    }
+
     /// Opens a session with `POST /v1/sessions`: the fixed context and its
     /// questions, answered once with no frame. The model is always sent (the
     /// options', else the client's). Questions are checked as in a request.
@@ -961,6 +994,38 @@ mod tests {
         }
         let session = Session::from_open(dn, json!({"session_id": "ses_1"}), 200, &headers).unwrap_err();
         assert_eq!(session.kind(), ErrorKind::Server);
+    }
+
+    #[tokio::test]
+    async fn the_socket_goes_through_the_clients_proxy() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let proxy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy.local_addr().unwrap();
+        let seen = tokio::spawn(async move {
+            let (mut sock, _) = proxy.accept().await.unwrap();
+            let mut buf = vec![0u8; 4096];
+            let n = sock.read(&mut buf).await.unwrap();
+            let body = r#"{"detail":{"error_type":"permission_error","message":"no"}}"#;
+            let reply =
+                format!("HTTP/1.1 403 Forbidden\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+            sock.write_all(reply.as_bytes()).await.unwrap();
+            String::from_utf8_lossy(&buf[..n]).to_lowercase()
+        });
+        let settings = crate::HttpSettings::new().proxy(reqwest::Proxy::all(format!("http://{proxy_addr}")).unwrap());
+        let dn = DecisionNode::builder()
+            .api_key("k")
+            .base_url("http://127.0.0.1:9")
+            .http_settings(settings)
+            .build()
+            .unwrap();
+        let raw = json!({"session_id": "ses_1", "stream_url": "ws://127.0.0.1:9/v1/sessions/ses_1/stream"});
+        let session = Session::from_open(dn, raw, 200, &reqwest::header::HeaderMap::new()).unwrap();
+        let err = session.connect().await.unwrap_err();
+        assert_eq!(err.status(), Some(403));
+        let request = seen.await.unwrap();
+        assert!(request.starts_with("get http://127.0.0.1:9/v1/sessions/ses_1/stream"), "{request}");
+        assert!(request.contains("upgrade: websocket"), "{request}");
+        assert!(request.contains("authorization: bearer k"), "{request}");
     }
 
     #[test]

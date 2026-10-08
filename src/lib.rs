@@ -59,12 +59,13 @@ mod session;
 mod upload;
 
 pub use batch::{
-    Batch, BatchCounters, BatchPage, BatchRequest, BatchResult, BatchResults, BatchRun, BatchStatus, Batches,
-    DEFAULT_BATCH_TIMEOUT, DEFAULT_POLL_INTERVAL, MIN_POLL_INTERVAL,
+    Batch, BatchCounters, BatchPage, BatchRequest, BatchResult, BatchResultStream, BatchResults, BatchRun, BatchStatus,
+    Batches, DEFAULT_BATCH_TIMEOUT, DEFAULT_POLL_INTERVAL, MIN_POLL_INTERVAL,
 };
 pub use client::{
     gate_questions, CallOptions, ClientBuilder, DecideRequest, DecisionNode, Sleeper, DEFAULT_BASE_URL,
     DEFAULT_CONCURRENCY, DEFAULT_INLINE_THRESHOLD, DEFAULT_MAX_RETRIES, DEFAULT_MODEL, DEFAULT_TIMEOUT,
+    DEFAULT_UPLOAD_TIMEOUT,
 };
 pub use error::{DecisionNodeError, Error, ErrorKind, Result};
 pub use http::HttpSettings;

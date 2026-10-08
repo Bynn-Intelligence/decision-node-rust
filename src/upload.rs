@@ -309,17 +309,20 @@ impl DecisionNode {
             let rb = inner
                 .http
                 .put(url.clone())
-                .timeout(inner.timeout)
+                .timeout(inner.upload_timeout)
                 .headers(presigned.headers.clone())
                 .body(local.data.clone());
             let attempt_future = async {
-                let resp = rb.send().await.map_err(|e| transport_error(e, inner.timeout))?;
+                let resp = rb.send().await.map_err(|e| transport_error(e, inner.upload_timeout))?;
                 let status = resp.status().as_u16();
-                let body = resp.bytes().await.map_err(|e| transport_error(e, inner.timeout))?;
+                let body = resp.bytes().await.map_err(|e| transport_error(e, inner.upload_timeout))?;
                 Ok::<_, Error>((status, body))
             };
-            let result = tokio::time::timeout(inner.timeout, attempt_future).await.unwrap_or_else(|_| {
-                Err(Error::new(ErrorKind::Timeout, format!("no response within {:.1} s", inner.timeout.as_secs_f64())))
+            let result = tokio::time::timeout(inner.upload_timeout, attempt_future).await.unwrap_or_else(|_| {
+                Err(Error::new(
+                    ErrorKind::Timeout,
+                    format!("no response within {:.1} s", inner.upload_timeout.as_secs_f64()),
+                ))
             });
             log::debug!(
                 "PUT storage {} in {} ms (attempt {})",

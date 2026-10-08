@@ -23,9 +23,9 @@ default = ["rustls-tls", "sessions"]
 blocking = ["tokio/rt-multi-thread"]
 # Sessions over a WebSocket (`DecisionNode::open_session`, `supervise`).
 sessions = ["dep:tokio-tungstenite"]
-# TLS backends, passed through to reqwest and, with sessions, to the WebSocket.
-rustls-tls = ["reqwest/rustls-tls", "tokio-tungstenite?/rustls-tls-webpki-roots"]
-native-tls = ["reqwest/native-tls", "tokio-tungstenite?/native-tls"]
+# TLS backends, passed through to reqwest; sessions use the same client settings.
+rustls-tls = ["reqwest/rustls-tls"]
+native-tls = ["reqwest/native-tls"]
 
 [dependencies]
 base64 = "0.22"
@@ -40,7 +40,7 @@ serde = "1"
 serde_json = { version = "1", features = ["preserve_order", "float_roundtrip"] }
 sha2 = "0.11.0"
 tokio = { version = "1", features = ["time", "sync", "rt"] }
-tokio-tungstenite = { version = "0.30.0", default-features = false, features = ["connect", "handshake"], optional = true }
+tokio-tungstenite = { version = "0.30.0", default-features = false, features = ["handshake"], optional = true }
 
 [dev-dependencies]
 regex = "1"

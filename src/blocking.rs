@@ -24,7 +24,7 @@ use serde_json::Value;
 
 use std::time::Duration;
 
-use crate::batch::{Batch, BatchPage, BatchRequest, BatchResults, BatchRun};
+use crate::batch::{Batch, BatchPage, BatchRequest, BatchResult, BatchResultStream, BatchResults, BatchRun};
 use crate::client::{CallOptions, ClientBuilder, DecideRequest};
 use crate::error::{Error, ErrorKind, Result};
 use crate::image::Image;
@@ -164,6 +164,26 @@ impl DecisionNode {
         self.run(self.client.decide_raw(body))
     }
 
+    /// See [`crate::DecisionNode::check_decide`].
+    pub fn check_decide(&self, request: &DecideRequest) -> Result<()> {
+        self.client.check_decide(request)
+    }
+
+    /// See [`crate::DecisionNode::check_systemone`].
+    pub fn check_systemone(&self, request: &DecideRequest) -> Result<()> {
+        self.client.check_systemone(request)
+    }
+
+    /// See [`crate::DecisionNode::check_batch`].
+    pub fn check_batch(&self, requests: &[BatchRequest]) -> Result<()> {
+        self.client.check_batch(requests)
+    }
+
+    /// See [`crate::DecisionNode::check_batch_add`].
+    pub fn check_batch_add(&self, requests: &[BatchRequest]) -> Result<()> {
+        self.client.check_batch_add(requests)
+    }
+
     /// See [`crate::DecisionNode::systemone`].
     pub fn systemone(&self, request: DecideRequest) -> Result<Decision> {
         self.run(self.client.systemone(request))
@@ -242,9 +262,39 @@ impl Batches<'_> {
         self.client.run(self.client.client.batches().results(batch_id))
     }
 
+    /// See [`crate::Batches::stream_results`]: the results read from the
+    /// network line by line, as an iterator.
+    pub fn stream_results(&self, batch_id: &str) -> Result<BatchResultIter> {
+        let stream = self.client.run(self.client.client.batches().stream_results(batch_id))?;
+        Ok(BatchResultIter { stream, runtime: self.client.runtime.clone() })
+    }
+
     /// See [`crate::Batches::cancel`].
     pub fn cancel(&self, batch_id: &str) -> Result<Batch> {
         self.client.run(self.client.client.batches().cancel(batch_id))
+    }
+}
+
+/// The results of a batch read from the network line by line, one
+/// [`BatchResult`] per request in upload order. See
+/// [`crate::BatchResultStream`].
+pub struct BatchResultIter {
+    stream: BatchResultStream,
+    runtime: Arc<tokio::runtime::Runtime>,
+}
+
+impl fmt::Debug for BatchResultIter {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("BatchResultIter").finish_non_exhaustive()
+    }
+}
+
+impl Iterator for BatchResultIter {
+    type Item = Result<BatchResult>;
+
+    fn next(&mut self) -> Option<Result<BatchResult>> {
+        use futures_util::StreamExt;
+        self.runtime.block_on(self.stream.next())
     }
 }
 
@@ -283,6 +333,11 @@ mod sessions {
         /// See [`crate::Session::connect`].
         pub fn connect(&self) -> Result<()> {
             self.runtime.block_on(self.session.connect())
+        }
+
+        /// See [`crate::Session::check_frame`].
+        pub fn check_frame(&self, frame: &Frame) -> Result<()> {
+            self.session.check_frame(frame)
         }
 
         /// See [`crate::Session::send`].
@@ -330,6 +385,11 @@ mod sessions {
     }
 
     impl DecisionNode {
+        /// See [`crate::DecisionNode::check_session`].
+        pub fn check_session(&self, options: &SessionOptions) -> Result<()> {
+            self.client.check_session(options)
+        }
+
         /// See [`crate::DecisionNode::open_session`].
         pub fn open_session(&self, options: SessionOptions) -> Result<Session> {
             let session = self.run(self.client.open_session(options))?;

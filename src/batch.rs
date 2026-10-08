@@ -3,6 +3,8 @@
 
 use std::collections::HashSet;
 use std::fmt;
+use std::pin::Pin;
+use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
@@ -12,7 +14,9 @@ use reqwest::Method;
 use serde_json::{Map, Value};
 
 use crate::check::{usage_error, Profile};
-use crate::client::{DecideRequest, DecisionNode, Payload, Policy, Prepared};
+use futures_util::Stream;
+
+use crate::client::{transport_error, DecideRequest, DecisionNode, Payload, Policy, Prepared};
 use crate::error::{retry_after, Error, ErrorKind, Result};
 use crate::response::{Decision, Usage};
 
@@ -301,12 +305,81 @@ impl Iterator for BatchResults {
             let end = rest.iter().position(|&b| b == b'\n').unwrap_or(rest.len());
             let line = &rest[..end];
             self.at += end + 1;
-            if line.iter().all(u8::is_ascii_whitespace) {
-                continue;
+            if let Some(result) = parse_line(line) {
+                return Some(result);
             }
-            let parsed = serde_json::from_slice::<Value>(line).ok().and_then(BatchResult::from_line);
-            return Some(parsed.ok_or_else(|| Error::new(ErrorKind::Server, "a result line is not a valid result")));
         }
+    }
+}
+
+/// One line of a results file; `None` for a blank line.
+fn parse_line(line: &[u8]) -> Option<Result<BatchResult>> {
+    if line.iter().all(u8::is_ascii_whitespace) {
+        return None;
+    }
+    let parsed = serde_json::from_slice::<Value>(line).ok().and_then(BatchResult::from_line);
+    Some(parsed.ok_or_else(|| Error::new(ErrorKind::Server, "a result line is not a valid result")))
+}
+
+/// The results of a batch read from the network line by line, one
+/// [`BatchResult`] per request in upload order, from
+/// [`Batches::stream_results`]. Memory holds one network chunk and one line
+/// at a time, however large the file. Each chunk must arrive within the
+/// client's timeout.
+pub struct BatchResultStream {
+    inner: Pin<Box<dyn Stream<Item = Result<BatchResult>> + Send>>,
+}
+
+impl fmt::Debug for BatchResultStream {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("BatchResultStream").finish_non_exhaustive()
+    }
+}
+
+impl Stream for BatchResultStream {
+    type Item = Result<BatchResult>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Result<BatchResult>>> {
+        self.inner.as_mut().poll_next(cx)
+    }
+}
+
+/// What a results stream holds between lines.
+struct Reading {
+    response: reqwest::Response,
+    buffer: Vec<u8>,
+    done: bool,
+}
+
+impl BatchResultStream {
+    fn new(response: reqwest::Response, timeout: Duration) -> BatchResultStream {
+        let start = Reading { response, buffer: Vec::new(), done: false };
+        let lines = futures_util::stream::unfold(Some(start), move |state| async move {
+            let mut r = state?;
+            loop {
+                if let Some(end) = r.buffer.iter().position(|&b| b == b'\n') {
+                    let line: Vec<u8> = r.buffer.drain(..=end).collect();
+                    match parse_line(&line[..end]) {
+                        Some(result) => return Some((result, Some(r))),
+                        None => continue,
+                    }
+                }
+                if r.done {
+                    let rest = std::mem::take(&mut r.buffer);
+                    return parse_line(&rest).map(|result| (result, None));
+                }
+                match tokio::time::timeout(timeout, r.response.chunk()).await {
+                    Ok(Ok(Some(chunk))) => r.buffer.extend_from_slice(&chunk),
+                    Ok(Ok(None)) => r.done = true,
+                    Ok(Err(e)) => return Some((Err(transport_error(e, timeout)), None)),
+                    Err(_) => {
+                        let message = format!("no part of the results within {:.1} s", timeout.as_secs_f64());
+                        return Some((Err(Error::new(ErrorKind::Timeout, message)), None));
+                    }
+                }
+            }
+        });
+        BatchResultStream { inner: Box::pin(lines) }
     }
 }
 
@@ -410,6 +483,21 @@ impl DecisionNode {
         }
         let results = batches.results(&batch.id).await?;
         Ok(BatchRun { batch, results })
+    }
+
+    /// Runs every local check [`Batches::create`] would run on these
+    /// requests (the `custom_id` rules, each line as a decide request, the
+    /// limits held from [`DecisionNode::models`]) and returns the error
+    /// creating would return. Sends and uploads nothing; `Ok(())` means the
+    /// batch would be sent.
+    pub fn check_batch(&self, requests: &[BatchRequest]) -> Result<()> {
+        self.prepare_lines(requests.iter().cloned(), true).map(drop)
+    }
+
+    /// [`DecisionNode::check_batch`] for [`Batches::add`], which takes no
+    /// empty list.
+    pub fn check_batch_add(&self, requests: &[BatchRequest]) -> Result<()> {
+        self.prepare_lines(requests.iter().cloned(), false).map(drop)
     }
 
     /// Checks every request of one call before anything is sent: the
@@ -647,10 +735,37 @@ impl Batches<'_> {
     /// [`BatchResult`] per request in upload order. A batch that has not
     /// ended is a `409` `results_not_ready`; results deleted 7 days after the
     /// end are a `410` `results_expired` (the base kind with its status).
+    ///
+    /// This reads the whole file, then parses it a line at a time as the
+    /// iterator is read. [`Batches::stream_results`] reads it from the network
+    /// line by line instead, for files of any size.
     pub async fn results(&self, batch_id: &str) -> Result<BatchResults> {
         let path = format!("/v1/batches/{}/results", segment(batch_id));
         let raw = self.client.request(Method::GET, &path, None, Policy::Default).await?;
         Ok(BatchResults { body: raw.body, at: 0 })
+    }
+
+    /// `GET /v1/batches/{id}/results`, read from the network line by line:
+    /// a stream of one [`BatchResult`] per request in upload order. The
+    /// request is retried as every call is until the results start to
+    /// arrive; then each chunk must arrive within the client's timeout.
+    ///
+    /// ```no_run
+    /// # async fn run(dn: decisionnode::DecisionNode) -> decisionnode::Result<()> {
+    /// use futures_util::StreamExt;
+    ///
+    /// let mut results = dn.batches().stream_results("batch_01J9ZB8Q3T").await?;
+    /// while let Some(result) = results.next().await {
+    ///     let result = result?;
+    ///     println!("{} {:?}", result.custom_id, result.status);
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn stream_results(&self, batch_id: &str) -> Result<BatchResultStream> {
+        let path = format!("/v1/batches/{}/results", segment(batch_id));
+        let response = self.client.request_open(Method::GET, &path, Policy::Default).await?;
+        Ok(BatchResultStream::new(response, self.client.inner.timeout))
     }
 
     /// `POST /v1/batches/{id}/cancel`: cancels a draft, a queued or a running
@@ -716,6 +831,41 @@ mod tests {
         let mut bad = BatchResults { body: Bytes::from_static(b"{\"nope\":1}\n"), at: 0 };
         assert_eq!(bad.next().unwrap().unwrap_err().kind(), ErrorKind::Server);
         assert!(bad.next().is_none());
+    }
+
+    #[tokio::test]
+    async fn results_stream_line_by_line_across_chunks() {
+        use futures_util::StreamExt;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = sock.read(&mut buf).await;
+            let lines: String = (0..3)
+                .map(|i| {
+                    format!("{{\"custom_id\":\"r{i}\",\"status\":\"cancelled\",\"body\":null,\"headers\":{{}}}}\n")
+                })
+                .collect::<String>()
+                + "\n{\"custom_id\":\"last\",\"status\":\"expired\",\"body\":null,\"headers\":{}}";
+            let (a, b) = lines.split_at(37); // mid-line
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: application/x-ndjson\r\n\r\n",
+                lines.len()
+            );
+            sock.write_all(head.as_bytes()).await.unwrap();
+            sock.write_all(a.as_bytes()).await.unwrap();
+            sock.flush().await.unwrap();
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            sock.write_all(b.as_bytes()).await.unwrap();
+        });
+        let dn = DecisionNode::builder().api_key("k").base_url(format!("http://{addr}")).build().unwrap();
+        let results: Vec<BatchResult> =
+            dn.batches().stream_results("batch_x").await.unwrap().map(|r| r.unwrap()).collect().await;
+        let ids: Vec<&str> = results.iter().map(|r| r.custom_id.as_str()).collect();
+        assert_eq!(ids, ["r0", "r1", "r2", "last"]);
+        assert_eq!(results[3].status, BatchStatus::Expired);
     }
 
     #[test]

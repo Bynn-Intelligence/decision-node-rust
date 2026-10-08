@@ -50,8 +50,15 @@ pub(crate) struct Limits {
 }
 
 impl Limits {
+    /// The entry of the model a request names: the entry of that name, else
+    /// the one stating the name as its `alias` or its pinned `version`. A
+    /// name the list does not state holds nothing.
     pub(crate) fn of(model: &str, held: &HashMap<String, Map<String, Value>>) -> Limits {
-        Limits { model: model.to_owned(), entry: held.get(model).cloned() }
+        let entry = held.get(model).or_else(|| {
+            held.values()
+                .find(|m| ["alias", "version"].iter().any(|k| m.get(*k).and_then(Value::as_str) == Some(model)))
+        });
+        Limits { model: model.to_owned(), entry: entry.cloned() }
     }
 
     /// A field of the entry, or of one of its objects (`sessions`, `batch`).
@@ -799,5 +806,17 @@ mod tests {
         let e = check_session_open(open.as_object().unwrap(), 3, &limits).unwrap_err();
         assert_eq!(e.message(), "Model m does not serve sessions.");
         assert!(check_session_open(open.as_object().unwrap(), 3, &Limits::default()).is_ok());
+    }
+
+    #[test]
+    fn held_limits_by_alias_or_version() {
+        let mut held = HashMap::new();
+        let entry = json!({"name": "decisionnode-1.0", "version": "decisionnode-1.0", "alias": "decisionnode-latest",
+                           "max_choice_options": 2});
+        held.insert("decisionnode-1.0".to_owned(), entry.as_object().unwrap().clone());
+        for name in ["decisionnode-1.0", "decisionnode-latest"] {
+            assert_eq!(Limits::of(name, &held).count(&["max_choice_options"]), Some(2), "{name}");
+        }
+        assert_eq!(Limits::of("decisionnode-9", &held).count(&["max_choice_options"]), None);
     }
 }

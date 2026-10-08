@@ -32,6 +32,10 @@ pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 pub const DEFAULT_MAX_RETRIES: u32 = 2;
 /// How many requests [`DecisionNode::decide_many`] sends at a time.
 pub const DEFAULT_CONCURRENCY: usize = 8;
+/// The timeout of one storage `PUT` attempt of an upload, apart from the API
+/// call's [`DEFAULT_TIMEOUT`]: a 10 MB image on a slow uplink needs more than
+/// 10 seconds. Set another with [`ClientBuilder::upload_timeout`].
+pub const DEFAULT_UPLOAD_TIMEOUT: Duration = Duration::from_secs(60);
 /// Local images of one request (or session frame, or batch line) that total
 /// fewer bytes than this go inline as base64; at or above it they are
 /// uploaded and sent by upload id. Below about half a megabyte the base64
@@ -253,6 +257,7 @@ pub struct ClientBuilder {
     timeout: Option<std::result::Result<Duration, String>>,
     max_retries: Option<std::result::Result<u32, String>>,
     inline_threshold: Option<std::result::Result<usize, String>>,
+    upload_timeout: Option<std::result::Result<Duration, String>>,
     headers: Vec<(String, String)>,
     http: HttpSettings,
     sleeper: Option<Sleeper>,
@@ -314,6 +319,26 @@ impl ClientBuilder {
                 .ok()
                 .filter(|_| seconds.is_finite())
                 .ok_or_else(|| format!("timeout must be above 0 seconds, got {seconds}")),
+        );
+        self
+    }
+
+    /// The timeout of one storage `PUT` attempt of an image upload, from
+    /// sending to the storage's answer, apart from [`ClientBuilder::timeout`].
+    /// Default: 60 seconds. Zero fails [`ClientBuilder::build`].
+    pub fn upload_timeout(mut self, timeout: Duration) -> ClientBuilder {
+        self.upload_timeout = Some(Ok(timeout));
+        self
+    }
+
+    /// [`ClientBuilder::upload_timeout`] as a number of seconds. A value of 0
+    /// or below, or one that is not finite, fails [`ClientBuilder::build`].
+    pub fn upload_timeout_secs(mut self, seconds: f64) -> ClientBuilder {
+        self.upload_timeout = Some(
+            Duration::try_from_secs_f64(seconds)
+                .ok()
+                .filter(|_| seconds.is_finite())
+                .ok_or_else(|| format!("upload_timeout must be above 0 seconds, got {seconds}")),
         );
         self
     }
@@ -448,7 +473,14 @@ impl ClientBuilder {
         }
         let max_retries = self.max_retries.unwrap_or(Ok(DEFAULT_MAX_RETRIES)).map_err(Error::invalid)?;
         let inline_threshold = self.inline_threshold.unwrap_or(Ok(DEFAULT_INLINE_THRESHOLD)).map_err(Error::invalid)?;
-        let http = self.http.build(base_url.starts_with("https:"))?;
+        let upload_timeout = self.upload_timeout.unwrap_or(Ok(DEFAULT_UPLOAD_TIMEOUT)).map_err(Error::invalid)?;
+        if upload_timeout.is_zero() {
+            return Err(Error::invalid("upload_timeout must be above 0"));
+        }
+        let https = base_url.starts_with("https:");
+        let http = self.http.build(https, false)?;
+        #[cfg(not(feature = "sessions"))]
+        drop(self.http);
         Ok(DecisionNode {
             inner: Arc::new(Inner {
                 api_key: self.api_key.or_else(|| env("DECISIONNODE_API_KEY")),
@@ -457,8 +489,15 @@ impl ClientBuilder {
                 timeout,
                 max_retries,
                 inline_threshold,
+                upload_timeout,
                 headers,
                 http,
+                #[cfg(feature = "sessions")]
+                https,
+                #[cfg(feature = "sessions")]
+                http_settings: self.http,
+                #[cfg(feature = "sessions")]
+                socket_http: std::sync::OnceLock::new(),
                 sleeper: self.sleeper,
                 clock: self.clock,
                 uploads: UploadCache::default(),
@@ -515,8 +554,19 @@ pub(crate) struct Inner {
     pub(crate) timeout: Duration,
     pub(crate) max_retries: u32,
     pub(crate) inline_threshold: usize,
+    pub(crate) upload_timeout: Duration,
     pub(crate) headers: HeaderMap,
     pub(crate) http: reqwest::Client,
+    /// True for an `https` base URL: nothing is then sent over plain HTTP.
+    #[cfg(feature = "sessions")]
+    pub(crate) https: bool,
+    /// The settings the clients were built from, for the session client.
+    #[cfg(feature = "sessions")]
+    pub(crate) http_settings: HttpSettings,
+    /// The HTTP/1.1 client a session's WebSocket upgrades on, built from the
+    /// same settings on the first connect.
+    #[cfg(feature = "sessions")]
+    pub(crate) socket_http: std::sync::OnceLock<reqwest::Client>,
     pub(crate) sleeper: Option<Sleeper>,
     pub(crate) clock: Option<Clock>,
     pub(crate) uploads: UploadCache,
@@ -572,6 +622,19 @@ impl DecisionNode {
     /// The inline threshold in bytes, see [`ClientBuilder::inline_threshold`].
     pub fn inline_threshold(&self) -> usize {
         self.inner.inline_threshold
+    }
+
+    /// Runs every local check [`DecisionNode::decide`] would run on this
+    /// request, with the limits held from [`DecisionNode::models`], and returns
+    /// the error sending would return. Sends and uploads nothing; `Ok(())`
+    /// means the request would be sent.
+    pub fn check_decide(&self, request: &DecideRequest) -> Result<()> {
+        request.clone().prepare(self, Profile::Decide).map(drop)
+    }
+
+    /// [`DecisionNode::check_decide`] for [`DecisionNode::systemone`].
+    pub fn check_systemone(&self, request: &DecideRequest) -> Result<()> {
+        request.clone().prepare(self, Profile::Systemone).map(drop)
     }
 
     /// Sends one decision request to `POST /v1/decide`.
@@ -876,6 +939,30 @@ impl DecisionNode {
         payload: Option<Payload>,
         policy: Policy,
     ) -> Result<RawReply> {
+        match self.exchange(method, path, payload, policy, false).await? {
+            Exchanged::Whole(reply) => Ok(reply),
+            Exchanged::Open(_) => unreachable!("a whole reply was asked for"),
+        }
+    }
+
+    /// Sends one API call with retries and returns a 2xx response with its
+    /// body still to read, for a body read line by line. The timeout covers
+    /// the attempt up to the response's headers.
+    pub(crate) async fn request_open(&self, method: Method, path: &str, policy: Policy) -> Result<reqwest::Response> {
+        match self.exchange(method, path, None, policy, true).await? {
+            Exchanged::Open(resp) => Ok(resp),
+            Exchanged::Whole(_) => unreachable!("an open reply was asked for"),
+        }
+    }
+
+    async fn exchange(
+        &self,
+        method: Method,
+        path: &str,
+        payload: Option<Payload>,
+        policy: Policy,
+        open: bool,
+    ) -> Result<Exchanged> {
         let inner = &*self.inner;
         let auth = self.authorization()?;
         let url = format!("{}{}", inner.base_url, path);
@@ -886,7 +973,6 @@ impl DecisionNode {
             let mut rb = inner
                 .http
                 .request(method.clone(), &url)
-                .timeout(inner.timeout)
                 .header(AUTHORIZATION, auth.clone())
                 .header(USER_AGENT, USER_AGENT_VALUE)
                 .header(ACCEPT, "application/json");
@@ -896,16 +982,24 @@ impl DecisionNode {
             if !inner.headers.is_empty() {
                 rb = rb.headers(inner.headers.clone());
             }
+            if !open {
+                rb = rb.timeout(inner.timeout);
+            }
 
             // The timeout covers the whole attempt, from sending to the last
             // byte of the body: reqwest's own covers the same span, and this
-            // one holds whatever the HTTP client was configured with.
+            // one holds whatever the HTTP client was configured with. A body
+            // read line by line is covered up to its headers here, and chunk
+            // by chunk by its reader.
             let attempt_future = async {
                 let resp = rb.send().await.map_err(|e| transport_error(e, inner.timeout))?;
                 let status = resp.status().as_u16();
                 let headers = resp.headers().clone();
+                if open && (200..=299).contains(&status) {
+                    return Ok((status, headers, Body::Open(resp)));
+                }
                 let bytes = resp.bytes().await.map_err(|e| transport_error(e, inner.timeout))?;
-                Ok((status, headers, bytes))
+                Ok((status, headers, Body::Bytes(bytes)))
             };
             let result = match tokio::time::timeout(inner.timeout, attempt_future).await {
                 Ok(r) => r,
@@ -937,8 +1031,12 @@ impl DecisionNode {
                         started.elapsed().as_millis(),
                         attempt + 1
                     );
+                    let body = match body {
+                        Body::Open(resp) => return Ok(Exchanged::Open(resp)),
+                        Body::Bytes(bytes) => bytes,
+                    };
                     if (200..=299).contains(&status) {
-                        return Ok(RawReply { status, headers, body });
+                        return Ok(Exchanged::Whole(RawReply { status, headers, body }));
                     }
                     let retryable = match policy {
                         Policy::Mutation => matches!(status, 429 | 529),
@@ -996,7 +1094,18 @@ impl Payload {
     }
 }
 
-/// A 2xx response, its body unread.
+/// The body of one attempt: read whole, or a 2xx left open.
+enum Body {
+    Bytes(Bytes),
+    Open(reqwest::Response),
+}
+
+enum Exchanged {
+    Whole(RawReply),
+    Open(reqwest::Response),
+}
+
+/// A 2xx response, its body read whole.
 pub(crate) struct RawReply {
     pub(crate) status: u16,
     pub(crate) headers: HeaderMap,
@@ -1176,6 +1285,20 @@ mod tests {
     }
 
     #[test]
+    fn checks_send_nothing_and_return_what_sending_would() {
+        // No server at this address: a check that sent anything would fail
+        // with a connection error.
+        let dn = DecisionNode::builder().api_key("k").base_url("http://127.0.0.1:9").build().unwrap();
+        let ok = DecideRequest::new().question("q", truth("?")).image(Image::url("u", "https://example.com/a.png"));
+        assert!(dn.check_decide(&ok).is_ok());
+        assert!(dn.check_systemone(&ok).is_ok());
+        let bad = DecideRequest::new().question("n", crate::number("How many?").min(60).max(50));
+        assert_eq!(dn.check_decide(&bad).unwrap_err().kind(), ErrorKind::Validation);
+        assert_eq!(dn.check_systemone(&bad).unwrap_err().message(), "Invalid request.");
+        assert!(dn.check_decide(&DecideRequest::new()).unwrap_err().is_argument());
+    }
+
+    #[test]
     fn question_and_image_faults_are_the_apis_errors() {
         let err = body(DecideRequest::new().question("q", crate::Truth::new())).unwrap_err();
         assert_eq!(err.kind(), ErrorKind::BadRequest);
@@ -1203,8 +1326,15 @@ mod tests {
             timeout: dn.inner.timeout,
             max_retries: dn.inner.max_retries,
             inline_threshold: dn.inner.inline_threshold,
+            upload_timeout: dn.inner.upload_timeout,
             headers: dn.inner.headers.clone(),
             http: dn.inner.http.clone(),
+            #[cfg(feature = "sessions")]
+            https: dn.inner.https,
+            #[cfg(feature = "sessions")]
+            http_settings: dn.inner.http_settings.clone(),
+            #[cfg(feature = "sessions")]
+            socket_http: std::sync::OnceLock::new(),
             sleeper: None,
             clock: None,
             uploads: UploadCache::default(),
@@ -1245,6 +1375,9 @@ mod tests {
         assert!(DecisionNode::builder().max_retries(0).build().is_ok());
         assert!(DecisionNode::builder().max_retries(4u64).build().is_ok());
         assert!(DecisionNode::builder().inline_threshold(-1).build().unwrap_err().is_argument());
+        assert!(DecisionNode::builder().upload_timeout(Duration::ZERO).build().unwrap_err().is_argument());
+        assert!(DecisionNode::builder().upload_timeout_secs(-1.0).build().unwrap_err().is_argument());
+        assert_eq!(DecisionNode::builder().build().unwrap().inner.upload_timeout, DEFAULT_UPLOAD_TIMEOUT);
         let dn = DecisionNode::builder().inline_threshold(0).build().unwrap();
         assert_eq!(dn.inline_threshold(), 0);
         assert_eq!(DecisionNode::builder().build().unwrap().inline_threshold(), DEFAULT_INLINE_THRESHOLD);

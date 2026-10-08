@@ -2,11 +2,12 @@
 
 use std::fmt;
 use std::net::{IpAddr, SocketAddr};
+use std::sync::Arc;
 use std::time::Duration;
 
 use crate::error::{Error, ErrorKind, Result};
 
-type Step = Box<dyn FnOnce(reqwest::ClientBuilder) -> reqwest::ClientBuilder + Send + Sync>;
+type Step = Arc<dyn Fn(reqwest::ClientBuilder) -> reqwest::ClientBuilder + Send + Sync>;
 
 /// Transport settings for the HTTP client the SDK builds, passed to
 /// [`crate::ClientBuilder::http_settings`].
@@ -18,9 +19,8 @@ type Step = Box<dyn FnOnce(reqwest::ClientBuilder) -> reqwest::ClientBuilder + S
 /// setting that turns them off, and a client certificate or extra root
 /// certificates add to the checks rather than replace them.
 ///
-/// The settings apply to every HTTP call, uploads to storage included. A
-/// session's WebSocket connects directly with the platform's root
-/// certificates.
+/// The settings apply to every connection the client opens: API calls,
+/// uploads to storage and a session's WebSocket.
 ///
 /// ```
 /// use std::time::Duration;
@@ -33,7 +33,7 @@ type Step = Box<dyn FnOnce(reqwest::ClientBuilder) -> reqwest::ClientBuilder + S
 /// let dn = decisionnode::DecisionNode::builder().http_settings(settings).build()?;
 /// # Ok::<(), decisionnode::Error>(())
 /// ```
-#[derive(Default)]
+#[derive(Clone, Default)]
 #[must_use]
 pub struct HttpSettings {
     names: Vec<&'static str>,
@@ -55,17 +55,17 @@ impl HttpSettings {
     fn step(
         mut self,
         name: &'static str,
-        f: impl FnOnce(reqwest::ClientBuilder) -> reqwest::ClientBuilder + Send + Sync + 'static,
+        f: impl Fn(reqwest::ClientBuilder) -> reqwest::ClientBuilder + Send + Sync + 'static,
     ) -> HttpSettings {
         self.names.push(name);
-        self.steps.push(Box::new(f));
+        self.steps.push(Arc::new(f));
         self
     }
 
     /// Sends through a proxy. An `https` request goes through the proxy in a
     /// tunnel, so TLS still runs end to end with the API.
     pub fn proxy(self, proxy: reqwest::Proxy) -> HttpSettings {
-        self.step("proxy", move |b| b.proxy(proxy))
+        self.step("proxy", move |b| b.proxy(proxy.clone()))
     }
 
     /// Ignores proxies from the environment (`HTTPS_PROXY` and the others).
@@ -120,7 +120,7 @@ impl HttpSettings {
     /// Certificates are still checked.
     #[cfg(any(feature = "rustls-tls", feature = "native-tls"))]
     pub fn add_root_certificate(self, certificate: reqwest::Certificate) -> HttpSettings {
-        self.step("add_root_certificate", move |b| b.add_root_certificate(certificate))
+        self.step("add_root_certificate", move |b| b.add_root_certificate(certificate.clone()))
     }
 
     /// Whether the built-in root certificates are trusted (default `true`).
@@ -134,14 +134,18 @@ impl HttpSettings {
     /// A client certificate, for a proxy or gateway that asks for one.
     #[cfg(any(feature = "rustls-tls", feature = "native-tls"))]
     pub fn identity(self, identity: reqwest::Identity) -> HttpSettings {
-        self.step("identity", move |b| b.identity(identity))
+        self.step("identity", move |b| b.identity(identity.clone()))
     }
 
-    /// Builds the client: the settings, then the rules no setting can change.
-    pub(crate) fn build(self, https: bool) -> Result<reqwest::Client> {
+    /// Builds a client: the settings, then the rules no setting can change.
+    /// `http1` builds the one a session's WebSocket upgrades on.
+    pub(crate) fn build(&self, https: bool, http1: bool) -> Result<reqwest::Client> {
         let mut builder = reqwest::Client::builder();
-        for step in self.steps {
+        for step in &self.steps {
             builder = step(builder);
+        }
+        if http1 {
+            builder = builder.http1_only();
         }
         // Never follow a redirect, so the key never reaches another URL.
         builder = builder.redirect(reqwest::redirect::Policy::none());
