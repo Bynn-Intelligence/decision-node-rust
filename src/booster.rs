@@ -211,7 +211,9 @@ pub struct Evidence {
     /// for a refused request.
     /// `None` when the server does not send it.
     pub billed_calls: Option<u64>,
-    /// One reading per image read. Empty unless `status` is `ok`.
+    /// One entry per picture. A picture the booster did not read (it timed
+    /// out or failed, or could not decode the picture) is a
+    /// [`Reading::Unknown`] holding only its image, `status` saying why.
     pub results: Vec<Reading>,
     /// The evidence entry as received.
     pub raw: Value,
