@@ -207,8 +207,8 @@ pub struct Evidence {
     /// How long the booster took, in milliseconds. `None` when absent.
     pub latency_ms: Option<f64>,
     /// The calls of this booster billed on this request: one per image it
-    /// read with status `ok`, 0 for a reading served again from the last
-    /// hour's, a booster that failed or timed out, and a refused request.
+    /// read with status `ok`, 0 for a booster that failed or timed out and
+    /// for a refused request.
     /// `None` when the server does not send it.
     pub billed_calls: Option<u64>,
     /// One reading per image read. Empty unless `status` is `ok`.
