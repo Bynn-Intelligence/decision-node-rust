@@ -26,10 +26,11 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use base64::Engine;
+use decisionnode::Evidence;
 use decisionnode::{
-    Batch, BatchPage, BatchRequest, BatchResult, BatchStatus, BoundingBox, CallOptions, Choice, ChoiceAnswer,
+    Batch, BatchPage, BatchRequest, BatchResult, BatchStatus, Booster, BoundingBox, CallOptions, Choice, ChoiceAnswer,
     ClientBuilder, DecideRequest, Decision, DecisionNode, DecisionResult, Error, Image, Levels, ModelInfo, Number,
-    NumberAnswer, Options, Point, Question, Safety, Score, ScoreAnswer, Truth, TruthAnswer, Video, VideoFrame,
+    NumberAnswer, Options, Point, Question, Reading, Safety, Score, ScoreAnswer, Truth, TruthAnswer, Video, VideoFrame,
 };
 use serde_json::{json, Map, Value};
 use sha2::Digest;
@@ -583,6 +584,36 @@ fn videos(root: &Path, args: &Value) -> Vec<Video> {
     args.get("videos").and_then(Value::as_array).into_iter().flatten().map(|v| video(root, v)).collect()
 }
 
+/// One booster of a call: a `$booster` builder (`name`, and `images`,
+/// `require` and `options` only when present) or a plain value, a name or a
+/// wire-form object, passed as is.
+fn booster(value: &Value) -> Booster {
+    match single(value) {
+        Some(("$booster", args)) => {
+            let name = args.get("name").or_else(|| args.get("booster")).and_then(Value::as_str).unwrap_or_default();
+            let mut b = Booster::new(name);
+            if let Some(images) = opt(args, "images").and_then(Value::as_array) {
+                b = b.images(images.iter().map(|i| i.as_str().unwrap_or_default().to_owned()));
+            }
+            if let Some(r) = opt(args, "require").and_then(Value::as_bool) {
+                b = b.require(r);
+            }
+            if let Some(o) = opt(args, "options") {
+                b = b.options(o);
+            }
+            b
+        }
+        _ => match value {
+            Value::String(name) => Booster::from(name.as_str()),
+            other => Booster::from(other.clone()),
+        },
+    }
+}
+
+fn boosters(args: &Value) -> Vec<Booster> {
+    args.get("boosters").and_then(Value::as_array).into_iter().flatten().map(booster).collect()
+}
+
 fn decide_request(root: &Path, args: &Value) -> Result<DecideRequest, Error> {
     let mut r = DecideRequest::new();
     if let Some(s) = args.get("state") {
@@ -591,6 +622,7 @@ fn decide_request(root: &Path, args: &Value) -> Result<DecideRequest, Error> {
     r = r.questions(questions(args));
     r = r.images(images(root, args)?);
     r = r.videos(videos(root, args));
+    r = r.boosters(boosters(args));
     if let Some(m) = opt(args, "model").and_then(Value::as_str) {
         r = r.model(m);
     }
@@ -612,9 +644,9 @@ fn batch_requests(root: &Path, args: &Value) -> Result<Vec<BatchRequest>, Error>
         .collect()
 }
 
-/// The images, videos and model of a helper call.
+/// The images, videos, boosters and model of a helper call.
 fn call_options(root: &Path, args: &Value) -> Result<CallOptions, Error> {
-    let mut o = CallOptions::new().images(images(root, args)?).videos(videos(root, args));
+    let mut o = CallOptions::new().images(images(root, args)?).videos(videos(root, args)).boosters(boosters(args));
     if let Some(m) = opt(args, "model").and_then(Value::as_str) {
         o = o.model(m);
     }
@@ -1034,6 +1066,27 @@ fn norm_answers(answers: &indexmap::IndexMap<String, decisionnode::Answer>) -> V
     Value::Object(answers.iter().map(|(k, v)| (k.clone(), norm_answer(v))).collect())
 }
 
+fn norm_reading(r: &Reading) -> Value {
+    match r {
+        Reading::Age(a) => json!({"kind": "age", "image": a.image, "faces": a.faces, "age_years": a.age_years.map(num),
+            "low": a.low.map(num), "high": a.high.map(num), "confidence": a.confidence.map(num)}),
+        Reading::AiGenerated(g) => json!({"kind": "ai_generated", "image": g.image, "generated": num(g.generated),
+            "confidence": num(g.confidence), "method": g.method,
+            "top_generator": g.top_generator.as_ref().map(|t| json!({"name": t.name, "probability": num(t.probability)})),
+            "c2pa_signer": g.c2pa_signer}),
+        _ => json!({"kind": "unknown", "raw": r.raw()}),
+    }
+}
+
+fn norm_evidence(e: &Evidence) -> Value {
+    json!({
+        "version": e.version,
+        "status": e.status,
+        "latency_ms": e.latency_ms.map(num),
+        "results": e.results.iter().map(norm_reading).collect::<Vec<_>>(),
+    })
+}
+
 fn norm_decision(d: &Decision) -> Value {
     json!({
         "model": d.model,
@@ -1044,7 +1097,12 @@ fn norm_decision(d: &Decision) -> Value {
             "output_tokens": d.usage.output_tokens,
             "video_frames": d.usage.video_frames,
             "video_seconds": d.usage.video_seconds.map(num),
+            "booster_tokens": d.usage.booster_tokens,
+            "boosters": d.usage.boosters,
         },
+        "evidence": d.evidence.as_ref().map(|m| {
+            Value::Object(m.iter().map(|(k, e)| (k.clone(), norm_evidence(e))).collect())
+        }),
         "warnings": d.warnings,
         "safety": norm_safety(&d.safety),
         "answers": norm_answers(&d.answers),
@@ -1064,6 +1122,9 @@ fn norm_error(e: &Error) -> Value {
         "safety": norm_safety(&e.safety().cloned()),
         "entries": e.entries(),
         "retry_after": e.retry_after().map(|d| num(d.as_secs_f64())),
+        "boosters": Value::Object(
+            e.boosters().iter().map(|(k, b)| (k.clone(), json!({"status": b.status, "latency_ms": b.latency_ms}))).collect()
+        ),
     })
 }
 
@@ -1678,6 +1739,23 @@ fn run_request(ctx: &Ctx, driver: Driver, case: &Value) -> Result<(), Fail> {
     }
 }
 
+/// The fields of a fine-tuned model's `models()` entry, compared when a case
+/// lists them.
+const FINE_TUNED: [&str; 4] = ["fine_tuned", "base", "adapter_version", "status"];
+
+/// A `models()` entry, with the fine-tuned fields only where the expected
+/// entry lists them.
+fn norm_model(m: &ModelInfo, expected: Option<&Value>) -> Value {
+    let mut out = json!({"name": m.name, "description": m.description, "release_date": m.release_date, "limits": m.limits,
+        "fine_tuned": m.fine_tuned, "base": m.base, "adapter_version": m.adapter_version, "status": m.status});
+    for k in FINE_TUNED {
+        if expected.and_then(|e| e.get(k)).is_none() {
+            out.as_object_mut().unwrap().remove(k);
+        }
+    }
+    out
+}
+
 fn run_response(ctx: &Ctx, driver: Driver, case: &Value) -> Result<(), Fail> {
     let s = session();
     let id = case["id"].as_str().unwrap();
@@ -1703,10 +1781,7 @@ fn run_response(ctx: &Ctx, driver: Driver, case: &Value) -> Result<(), Fail> {
     } else if let Some(m) = exp.get("models") {
         match &outcome {
             Outcome::Models(list) => {
-                let got: Vec<Value> = list
-                    .iter()
-                    .map(|m| json!({"name": m.name, "description": m.description, "release_date": m.release_date, "limits": m.limits}))
-                    .collect();
+                let got: Vec<Value> = list.iter().enumerate().map(|(i, model)| norm_model(model, m.get(i))).collect();
                 let got = Value::Array(got);
                 if same(m, &got) {
                     Ok(())

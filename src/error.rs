@@ -8,9 +8,11 @@
 use std::fmt;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use indexmap::IndexMap;
 use reqwest::header::HeaderMap;
 use serde_json::Value;
 
+use crate::booster::{parse_boosters_header, BoosterStatus};
 use crate::safety::Safety;
 
 /// The result type of every call.
@@ -42,7 +44,8 @@ pub enum ErrorKind {
     /// 403 with `error_type` `refusal_error`: the request was refused under the
     /// usage policy. See [`Error::category`] and [`Error::safety`].
     Refusal,
-    /// 403 for any other reason.
+    /// 403 for any other reason: an `error_type` other than `refusal_error`
+    /// (`booster_not_enabled`, a suspended workspace) or none.
     PermissionDenied,
     /// 404: unknown path.
     NotFound,
@@ -56,7 +59,10 @@ pub enum ErrorKind {
     /// open sessions as it may. Never retried, since a count frees when a
     /// session ends. A special case of [`ErrorKind::RateLimit`].
     SessionLimit,
-    /// 529: the service is overloaded. See [`Error::retry_after`].
+    /// 529: the service is overloaded, or (`error_type`
+    /// `booster_unavailable`) a booster the request requires failed or did
+    /// not answer in time. Retried like every 529. See [`Error::retry_after`]
+    /// and [`Error::boosters`].
     Overloaded,
     /// Any other 5xx, or a 2xx response whose body is not JSON or not a valid
     /// answer.
@@ -137,6 +143,7 @@ struct Inner {
     safety: Option<Safety>,
     entries: Option<Vec<Value>>,
     retry_after: Option<Duration>,
+    boosters: IndexMap<String, BoosterStatus>,
     body: Option<Value>,
     source: Option<Box<dyn std::error::Error + Send + Sync + 'static>>,
 }
@@ -155,6 +162,7 @@ impl Error {
                 safety: None,
                 entries: None,
                 retry_after: None,
+                boosters: IndexMap::new(),
                 body: None,
                 source: None,
             }),
@@ -283,6 +291,7 @@ impl Error {
                 safety,
                 entries: if kind == ErrorKind::Validation { entries } else { None },
                 retry_after,
+                boosters: parse_boosters_header(headers),
                 body: parsed,
                 source: None,
             }),
@@ -352,6 +361,15 @@ impl Error {
     /// seconds or as an HTTP date, capped at 60 seconds.
     pub fn retry_after(&self) -> Option<Duration> {
         self.inner.retry_after
+    }
+
+    /// For a request that named boosters: what each booster did, from the
+    /// `x-decisionnode-boosters` header, by booster name in the request's
+    /// order, so a caller can see which required booster failed (an
+    /// [`ErrorKind::Overloaded`] error with `error_type`
+    /// `booster_unavailable`). Empty when the header is absent.
+    pub fn boosters(&self) -> &IndexMap<String, BoosterStatus> {
+        &self.inner.boosters
     }
 
     /// The parsed error body, when it was JSON.
@@ -570,6 +588,11 @@ mod tests {
             (402, r#"{"detail":{"error_type":"insufficient_credit_error"}}"#, ErrorKind::InsufficientCredit),
             (403, r#"{"detail":{"error_type":"refusal_error","category":"harm"}}"#, ErrorKind::Refusal),
             (403, r#"{"detail":{"error_type":"permission_error"}}"#, ErrorKind::PermissionDenied),
+            (403, r#"{"detail":{"error_type":"booster_not_enabled","message":"x"}}"#, ErrorKind::PermissionDenied),
+            (403, r#"{}"#, ErrorKind::PermissionDenied),
+            (400, r#"{"detail":{"error_type":"booster_unknown","message":"x"}}"#, ErrorKind::BadRequest),
+            (400, r#"{"detail":{"error_type":"booster_input_mismatch","message":"x"}}"#, ErrorKind::BadRequest),
+            (529, r#"{"detail":{"error_type":"booster_unavailable","message":"x"}}"#, ErrorKind::Overloaded),
             (404, r#"{"detail":{"error_type":"not_found_error"}}"#, ErrorKind::NotFound),
             (405, r#"{"detail":{"error_type":"method_not_allowed"}}"#, ErrorKind::Other),
             (302, r#"{"detail":{"error_type":"redirect"}}"#, ErrorKind::Other),
@@ -585,6 +608,23 @@ mod tests {
         for (status, body, kind) in cases {
             assert_eq!(Error::from_response(status, &h, body.as_bytes()).kind(), kind, "status {status}");
         }
+    }
+
+    #[test]
+    fn a_booster_error_carries_the_boosters_header() {
+        let h = headers(&[("x-decisionnode-boosters", "age=ok:212,ai_generated=error:15"), ("retry-after-ms", "300")]);
+        let e = Error::from_response(
+            529,
+            &h,
+            br#"{"detail":{"error_type":"booster_unavailable","message":"The booster 'ai_generated' failed."}}"#,
+        );
+        assert_eq!(e.kind(), ErrorKind::Overloaded);
+        assert_eq!(e.error_type(), Some("booster_unavailable"));
+        assert_eq!(e.retry_after(), Some(Duration::from_millis(300)));
+        assert_eq!(e.boosters().keys().collect::<Vec<_>>(), ["age", "ai_generated"]);
+        assert_eq!(e.boosters()["ai_generated"].status, "error");
+        assert!(Error::from_response(400, &HeaderMap::new(), b"{}").boosters().is_empty());
+        assert!(Error::invalid("x").boosters().is_empty());
     }
 
     #[test]

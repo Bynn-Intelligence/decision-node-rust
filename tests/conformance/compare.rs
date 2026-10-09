@@ -6,7 +6,22 @@ use serde_json::Value;
 pub struct Fail(pub String);
 
 /// Keys whose values compare whole instead of key by key.
-const EXACT: [&str; 7] = ["probabilities", "legend", "raw", "entries", "safety", "body", "limits"];
+const EXACT: [&str; 9] =
+    ["probabilities", "legend", "raw", "entries", "safety", "body", "limits", "evidence", "boosters"];
+
+/// Keys compared whole whose top-level key order must also be the order
+/// expected: a decision's `evidence` (the request's order) and an error's
+/// `boosters` (the header's).
+const ORDERED: [&str; 2] = ["evidence", "boosters"];
+
+/// True when two objects list the same keys in the same order (anything else
+/// has no order to compare).
+fn same_order(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::Object(x), Value::Object(y)) => x.keys().eq(y.keys()),
+        _ => true,
+    }
+}
 
 /// JSON equality with numbers compared exactly as IEEE doubles and objects by
 /// key, regardless of order.
@@ -33,7 +48,7 @@ pub fn matches(expected: &Value, actual: &Value, path: &str) -> Result<(), Fail>
                 return Err(Fail(format!("{path}.{k}: missing (expected {})", short(v))));
             };
             if EXACT.contains(&k.as_str()) {
-                if !same(v, got) {
+                if !same(v, got) || (ORDERED.contains(&k.as_str()) && !same_order(v, got)) {
                     return Err(Fail(format!("{path}.{k}: expected {}, got {}", short(v), short(got))));
                 }
             } else {

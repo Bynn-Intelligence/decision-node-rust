@@ -2,6 +2,24 @@
 
 All notable changes to this crate are listed here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the crate follows [Semantic Versioning](https://semver.org/).
 
+## [0.3.0] - Unreleased
+
+Implements DecisionNode SDK specification version 1.3 (`SPEC_VERSION`): boosters and fine-tuned model names, checked against conformance suite 1.11 with the async and the blocking client.
+
+### Added
+
+- Boosters: `Booster` (`Booster::new(name)` with `image`, `images`, `require` and `options`; a plain name, `"age"`, converts into one and is sent as the string; a `serde_json::Value` in the wire form is sent as given), and `DecideRequest::booster` / `boosters` and `CallOptions::booster` / `boosters`. The helpers, `decide_many`, batch requests and `check_decide` take boosters as `decide` does; sessions do not. The list keeps the caller's order, and a request without boosters has no `boosters` key. Nothing about boosters is checked locally except that the list counts toward the 128-level nesting limit.
+- `Decision::evidence`: one `Evidence` per booster the request named, by name in the request's order (`version`, `status`, `latency_ms`, `results`, `raw`), `None` when it named none. Readings are `Reading::Age(AgeReading)`, `Reading::AiGenerated(AiGeneratedReading)` with `TopGenerator`, and `Reading::Unknown(UnknownReading)` for a booster this version does not know or a reading with a field missing or of the wrong type, so the decision never fails on one.
+- `Usage::booster_tokens` and `Usage::boosters`, `None` for a request without boosters.
+- `Error::boosters`: the `x-decisionnode-boosters` header parsed into booster name to `BoosterStatus` (`status`, `latency_ms`), in the request's order, on every error from a response; empty when the header is absent.
+- `ModelInfo::fine_tuned`, `base`, `adapter_version` and `status` for a workspace's fine-tuned models, `None` on a catalogue entry.
+
+### Changed
+
+- `SPEC_VERSION` is `"1.3"`.
+- A fine-tuned model's name (`decisionnode-1.0-flash@acme/fraud`, `...:3`) is a model like any other: sent as given, never parsed locally, and `Decision::model` carries the pinned name that answered.
+- `booster_unknown`, `booster_input_mismatch` and a malformed `boosters` list are `BadRequest` errors; `booster_not_enabled` and any other 403 that is not a refusal are `PermissionDenied`; `booster_unavailable` is `Overloaded` and retried like every 529.
+
 ## [0.2.0] - Unreleased
 
 Implements DecisionNode SDK specification version 1.2 (`SPEC_VERSION`): sixteen images, videos as frames, and the point and box question types, checked against conformance suite 1.10 with the async and the blocking client.

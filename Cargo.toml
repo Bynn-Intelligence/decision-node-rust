@@ -1,8 +1,8 @@
 [package]
 name = "bynn-decisionnode"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
-description = "The official Rust client for the DecisionNode API: typed truth, choice, score and number decisions, images and videos, sessions and batches."
+description = "The official Rust client for the DecisionNode API: typed truth, choice, score and number decisions, images and videos, boosters, sessions and batches."
 license = "MIT"
 authors = ["Bynn Intelligence, Inc."]
 repository = "https://github.com/Bynn-Intelligence/decision-node-rust"

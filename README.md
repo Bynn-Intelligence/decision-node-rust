@@ -1,6 +1,6 @@
 # DecisionNode Rust SDK
 
-The official Rust client for the [DecisionNode](https://decisionnode.com) API: typed `truth`, `choice`, `score`, `number`, `point` and `box` decisions over any state, with up to 16 images, videos sent as frames, sessions, batches, retries and typed errors. Async on [reqwest](https://docs.rs/reqwest) and Tokio, with an optional blocking client.
+The official Rust client for the [DecisionNode](https://decisionnode.com) API: typed `truth`, `choice`, `score`, `number`, `point` and `box` decisions over any state, with up to 16 images, videos sent as frames, boosters, fine-tuned models, sessions, batches, retries and typed errors. Async on [reqwest](https://docs.rs/reqwest) and Tokio, with an optional blocking client.
 
 The client checks every request against the API's fixed rules before it sends anything, reuses its connections, and picks the fastest form for each image, so a call costs one round trip wherever one is enough.
 
@@ -78,7 +78,7 @@ println!("{}", answer.truth); // 0.97
 | `check_decide(&request)`, `check_session(&options)`, `check_batch(&requests)`, `check_batch_add(&requests)`, `Session::check_frame(&frame)` | Nothing: every local check the call would run | `Ok(())`, or the error the call would return |
 | `decide_raw(body)` | The body exactly as given | The response body as `serde_json::Value`, for API fields this version does not know yet |
 
-`check_with`, `classify_with`, `score_with`, `number_with` and `gate_with` take `CallOptions` for images, videos and a model, like `decide`:
+`check_with`, `classify_with`, `score_with`, `number_with` and `gate_with` take `CallOptions` for images, videos, boosters and a model, like `decide`:
 
 ```rust
 use decisionnode::{CallOptions, Image};
@@ -147,8 +147,8 @@ A question id is any string and comes back as the key of its answer. Without a s
 
 | Type | Fields |
 |---|---|
-| `Decision` | `answers` (by question id, also `decision["id"]` and `decision.get("id")`), `model`, `usage.input_tokens`, `usage.output_tokens`, `usage.video_frames`, `usage.video_seconds`, `warnings`, `request_id`, `latency_ms`, `safety`, `raw` |
-| `ModelInfo` | `name`, `description`, `release_date`, `limits` (every other field of the entry), `raw` |
+| `Decision` | `answers` (by question id, also `decision["id"]` and `decision.get("id")`), `model`, `usage.input_tokens`, `usage.output_tokens`, `usage.video_frames`, `usage.video_seconds`, `usage.booster_tokens`, `usage.boosters`, `warnings`, `evidence`, `request_id`, `latency_ms`, `safety`, `raw` |
+| `ModelInfo` | `name`, `description`, `release_date`, `fine_tuned`, `base`, `adapter_version`, `status` (the last four on a fine-tuned model only), `limits` (every other field of the entry), `raw` |
 | `Answer::Truth(TruthAnswer)` | `truth` |
 | `Answer::Choice(ChoiceAnswer)` | `choice`, `confidence`, `probabilities` (by option name, exactly as sent) |
 | `Answer::Score(ScoreAnswer)` | `score`, `confidence`, `probabilities` (by level index), `legend` (level index to the level as sent) |
@@ -245,6 +245,54 @@ println!("{:?} {:?}", d["fall"].truth(), d.warnings);
 
 Before anything is sent the client checks the API's video rules. More than 4 videos is the API's `Validation` error with a `too_long` entry on `["body", "videos"]`; every other fault is a `BadRequest` error with the API's message: a video without an id or with an id already used by an image or a video, a video without frames, a frame time that is negative or not after the one before it, a frame that is not JPEG, PNG or WebP by its media type, `fps` not above 0 and at most 4, `start` or `end` negative, and `end` not after `start`. How many frames a request may carry, their sizes and their pixels are the server's to judge. To turn a video file into frames, use the `dn` command line tool: `dn --video dock.mp4`.
 
+### Boosters
+
+A booster is a specialist model that reads a request's images before the decision. Its reading is added to what the model sees as evidence and comes back in the response. The model still answers every question: a booster never answers one, and a request without boosters is answered exactly as before. Two boosters are available: `age` (how old the person in a picture is, with a range and a confidence; the largest face is read) and `ai_generated` (how likely a picture was made by an image generator, the likeliest generator, and whether the file carries Content Credentials and who signed them).
+
+```rust
+use decisionnode::{Booster, Image, Reading};
+
+let d = dn
+    .decide(
+        DecideRequest::new()
+            .image(Image::upload_id("a1b2", "upl_..."))
+            .image(Image::url("c3d4", "https://files.example.com/c3d4.jpg"))
+            .booster("age")
+            .booster(Booster::new("ai_generated").image("c3d4").require(true))
+            .question("adult", truth("Is the person in the first picture an adult?"))
+            .question("synthetic", truth("Is the second picture AI-generated?")),
+    )
+    .await?;
+
+for (name, evidence) in d.evidence.iter().flatten() {
+    println!("{name}: {:?} in {:?} ms", evidence.status, evidence.latency_ms);
+    for reading in &evidence.results {
+        match reading {
+            Reading::Age(r) => println!("  {}: {:?} years ({:?} to {:?})", r.image, r.age_years, r.low, r.high),
+            Reading::AiGenerated(r) => println!("  {}: generated {} by {}", r.image, r.generated, r.method),
+            other => println!("  {:?}", other.raw()),
+        }
+    }
+}
+println!("{:?} booster calls, {:?} tokens of readings", d.usage.boosters, d.usage.booster_tokens);
+```
+
+| Form | What is sent |
+|---|---|
+| `"age"` (a name, or `Booster::from("age")`) | `"age"`: the booster reads every image of the request |
+| `Booster::new(name)`, `.image(id)`, `.images(ids)`, `.require(true)`, `.options(...)` | `{"booster": name, "images"?: [...], "require"?: true, "options"?: {...}}`, each field only when given |
+| A `serde_json::Value` in the wire form | Sent as given |
+
+`DecideRequest::booster` and `boosters` take up to 4 boosters, each at most once, kept in your order; without any the body has no `boosters` key. The helpers' `CallOptions`, `decide_many` and batch requests take boosters as `decide` does; sessions do not. Names are plain strings, so a booster added later works with this version. The client checks nothing about boosters itself: the API answers a malformed list, an unknown name or a booster turned off for your workspace before any booster runs and before any charge.
+
+`d.evidence` holds one `Evidence` per booster the request named, in its order (`None` when it named none): `version`, `status` (`ok`, `timeout` when it did not answer within its time budget, `error`, or `skipped` when none of the request's images is one it reads), `latency_ms`, and `results`, one reading per image read, empty unless `status` is `ok`. A reading is `Reading::Age(AgeReading)` (`image`, `faces`, and `age_years`, `low`, `high`, `confidence`, each `None` when `faces` is 0), `Reading::AiGenerated(AiGeneratedReading)` (`image`, `generated`, `confidence`, `method`: `inference` from the pixels or `c2pa` from the file's Content Credentials, `top_generator` with `name` and `probability`, `c2pa_signer`), or `Reading::Unknown(UnknownReading)` with its raw fields for a booster this version does not know or a reading with a field missing or of the wrong type, so the decision never fails on one. `usage.booster_tokens` is the readings' share of `input_tokens` and `usage.boosters` the booster calls billed; both are `None` for a request without boosters.
+
+A booster call costs USD 0.002, one per booster and image read with status `ok`, drawn from your prepaid balance with the request's tokens. A booster that timed out or failed is free, a picture the same booster read for your workspace in the last hour is not billed again, and a refused request pays nothing for its boosters. Without `require`, a booster that fails leaves the decision to run without its reading; with `require: true` it fails the request with a `529` `booster_unavailable`, retried like any `529` (see [Errors](#errors)).
+
+### Fine-tuned models
+
+A model your workspace fine-tuned in the console is called by its name in `model`, by your workspace's keys only: `decisionnode-1.0-flash@acme/fraud` for the version deployed most recently, `decisionnode-1.0-flash@acme/fraud:3` to pin version 3. The name is sent as given and `d.model` carries the pinned name that answered. `models()` lists your fine-tuned models beside the catalogue, with `fine_tuned`, `base` (the model it was trained from), `adapter_version` and `status` (`deployed`, or `ready` when trained but not deployed). A name that does not exist, is not deployed or is another workspace's is the API's `400` "Unknown model", a `BadRequest` error.
+
 ### Safety
 
 On the hosted API every decision carries the result of the safety check, parsed from the `x-decisionnode-safety` header:
@@ -330,8 +378,8 @@ Every failure is a `decisionnode::Error`, also exported under the name used acro
 | 404 | `NotFound` | |
 | 422 | `Validation` | `entries()` |
 | 429 | `RateLimit`; `SessionLimit` when `error_type` is `session_limit_exceeded` | `retry_after()` |
-| 529 | `Overloaded` | `retry_after()` |
-| 403 otherwise | `PermissionDenied` | |
+| 529 | `Overloaded`, also with `error_type` `booster_unavailable` when a booster the request requires failed | `retry_after()`, `boosters()` |
+| 403 otherwise (`booster_not_enabled`, a suspended workspace) | `PermissionDenied` | |
 | other 5xx | `Server` | |
 | 2xx whose body is not JSON | `Server` | `status()`, `request_id()`, `reason()` |
 | 2xx where `check`, `classify` or `score` gets no answer of the type it promises | `Server` | `status()`, `request_id()`, `reason()` |
@@ -340,6 +388,8 @@ Every failure is a `decisionnode::Error`, also exported under the name used acro
 | a request the API would refuse, refused before sending | the API's own kind, `BadRequest`, or `Validation` for what the API answers with a 422, with its `error_type` and message, without a status (`is_local()` is true) | `entries()` for a `Validation` |
 | a storage `PUT` that failed | `Other`, the base `DecisionNodeError`, with the storage's status, `error_type` `upload_failed` and the storage's error code in `reason()` | |
 | an argument refused before sending | `Other`, the base `DecisionNodeError`, without a status (`is_argument()` is true) | |
+
+A booster name that does not exist (`booster_unknown`), a booster that reads images on a request without any or an `images` entry that is not an image of the request (`booster_input_mismatch`), and a malformed `boosters` list (`api_usage_error`) are `BadRequest` errors. Every error of a request that named boosters carries `boosters()`: what each booster did, from the `x-decisionnode-boosters` header, by name in the request's order (`status` and `latency_ms`), so you can see which required booster failed. It is empty when the header is absent.
 
 Only 200 to 299 is a success. Redirects are never followed, whatever transport settings you pass (see [Configuration](#configuration)), so the key is never sent to another URL or over plain HTTP: a 3xx is an error carrying its status.
 
@@ -401,7 +451,7 @@ The SDK sends no telemetry and logs no state or questions. Its only added header
 cargo test --all-features
 ```
 
-The integration tests run the DecisionNode SDK conformance suite (every request, response, error, behaviour and constant case, with both clients) against its mock server, from the suite `DECISIONNODE_CONFORMANCE_DIR` points at; they need `python3` for the mock. Without the variable the conformance test fails rather than skipping. CI checks the suite out at one pinned commit, set in a single place at the top of `.github/workflows/ci.yml`, and pins every action to a commit SHA. This crate implements DecisionNode SDK specification version 1.2, exported as `decisionnode::SPEC_VERSION`, and passes conformance suite 1.10.
+The integration tests run the DecisionNode SDK conformance suite (every request, response, error, behaviour and constant case, with both clients) against its mock server, from the suite `DECISIONNODE_CONFORMANCE_DIR` points at; they need `python3` for the mock. Without the variable the conformance test fails rather than skipping. CI checks the suite out at one pinned commit, set in a single place at the top of `.github/workflows/ci.yml`, and pins every action to a commit SHA. This crate implements DecisionNode SDK specification version 1.3, exported as `decisionnode::SPEC_VERSION`, and passes conformance suite 1.11.
 
 ## License
 

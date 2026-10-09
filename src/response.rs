@@ -11,6 +11,7 @@ use indexmap::IndexMap;
 use reqwest::header::HeaderMap;
 use serde_json::{Map, Value};
 
+use crate::booster::{evidence_from_body, Evidence};
 use crate::error::{header, Error, ErrorKind, Result};
 use crate::safety::Safety;
 
@@ -383,8 +384,9 @@ impl Answer {
     }
 }
 
-/// Token counts of a decision and, for a request with videos, what was read
-/// of them. A value the response does not carry is `None`, never 0.
+/// Token counts of a decision and, for a request with videos or boosters,
+/// what was read of them. A value the response does not carry is `None`,
+/// never 0.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 #[non_exhaustive]
 pub struct Usage {
@@ -398,6 +400,11 @@ pub struct Usage {
     /// The seconds of the videos' windows read, summed, as sent. `None` for
     /// a request without videos.
     pub video_seconds: Option<f64>,
+    /// The share of `input_tokens` that the boosters' readings take. `None`
+    /// for a request without boosters.
+    pub booster_tokens: Option<u64>,
+    /// The booster calls billed. `None` for a request without boosters.
+    pub boosters: Option<u64>,
 }
 
 impl Usage {
@@ -410,6 +417,8 @@ impl Usage {
             output_tokens: field("output_tokens").and_then(Value::as_u64),
             video_frames: field("video_frames").and_then(Value::as_u64),
             video_seconds: field("video_seconds").and_then(Value::as_f64),
+            booster_tokens: field("booster_tokens").and_then(Value::as_u64),
+            boosters: field("boosters").and_then(Value::as_u64),
         }
     }
 }
@@ -421,7 +430,8 @@ pub struct Decision {
     /// The answers by question id, in the order the server sent them. Read them
     /// by id, never by position.
     pub answers: IndexMap<String, Answer>,
-    /// The resolved model version, for example `decisionnode-1.0`.
+    /// The resolved model version, for example `decisionnode-1.0`; for a
+    /// fine-tuned model its pinned name, `decisionnode-1.0-flash@acme/fraud:3`.
     pub model: Option<String>,
     /// Token counts, each `None` when the response does not carry it.
     pub usage: Usage,
@@ -437,6 +447,10 @@ pub struct Decision {
     /// it read a video at a lower rate or resolution than asked. Empty when
     /// there are none.
     pub warnings: Vec<String>,
+    /// What each booster the request named read, by booster name in the
+    /// request's order. `None` when the request named none (or the response
+    /// carries no evidence, as for a request the refusal check refused).
+    pub evidence: Option<IndexMap<String, Evidence>>,
     /// The parsed response body.
     pub raw: Value,
 }
@@ -465,6 +479,7 @@ impl Decision {
                 .and_then(Value::as_array)
                 .map(|w| w.iter().filter_map(Value::as_str).map(str::to_owned).collect())
                 .unwrap_or_default(),
+            evidence: evidence_from_body(obj.get("evidence")),
             request_id,
             raw: body,
         })
@@ -503,8 +518,20 @@ pub struct ModelInfo {
     pub name: String,
     /// What the model is.
     pub description: String,
-    /// The release date, `YYYY-MM-DD`.
+    /// The release date, `YYYY-MM-DD`; for a fine-tuned model, the day the
+    /// version finished training.
     pub release_date: String,
+    /// `Some(true)` for one of the workspace's fine-tuned models; `None` on a
+    /// catalogue entry.
+    pub fine_tuned: Option<bool>,
+    /// For a fine-tuned model: the pinned id of the model it was trained from.
+    pub base: Option<String>,
+    /// For a fine-tuned model: its version number; on a plain name, the
+    /// version it resolves to.
+    pub adapter_version: Option<u64>,
+    /// For a fine-tuned model: `deployed` (it answers decisions) or `ready`
+    /// (trained, not deployed); any other value as received.
+    pub status: Option<String>,
     /// The model's published limits: every other field of the entry, for
     /// example `max_input_tokens`.
     pub limits: Map<String, Value>,
@@ -526,6 +553,10 @@ impl ModelInfo {
                     name: text("name"),
                     description: text("description"),
                     release_date: text("release_date"),
+                    fine_tuned: obj.get("fine_tuned").and_then(Value::as_bool),
+                    base: obj.get("base").and_then(Value::as_str).map(str::to_owned),
+                    adapter_version: obj.get("adapter_version").and_then(Value::as_u64),
+                    status: obj.get("status").and_then(Value::as_str).map(str::to_owned),
                     limits: obj
                         .iter()
                         .filter(|(k, _)| !matches!(k.as_str(), "name" | "description" | "release_date"))
@@ -680,6 +711,43 @@ mod tests {
         assert_eq!(d["fine"].as_number().unwrap().probabilities["0.000001"], 0.002);
         assert_eq!(d["fine"].number(), Some(-2.5));
         assert!(matches!(d["bad_number"], Answer::Unknown(_)));
+    }
+
+    #[test]
+    fn evidence_and_booster_usage() {
+        let body = json!({"model": "decisionnode-1.0-flash@acme/fraud:3", "answers": {"adult": {"type": "truth", "truth": 0.97}},
+            "evidence": {"age": {"version": "age-v3", "status": "ok", "latency_ms": 212,
+                "results": [{"image": "a1b2", "age_years": 27, "low": 22, "high": 33, "confidence": 0.81, "faces": 1}]}},
+            "usage": {"input_tokens": 341, "output_tokens": 0, "booster_tokens": 72, "boosters": 3}});
+        let d = Decision::from_response(body, 200, &HeaderMap::new()).unwrap();
+        assert_eq!(d.model.as_deref(), Some("decisionnode-1.0-flash@acme/fraud:3"));
+        assert_eq!((d.usage.booster_tokens, d.usage.boosters), (Some(72), Some(3)));
+        let ev = d.evidence.as_ref().unwrap();
+        assert_eq!(ev["age"].results[0].as_age().unwrap().age_years, Some(27.0));
+        let plain =
+            Decision::from_response(json!({"answers": {}, "usage": {"input_tokens": 3}}), 200, &HeaderMap::new())
+                .unwrap();
+        assert_eq!((plain.usage.booster_tokens, plain.usage.boosters), (None, None));
+        assert!(plain.evidence.is_none());
+    }
+
+    #[test]
+    fn fine_tuned_models() {
+        let body = json!({"models": [
+            {"name": "decisionnode-1.0-flash", "description": "d", "release_date": "2026-10-01", "version": "decisionnode-1.0-flash"},
+            {"name": "decisionnode-1.0-flash@acme/fraud:3", "description": "Claims fraud", "release_date": "2026-10-09",
+             "fine_tuned": true, "base": "decisionnode-1.0-flash", "adapter_version": 3, "status": "deployed",
+             "version": "decisionnode-1.0-flash@acme/fraud:3"}]});
+        let m = ModelInfo::list_from(body, 200, &HeaderMap::new()).unwrap();
+        assert_eq!(
+            (m[0].fine_tuned, m[0].base.as_deref(), m[0].adapter_version, m[0].status.as_deref()),
+            (None, None, None, None)
+        );
+        assert_eq!(m[1].fine_tuned, Some(true));
+        assert_eq!(m[1].base.as_deref(), Some("decisionnode-1.0-flash"));
+        assert_eq!(m[1].adapter_version, Some(3));
+        assert_eq!(m[1].status.as_deref(), Some("deployed"));
+        assert_eq!(m[1].limits.get("version"), Some(&json!("decisionnode-1.0-flash@acme/fraud:3")));
     }
 
     #[test]

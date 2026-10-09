@@ -11,7 +11,8 @@
 //! Beside [`DecisionNode::decide`] it covers every public call:
 //! [`DecisionNode::models`], image uploads
 //! ([`DecisionNode::upload`], also chosen for you by size), videos sent as
-//! frames ([`Video`]), sessions
+//! frames ([`Video`]), boosters whose readings come back as evidence
+//! ([`Booster`], [`Decision::evidence`]), sessions
 //! ([`DecisionNode::open_session`], [`DecisionNode::supervise`], behind the
 //! default `sessions` feature) and the Batch API ([`DecisionNode::batches`],
 //! [`DecisionNode::run_batch`]).
@@ -48,6 +49,7 @@
 mod batch;
 #[cfg(feature = "blocking")]
 pub mod blocking;
+mod booster;
 mod check;
 mod client;
 pub mod error;
@@ -64,6 +66,9 @@ mod video;
 pub use batch::{
     Batch, BatchCounters, BatchPage, BatchRequest, BatchResult, BatchResultStream, BatchResults, BatchRun, BatchStatus,
     Batches, DEFAULT_BATCH_TIMEOUT, DEFAULT_POLL_INTERVAL, MIN_POLL_INTERVAL,
+};
+pub use booster::{
+    AgeReading, AiGeneratedReading, Booster, BoosterStatus, Evidence, Reading, TopGenerator, UnknownReading,
 };
 pub use client::{
     gate_questions, CallOptions, ClientBuilder, DecideRequest, DecisionNode, Sleeper, DEFAULT_BASE_URL,
@@ -94,4 +99,4 @@ pub use serde_json;
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// The version of the DecisionNode SDK specification this crate implements.
-pub const SPEC_VERSION: &str = "1.2";
+pub const SPEC_VERSION: &str = "1.3";

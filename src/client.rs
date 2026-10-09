@@ -14,6 +14,7 @@ use reqwest::Method;
 use serde::Serialize;
 use serde_json::{Map, Value};
 
+use crate::booster::{boosters_value, Booster};
 use crate::check::{check_body, object_depth, Limits};
 use crate::error::{header, retry_after, Error, ErrorKind, Result};
 use crate::http::HttpSettings;
@@ -65,8 +66,8 @@ const STALE_UPLOAD: [&str; 4] = ["upload_expired", "upload_consumed", "upload_no
 
 // --------------------------------------------------------------------------- request
 
-/// One decision request: a state, questions by id, and optional images and
-/// model.
+/// One decision request: a state, questions by id, and optional images,
+/// videos, boosters and model.
 ///
 /// ```
 /// use decisionnode::{choice, truth, DecideRequest};
@@ -83,6 +84,7 @@ pub struct DecideRequest {
     questions: Vec<(String, Question)>,
     images: Vec<Image>,
     videos: Vec<Video>,
+    boosters: Vec<Booster>,
     model: Option<String>,
 }
 
@@ -173,8 +175,25 @@ impl DecideRequest {
         self
     }
 
-    /// The model for this request, over the client's. An empty string counts
-    /// as not given: the client's model applies.
+    /// Adds a booster: a name (`"age"`), a [`Booster`], or a booster in its
+    /// JSON wire form. Boosters read the request's images before the decision
+    /// and their readings come back in [`Decision::evidence`]. The list keeps
+    /// this order; without boosters the body has no `boosters` key.
+    pub fn booster(mut self, booster: impl Into<Booster>) -> DecideRequest {
+        self.boosters.push(booster.into());
+        self
+    }
+
+    /// Adds several boosters.
+    pub fn boosters<B: Into<Booster>>(mut self, boosters: impl IntoIterator<Item = B>) -> DecideRequest {
+        self.boosters.extend(boosters.into_iter().map(Into::into));
+        self
+    }
+
+    /// The model for this request, over the client's: a model id, or a
+    /// fine-tuned model's name (`decisionnode-1.0-flash@acme/fraud`, `:3` to
+    /// pin a version), sent as given. An empty string counts as not given: the
+    /// client's model applies.
     pub fn model(mut self, model: impl Into<String>) -> DecideRequest {
         self.model = given(model.into());
         self
@@ -196,6 +215,11 @@ impl DecideRequest {
         body.insert("model".into(), Value::String(model));
         body.insert("state".into(), state);
         body.insert("questions".into(), Value::Object(questions));
+        // Nothing about boosters is checked locally; the list counts toward the
+        // nesting limit with the rest of the body.
+        if let Some(boosters) = boosters_value(self.boosters)? {
+            body.insert("boosters".into(), boosters);
+        }
         // The images count toward the nesting as `[{...}]`, each video inside
         // the body's object and the videos array.
         let videos_depth = self.videos.iter().map(|v| v.depth() + 2).max().unwrap_or(0);
@@ -215,17 +239,18 @@ impl DecideRequest {
     }
 }
 
-/// Images and a model for the one-question helpers
+/// Images, videos, boosters and a model for the one-question helpers
 /// ([`DecisionNode::check_with`] and the others).
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct CallOptions {
     images: Vec<Image>,
     videos: Vec<Video>,
+    boosters: Vec<Booster>,
     model: Option<String>,
 }
 
 impl CallOptions {
-    /// No images, the client's model.
+    /// No images, videos or boosters; the client's model.
     pub fn new() -> CallOptions {
         CallOptions::default()
     }
@@ -254,6 +279,18 @@ impl CallOptions {
         self
     }
 
+    /// Adds a booster, see [`DecideRequest::booster`].
+    pub fn booster(mut self, booster: impl Into<Booster>) -> CallOptions {
+        self.boosters.push(booster.into());
+        self
+    }
+
+    /// Adds several boosters.
+    pub fn boosters<B: Into<Booster>>(mut self, boosters: impl IntoIterator<Item = B>) -> CallOptions {
+        self.boosters.extend(boosters.into_iter().map(Into::into));
+        self
+    }
+
     /// The model for this call, over the client's. An empty string counts as
     /// not given: the client's model applies.
     pub fn model(mut self, model: impl Into<String>) -> CallOptions {
@@ -262,7 +299,7 @@ impl CallOptions {
     }
 
     fn apply(self, mut request: DecideRequest) -> DecideRequest {
-        request = request.images(self.images).videos(self.videos);
+        request = request.images(self.images).videos(self.videos).boosters(self.boosters);
         if let Some(m) = self.model {
             request = request.model(m);
         }
@@ -1241,6 +1278,50 @@ mod tests {
     fn body(request: DecideRequest) -> Result<Value> {
         let dn = DecisionNode::builder().model("decisionnode-latest").build().unwrap();
         request.prepare(&dn).map(|p| Value::Object(p.body))
+    }
+
+    #[test]
+    fn boosters_in_the_body() {
+        let plain = body(DecideRequest::new().question("q", truth("?"))).unwrap();
+        assert!(plain.get("boosters").is_none());
+        let empty = body(DecideRequest::new().question("q", truth("?")).boosters(Vec::<Booster>::new())).unwrap();
+        assert_eq!(empty, plain);
+        let b = body(
+            DecideRequest::new()
+                .question("q", truth("?"))
+                .booster("age")
+                .booster(Booster::new("ai_generated").image("c3d4").require(true))
+                .booster(json!({"booster": "x", "options": {"k": 1}}))
+                .model("decisionnode-1.0-flash@acme/fraud:3"),
+        )
+        .unwrap();
+        assert_eq!(
+            b["boosters"],
+            json!(["age", {"booster": "ai_generated", "images": ["c3d4"], "require": true}, {"booster": "x", "options": {"k": 1}}])
+        );
+        assert_eq!(b["model"], "decisionnode-1.0-flash@acme/fraud:3");
+        // A helper's boosters reach its request.
+        let options = CallOptions::new().booster("age").boosters(["ai_generated"]);
+        let helper = body(options.apply(DecideRequest::new().question("check", truth("?")))).unwrap();
+        assert_eq!(helper["boosters"], json!(["age", "ai_generated"]));
+    }
+
+    #[test]
+    fn booster_options_count_toward_the_nesting_limit() {
+        fn nest(depth: usize) -> Value {
+            (0..depth).fold(json!(1), |v, _| json!([v]))
+        }
+        // The body, the boosters array, the booster object and the options
+        // object hold 4 levels; 124 arrays inside reach 128.
+        let at = |n: usize| {
+            DecideRequest::new().question("q", truth("?")).booster(Booster::new("age").options(json!({"k": nest(n)})))
+        };
+        assert!(body(at(124)).is_ok());
+        let e = body(at(125)).unwrap_err();
+        assert_eq!(
+            (e.kind(), e.error_type(), e.message()),
+            (ErrorKind::BadRequest, Some("api_usage_error"), "Invalid request.")
+        );
     }
 
     #[test]
