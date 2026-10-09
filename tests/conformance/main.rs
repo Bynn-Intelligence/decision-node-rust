@@ -1083,6 +1083,7 @@ fn norm_evidence(e: &Evidence) -> Value {
         "version": e.version,
         "status": e.status,
         "latency_ms": e.latency_ms.map(num),
+        "billed_calls": e.billed_calls,
         "results": e.results.iter().map(norm_reading).collect::<Vec<_>>(),
     })
 }

@@ -8,10 +8,16 @@
 //! let request = DecideRequest::new()
 //!     .image(Image::url("a1b2", "https://files.example.com/a1b2.jpg"))
 //!     .image(Image::url("c3d4", "https://files.example.com/c3d4.jpg"))
-//!     .booster("age")
-//!     .booster(Booster::new("ai_generated").image("c3d4").require(true))
+//!     .boosters(["age", "ai_generated"])
 //!     .question("adult", truth("Is the person in the first picture an adult?"))
 //!     .question("synthetic", truth("Is the second picture AI-generated?"));
+//!
+//! // A booster with a setting: `ai_generated` reads only the second picture,
+//! // and the request fails if it cannot answer.
+//! let required = DecideRequest::new()
+//!     .image(Image::url("c3d4", "https://files.example.com/c3d4.jpg"))
+//!     .booster(Booster::new("ai_generated").image("c3d4").require(true))
+//!     .question("synthetic", truth("Is the picture AI-generated?"));
 //! ```
 
 use indexmap::IndexMap;
@@ -60,9 +66,9 @@ enum Form {
 }
 
 impl Booster {
-    /// A booster in its object form, `{"booster": name}`, to which the images,
-    /// `require` and options may be added. Use `Booster::from("age")` (or pass
-    /// the name where a booster is taken) for the plain name form.
+    /// A booster by its name, to which the images, `require` and options may
+    /// be added. Without any of them it is sent as the plain name, `"age"`;
+    /// with one it is sent as the object `{"name": name, ...}`.
     pub fn new(name: impl Into<String>) -> Booster {
         Booster { form: Form::Object { name: name.into(), images: None, require: None, options: None } }
     }
@@ -121,12 +127,12 @@ impl Booster {
     }
 
     /// The booster's name, when the booster was built from one (a wire form
-    /// that is not a name or an object with `booster` has none).
+    /// that is not a name or an object with `name` has none).
     pub fn name(&self) -> Option<&str> {
         match &self.form {
             Form::Name(name) | Form::Object { name, .. } => Some(name),
             Form::Wire(Value::String(name)) => Some(name),
-            Form::Wire(v) => v.get("booster").and_then(Value::as_str),
+            Form::Wire(v) => v.get("name").and_then(Value::as_str),
         }
     }
 
@@ -135,9 +141,11 @@ impl Booster {
         Ok(match self.form {
             Form::Name(name) => Value::String(name),
             Form::Wire(value) => value,
+            // No option set: the plain name, so the list stays a list of names.
+            Form::Object { name, images: None, require: None, options: None } => Value::String(name),
             Form::Object { name, images, require, options } => {
                 let mut m = Map::new();
-                m.insert("booster".into(), Value::String(name));
+                m.insert("name".into(), Value::String(name));
                 if let Some(images) = images {
                     m.insert("images".into(), Value::Array(images.into_iter().map(Value::String).collect()));
                 }
@@ -198,6 +206,11 @@ pub struct Evidence {
     pub status: Option<String>,
     /// How long the booster took, in milliseconds. `None` when absent.
     pub latency_ms: Option<f64>,
+    /// The calls of this booster billed on this request: one per image it
+    /// read with status `ok`, 0 for a reading served again from the last
+    /// hour's, a booster that failed or timed out, and a refused request.
+    /// `None` when the server does not send it.
+    pub billed_calls: Option<u64>,
     /// One reading per image read. Empty unless `status` is `ok`.
     pub results: Vec<Reading>,
     /// The evidence entry as received.
@@ -213,6 +226,7 @@ impl Evidence {
             version: field("version").and_then(Value::as_str).map(str::to_owned),
             status: field("status").and_then(Value::as_str).map(str::to_owned),
             latency_ms: field("latency_ms").and_then(Value::as_f64),
+            billed_calls: field("billed_calls").and_then(Value::as_u64),
             results: field("results")
                 .and_then(Value::as_array)
                 .map(|list| list.iter().map(|r| Reading::parse(booster, r.clone())).collect())
@@ -458,7 +472,11 @@ mod tests {
     fn wire_forms() {
         assert_eq!(Booster::from("age").into_value().unwrap(), json!("age"));
         assert_eq!(Booster::from("age".to_owned()).into_value().unwrap(), json!("age"));
-        assert_eq!(Booster::new("age").into_value().unwrap(), json!({"booster": "age"}));
+        assert_eq!(Booster::new("age").into_value().unwrap(), json!("age"));
+        assert_eq!(
+            Booster::new("age").images(Vec::<String>::new()).into_value().unwrap(),
+            json!({"name": "age", "images": []})
+        );
         assert_eq!(
             Booster::new("ai_generated")
                 .images(["c3d4"])
@@ -467,13 +485,10 @@ mod tests {
                 .options(json!({}))
                 .into_value()
                 .unwrap(),
-            json!({"booster": "ai_generated", "images": ["c3d4", "e5"], "require": true, "options": {}})
+            json!({"name": "ai_generated", "images": ["c3d4", "e5"], "require": true, "options": {}})
         );
-        assert_eq!(
-            Booster::from("age").require(false).into_value().unwrap(),
-            json!({"booster": "age", "require": false})
-        );
-        let wire = json!({"booster": "age", "unknown": 1});
+        assert_eq!(Booster::from("age").require(false).into_value().unwrap(), json!({"name": "age", "require": false}));
+        let wire = json!({"name": "age", "unknown": 1});
         assert_eq!(Booster::from(wire.clone()).into_value().unwrap(), wire);
         assert_eq!(Booster::from(wire).name(), Some("age"));
         assert_eq!(Booster::from(json!(3)).name(), None);
@@ -491,7 +506,7 @@ mod tests {
     #[test]
     fn readings() {
         let body = json!({
-            "age": {"version": "age-v3", "status": "ok", "latency_ms": 212, "results": [
+            "age": {"version": "age-v3", "status": "ok", "latency_ms": 212, "billed_calls": 2, "results": [
                 {"image": "a1b2", "age_years": 27, "low": 22, "high": 33, "confidence": 0.81, "faces": 1},
                 {"image": "c3d4", "faces": 0},
                 {"image": "e5", "faces": 1},
@@ -513,7 +528,7 @@ mod tests {
                 {"image": "k1", "generated": 0.1, "confidence": 0.5, "method": "inference", "top_generator": null,
                  "c2pa_signer": null, "c2pa": true}
             ]},
-            "slow": {"version": "slow-v1", "status": "timeout", "latency_ms": 800, "results": []},
+            "slow": {"version": "slow-v1", "status": "timeout", "latency_ms": 800, "billed_calls": null, "results": []},
             "colour": {"version": "colour-v1", "status": "ok", "latency_ms": 5, "results": [{"image": "a1b2", "hue": 3}]}
         });
         let ev = evidence_from_body(Some(&body)).unwrap();
@@ -551,6 +566,7 @@ mod tests {
             assert!(matches!(ev["ai_generated"].results[i], Reading::Unknown(_)), "{i}");
         }
         assert!(ev["slow"].results.is_empty());
+        assert_eq!((age.billed_calls, ev["slow"].billed_calls, ev["colour"].billed_calls), (Some(2), None, None));
         assert_eq!(ev["slow"].status.as_deref(), Some("timeout"));
         assert!(matches!(&ev["colour"].results[0], Reading::Unknown(r) if r.booster == "colour" && r.raw["hue"] == 3));
         assert_eq!(evidence_from_body(None), None);

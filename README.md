@@ -251,16 +251,17 @@ Before anything is sent the client checks the API's video rules. More than 4 vid
 
 A booster is a specialist model that reads a request's images before the decision. Its reading is added to what the model sees as evidence and comes back in the response. The model still answers every question: a booster never answers one, and a request without boosters is answered exactly as before. Two boosters are available: `age` (how old the person in a picture is, with a range and a confidence; the largest face is read) and `ai_generated` (how likely a picture was made by an image generator, the likeliest generator, and whether the file carries Content Credentials and who signed them).
 
+Name the boosters a request should run, as a list of names:
+
 ```rust
-use decisionnode::{Booster, Image, Reading};
+use decisionnode::{Image, Reading};
 
 let d = dn
     .decide(
         DecideRequest::new()
             .image(Image::upload_id("a1b2", "upl_..."))
             .image(Image::url("c3d4", "https://files.example.com/c3d4.jpg"))
-            .booster("age")
-            .booster(Booster::new("ai_generated").image("c3d4").require(true))
+            .boosters(["age", "ai_generated"])
             .question("adult", truth("Is the person in the first picture an adult?"))
             .question("synthetic", truth("Is the second picture AI-generated?")),
     )
@@ -279,17 +280,30 @@ for (name, evidence) in d.evidence.iter().flatten() {
 println!("{:?} booster calls, {:?} tokens of readings", d.usage.boosters, d.usage.booster_tokens);
 ```
 
+A booster that needs a setting is a `Booster`: here `ai_generated` reads only the second picture, and the request fails if it cannot answer.
+
+```rust
+use decisionnode::Booster;
+
+let request = DecideRequest::new()
+    .image(Image::upload_id("a1b2", "upl_..."))
+    .image(Image::url("c3d4", "https://files.example.com/c3d4.jpg"))
+    .booster("age")
+    .booster(Booster::new("ai_generated").image("c3d4").require(true))
+    .question("synthetic", truth("Is the second picture AI-generated?"));
+```
+
 | Form | What is sent |
 |---|---|
 | `"age"` (a name, or `Booster::from("age")`) | `"age"`: the booster reads every image of the request |
-| `Booster::new(name)`, `.image(id)`, `.images(ids)`, `.require(true)`, `.options(...)` | `{"booster": name, "images"?: [...], "require"?: true, "options"?: {...}}`, each field only when given |
+| `Booster::new(name)`, `.image(id)`, `.images(ids)`, `.require(true)`, `.options(...)` | `{"name": name, "images"?: [...], "require"?: true, "options"?: {...}}`, each field only when given; with none of them, the plain name |
 | A `serde_json::Value` in the wire form | Sent as given |
 
 `DecideRequest::booster` and `boosters` take up to 4 boosters, each at most once, kept in your order; without any the body has no `boosters` key. The helpers' `CallOptions`, `decide_many` and batch requests take boosters as `decide` does; sessions do not. Names are plain strings, so a booster added later works with this version. The client checks nothing about boosters itself: the API answers a malformed list, an unknown name or a booster turned off for your workspace before any booster runs and before any charge.
 
-`d.evidence` holds one `Evidence` per booster the request named, in its order (`None` when it named none): `version`, `status` (`ok`, `timeout` when it did not answer within its time budget, `error`, or `skipped` when none of the request's images is one it reads), `latency_ms`, and `results`, one reading per image read, empty unless `status` is `ok`. A reading is `Reading::Age(AgeReading)` (`image`, `faces`, and `age_years`, `low`, `high`, `confidence`, each `None` when `faces` is 0), `Reading::AiGenerated(AiGeneratedReading)` (`image`, `generated`, `confidence`, `method`: `inference` from the pixels or `c2pa` from the file's Content Credentials, `top_generator` with `name` and `probability`, `None` unless the picture is likely generated, `c2pa_signer`, and `c2pa`: `"untrusted"` when the file's Content Credentials validate but their signer is not trusted), or `Reading::Unknown(UnknownReading)` with its raw fields for a booster this version does not know or a reading with a field missing or of the wrong type, so the decision never fails on one. `usage.booster_tokens` is the readings' share of `input_tokens` and `usage.boosters` the booster calls billed; both are `None` for a request without boosters.
+`d.evidence` holds one `Evidence` per booster the request named, in its order (`None` when it named none): `version`, `status` (`ok`, `timeout` when it did not answer within its time budget, `error`, or `skipped` when none of the request's images is one it reads), `latency_ms`, `billed_calls` (the calls of that booster billed on this request), and `results`, one reading per image read, empty unless `status` is `ok`. A reading is `Reading::Age(AgeReading)` (`image`, `faces`, and `age_years`, `low`, `high`, `confidence`, each `None` when `faces` is 0), `Reading::AiGenerated(AiGeneratedReading)` (`image`, `generated`, `confidence`, `method`: `inference` from the pixels or `c2pa` from the file's Content Credentials, `top_generator` with `name` and `probability`, `None` unless the picture is likely generated, `c2pa_signer`, and `c2pa`: `"untrusted"` when the file's Content Credentials validate but their signer is not trusted), or `Reading::Unknown(UnknownReading)` with its raw fields for a booster this version does not know or a reading with a field missing or of the wrong type, so the decision never fails on one. `usage.booster_tokens` is the readings' share of `input_tokens` and `usage.boosters` the booster calls billed; both are `None` for a request without boosters.
 
-A booster call costs USD 0.002, one per booster and image read with status `ok`, drawn from your prepaid balance with the request's tokens. A booster that timed out or failed is free, a picture the same booster read for your workspace in the last hour is not billed again, and a refused request pays nothing for its boosters. Without `require`, a booster that fails leaves the decision to run without its reading; with `require: true` it fails the request with a `529` `booster_unavailable`, retried like any `529` (see [Errors](#errors)).
+A booster call is one booster reading one picture with status `ok`: `age` costs USD 0.024 a call and `ai_generated` USD 0.006, drawn from your prepaid balance with the request's tokens. Each entry's `billed_calls` times its booster's price is what the request's boosters cost. A booster that timed out or failed is free, a picture the same booster read for your workspace in the last hour is not billed again, and a refused request pays nothing for its boosters. Without `require`, a booster that fails leaves the decision to run without its reading; with `require: true` it fails the request with a `529` `booster_unavailable`, retried like any `529` (see [Errors](#errors)).
 
 ### Fine-tuned models
 

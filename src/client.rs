@@ -1352,13 +1352,13 @@ mod tests {
                 .question("q", truth("?"))
                 .booster("age")
                 .booster(Booster::new("ai_generated").image("c3d4").require(true))
-                .booster(json!({"booster": "x", "options": {"k": 1}}))
+                .booster(json!({"name": "x", "options": {"k": 1}}))
                 .model("decisionnode-1.0-flash@acme/fraud:3"),
         )
         .unwrap();
         assert_eq!(
             b["boosters"],
-            json!(["age", {"booster": "ai_generated", "images": ["c3d4"], "require": true}, {"booster": "x", "options": {"k": 1}}])
+            json!(["age", {"name": "ai_generated", "images": ["c3d4"], "require": true}, {"name": "x", "options": {"k": 1}}])
         );
         assert_eq!(b["model"], "decisionnode-1.0-flash@acme/fraud:3");
         // A helper's boosters reach its request.
