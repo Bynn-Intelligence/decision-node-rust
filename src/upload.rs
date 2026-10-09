@@ -13,7 +13,7 @@ use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use reqwest::Method;
 use serde_json::{json, Value};
 
-use crate::client::{backoff, is_loopback, transport_error, DecisionNode, Policy};
+use crate::client::{backoff, encoded_len, is_loopback, transport_error, DecisionNode, Policy};
 use crate::error::{parse_rfc3339, Error, ErrorKind, Result};
 use crate::image::{check_images, Image, Local};
 
@@ -23,6 +23,9 @@ const CACHE_ENTRIES: usize = 256;
 const CACHE_MARGIN: Duration = Duration::from_secs(300);
 /// The most files one `POST /v1/uploads` takes.
 const MAX_UPLOAD_FILES: usize = 16;
+/// Stands for an upload id not issued yet, at the length of a real one, when
+/// the size of a body is worked out before anything is uploaded.
+const UPLOAD_ID_PLACEHOLDER: &str = "upl_00000000000000000000000000000000";
 
 /// The SHA-256 of the bytes and the media type.
 type Key = ([u8; 32], String);
@@ -61,6 +64,15 @@ impl UploadCache {
         let last = entries.len() - 1;
         entries.move_index(index, last);
         Some(entries[last].upload_id.clone())
+    }
+
+    /// [`UploadCache::get`] without touching the entries: the live upload id of
+    /// these bytes, if any.
+    fn peek(&self, key: &Key, now: SystemTime) -> Option<String> {
+        let entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+        let entry = entries.get(key)?;
+        let usable = entry.expires_at.checked_sub(CACHE_MARGIN).is_some_and(|t| now < t);
+        usable.then(|| entry.upload_id.clone())
     }
 
     fn put(&self, key: Key, upload_id: String, expires_at: SystemTime) {
@@ -151,6 +163,38 @@ impl DecisionNode {
             }
         }
         Ok(Placed { wires: wires.into_iter().map(|w| w.unwrap_or(Value::Null)).collect(), uploaded })
+    }
+
+    /// The length of the encoded `images` array [`DecisionNode::place_images`]
+    /// would build (with ids, not always uploading), worked out without
+    /// uploading or encoding anything: an image it would upload is named by a
+    /// placeholder id of a real id's length.
+    pub(crate) fn projected_images_len(&self, images: &[Image]) -> Result<usize> {
+        let cache = &self.inner.uploads;
+        let cache_empty = cache.is_empty();
+        let mut len = images.len().saturating_sub(1) + 2;
+        let mut pending = Vec::new();
+        let mut total = 0usize;
+        for image in images {
+            let Some(local) = image.as_local() else {
+                len += encoded_len(&image.wire(true))?;
+                continue;
+            };
+            total += local.data.len();
+            match (!cache_empty).then(|| cache.peek(&key_of(local), self.now())).flatten() {
+                Some(id) => len += encoded_len(&image.wire_upload(&id, true))?,
+                None => pending.push((image, local)),
+            }
+        }
+        let upload = total >= self.inner.inline_threshold;
+        for (image, local) in pending {
+            len += if upload {
+                encoded_len(&image.wire_upload(UPLOAD_ID_PLACEHOLDER, true))?
+            } else {
+                image.inline_len(local)?
+            };
+        }
+        Ok(len)
     }
 
     /// Uploads local images and returns one upload id per image, in order.

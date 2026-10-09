@@ -49,6 +49,12 @@ pub enum ErrorKind {
     PermissionDenied,
     /// 404: unknown path.
     NotFound,
+    /// 413: the request body is over the API's limit,
+    /// [`MAX_BODY_BYTES`](crate::MAX_BODY_BYTES) (25 MiB). Never retried.
+    /// Also raised before sending, without a status and with `error_type`
+    /// `request_too_large_error`, for a body that would be over it: send
+    /// large images as uploads.
+    RequestTooLarge,
     /// 422: the request body failed validation. See [`Error::entries`]. Also
     /// raised before sending, without a status, for a number grid the API
     /// would refuse with a 422 and for a score without levels.
@@ -93,6 +99,7 @@ impl ErrorKind {
             ErrorKind::Refusal => "RefusalError",
             ErrorKind::PermissionDenied => "PermissionDeniedError",
             ErrorKind::NotFound => "NotFoundError",
+            ErrorKind::RequestTooLarge => "RequestTooLargeError",
             ErrorKind::Validation => "ValidationError",
             ErrorKind::RateLimit => "RateLimitError",
             ErrorKind::SessionLimit => "SessionLimitError",
@@ -260,6 +267,7 @@ impl Error {
             403 if error_type.as_deref() == Some("refusal_error") => ErrorKind::Refusal,
             403 => ErrorKind::PermissionDenied,
             404 => ErrorKind::NotFound,
+            413 => ErrorKind::RequestTooLarge,
             422 => ErrorKind::Validation,
             429 if error_type.as_deref() == Some("session_limit_exceeded") => ErrorKind::SessionLimit,
             429 => ErrorKind::RateLimit,
@@ -387,7 +395,8 @@ impl Error {
     /// one of the API's fixed rules: an error of the API's own kind (usually
     /// [`ErrorKind::BadRequest`]) with no status.
     pub fn is_local(&self) -> bool {
-        self.inner.status.is_none() && matches!(self.inner.kind, ErrorKind::BadRequest | ErrorKind::Validation)
+        self.inner.status.is_none()
+            && matches!(self.inner.kind, ErrorKind::BadRequest | ErrorKind::Validation | ErrorKind::RequestTooLarge)
     }
 
     /// True for a failure without a response: a timeout or a connection error.

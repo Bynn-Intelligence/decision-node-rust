@@ -185,6 +185,8 @@ let request = DecideRequest::new()
 
 The local checks are the API's own: JPEG, PNG or WebP by the first bytes (a declared type must match them), at most 10 MB, at most 40 megapixels read from the image header, at most 16 images in a request (URLs included; a 17th is the API's `Validation` error with a `too_long` entry), ids unique. `upload` takes up to 16 images a call. A file is read when the `Image` is made, so a file that cannot be read fails there. No image is resized or re-encoded.
 
+A request body may be at most 26,214,400 bytes (25 MiB, `MAX_BODY_BYTES`), inline images and video frames included. The client works out the body as it would send it before sending anything, and a larger one fails with a `RequestTooLarge` error and nothing is sent or uploaded; the same holds for each request of `decide_many` and each batch line. Images given as a path or bytes above the inline threshold are uploaded, so a request with images stays far below the limit; give large images as a path or bytes, or by `Image::upload_id`, rather than as base64 in a wire-form map.
+
 The upload cache lives in the client's memory only: by SHA-256 of the bytes and the media type, at most 256 entries, never written to disk and never shared between clients. Requests holding the same bytes at the same time share one upload. If the API answers that an upload the client placed has expired, was consumed or is not there, the client uploads the image again and resends the request once.
 
 The `PUT` goes to the storage URL the API returned, with exactly the headers it returned: never the API key, never the client's own headers, and no redirect followed. A `PUT` answered `403` after its URL's 5 minutes have passed (a slow network, a paused process) is presigned again once. Each `PUT` attempt has its own timeout, 60 seconds by default (`ClientBuilder::upload_timeout`), apart from the API call's 10. `upload(images)` uploads whatever the size and returns the ids, for images you send many times:
@@ -376,6 +378,7 @@ Every failure is a `decisionnode::Error`, also exported under the name used acro
 | 402 | `InsufficientCredit` | |
 | 403 with `refusal_error` | `Refusal` | `category()` (`harm` or `self_harm`), `safety()` |
 | 404 | `NotFound` | |
+| 413 | `RequestTooLarge`, never retried: the body is over 25 MiB | |
 | 422 | `Validation` | `entries()` |
 | 429 | `RateLimit`; `SessionLimit` when `error_type` is `session_limit_exceeded` | `retry_after()` |
 | 529 | `Overloaded`, also with `error_type` `booster_unavailable` when a booster the request requires failed | `retry_after()`, `boosters()` |
@@ -385,7 +388,7 @@ Every failure is a `decisionnode::Error`, also exported under the name used acro
 | 2xx where `check`, `classify` or `score` gets no answer of the type it promises | `Server` | `status()`, `request_id()`, `reason()` |
 | any other status: 3xx, 405, 409, 418, 408 once its retries are spent | `Other`, the base `DecisionNodeError` | `status()` |
 | no response | `Connection`, `Timeout` | |
-| a request the API would refuse, refused before sending | the API's own kind, `BadRequest`, or `Validation` for what the API answers with a 422, with its `error_type` and message, without a status (`is_local()` is true) | `entries()` for a `Validation` |
+| a request the API would refuse, refused before sending | the API's own kind, `BadRequest`, `RequestTooLarge` for a body over 25 MiB, or `Validation` for what the API answers with a 422, with its `error_type` and message, without a status (`is_local()` is true) | `entries()` for a `Validation` |
 | a storage `PUT` that failed | `Other`, the base `DecisionNodeError`, with the storage's status, `error_type` `upload_failed` and the storage's error code in `reason()` | |
 | an argument refused before sending | `Other`, the base `DecisionNodeError`, without a status (`is_argument()` is true) | |
 

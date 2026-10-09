@@ -545,9 +545,15 @@ impl DecisionNode {
             .into_iter()
             .enumerate()
             .map(|(i, r)| {
-                let prepared =
-                    r.request.prepare(self).map_err(|e| if e.is_argument() { e.in_request(i) } else { e })?;
-                Ok(Line { custom_id: r.custom_id.unwrap_or_default(), prepared })
+                let custom_id = r.custom_id.unwrap_or_default();
+                let prepared = r.request.prepare_line(self, &custom_id).map_err(|e| {
+                    if e.is_argument() {
+                        e.in_request(i)
+                    } else {
+                        e
+                    }
+                })?;
+                Ok(Line { custom_id, prepared })
             })
             .collect()
     }
@@ -867,5 +873,27 @@ mod tests {
     fn segments_are_escaped() {
         assert_eq!(segment("batch_01J9ZB8Q3T"), "batch_01J9ZB8Q3T");
         assert_eq!(segment("a/b c"), "a%2Fb%20c");
+    }
+
+    #[tokio::test]
+    async fn each_line_is_held_to_the_body_limit_as_it_would_be_sent() {
+        use crate::{truth, DecideRequest, ErrorKind, MAX_BODY_BYTES};
+        let dn = DecisionNode::builder().build().unwrap();
+        let line = |state: String| {
+            BatchRequest::new("line-\u{e9}", DecideRequest::new().state(state).question("q", truth("?")))
+        };
+        let encoded = |r: BatchRequest| async {
+            let lines = dn.prepare_lines([r], true).unwrap();
+            let bytes = dn.line_bytes(lines.into_iter().next().unwrap()).await.unwrap();
+            bytes.len() - 1
+        };
+        // The line without its newline, `custom_id` included.
+        let rest = encoded(line(String::new())).await;
+        let fits = line("a".repeat(MAX_BODY_BYTES - rest));
+        assert_eq!(encoded(fits.clone()).await, MAX_BODY_BYTES);
+        assert!(dn.check_batch(&[fits]).is_ok());
+        let over = [line("a".repeat(MAX_BODY_BYTES - rest + 1))];
+        assert_eq!(dn.check_batch(&over).unwrap_err().kind(), ErrorKind::RequestTooLarge);
+        assert_eq!(dn.check_batch_add(&over).unwrap_err().kind(), ErrorKind::RequestTooLarge);
     }
 }

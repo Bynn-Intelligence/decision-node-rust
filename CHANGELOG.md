@@ -13,11 +13,13 @@ Implements DecisionNode SDK specification version 1.3 (`SPEC_VERSION`): boosters
 - `Usage::booster_tokens` and `Usage::boosters`, `None` for a request without boosters.
 - `Error::boosters`: the `x-decisionnode-boosters` header parsed into booster name to `BoosterStatus` (`status`, `latency_ms`), in the request's order, on every error from a response; empty when the header is absent.
 - `ModelInfo::fine_tuned`, `base`, `adapter_version` and `status` for a workspace's fine-tuned models, `None` on a catalogue entry.
+- The API's 25 MiB request body limit: `MAX_BODY_BYTES` (26,214,400) and `ErrorKind::RequestTooLarge` (`RequestTooLargeError`). The body is measured as it would be sent, inline images and video frames included and an image the client would upload named by its upload id, before anything is sent or uploaded: over the limit, `decide`, the helpers, `decide_many` (the whole call), each batch line and `check_decide` / `check_batch` fail with `RequestTooLarge`, no status, `error_type` `request_too_large_error` and the API's message. `decide_raw` sends its body as given.
 
 ### Changed
 
 - `SPEC_VERSION` is `"1.3"`.
 - A fine-tuned model's name (`decisionnode-1.0-flash@acme/fraud`, `...:3`) is a model like any other: sent as given, never parsed locally, and `Decision::model` carries the pinned name that answered.
+- The API's 413 is `RequestTooLarge`, never retried (the base kind before).
 - `booster_unknown`, `booster_input_mismatch` and a malformed `boosters` list are `BadRequest` errors; `booster_not_enabled` and any other 403 that is not a refusal are `PermissionDenied`; `booster_unavailable` is `Overloaded` and retried like every 529.
 
 ## [0.2.0] - Unreleased

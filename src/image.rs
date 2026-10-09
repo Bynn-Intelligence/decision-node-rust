@@ -12,6 +12,7 @@ use serde_json::{Map, Value};
 use sha2::Digest;
 
 use crate::check::Limits;
+use crate::client::encoded_len;
 use crate::error::{Error, ErrorKind, Result};
 
 /// The most images one request (or one batch line) may carry, URLs included.
@@ -257,6 +258,17 @@ impl Image {
             }
         }
         Value::Object(out)
+    }
+
+    /// The length of a local image's inline wire form (`{"id", "media_type",
+    /// "data"}`), without encoding its bytes: base64 text needs no escaping in
+    /// JSON, so it adds exactly its own length.
+    pub(crate) fn inline_len(&self, local: &Local) -> Result<usize> {
+        let mut out = Map::new();
+        out.insert("id".into(), Value::String(self.id.clone()));
+        out.insert("media_type".into(), Value::String(local.media_type().to_owned()));
+        out.insert("data".into(), Value::String(String::new()));
+        Ok(encoded_len(&out)? + local.data.len().div_ceil(3) * 4)
     }
 
     /// The image as a `422` entry lists it: its wire form, a local image's

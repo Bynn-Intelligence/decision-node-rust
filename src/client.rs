@@ -44,6 +44,17 @@ pub const DEFAULT_UPLOAD_TIMEOUT: Duration = Duration::from_secs(60);
 /// costs less than the extra round trips of an upload. Set another value with
 /// [`ClientBuilder::inline_threshold`].
 pub const DEFAULT_INLINE_THRESHOLD: usize = 524_288;
+/// The API's request body limit, 26,214,400 bytes (25 MiB). A request body
+/// that would be larger, inline images and video frames included, is refused
+/// before anything is sent with an [`ErrorKind::RequestTooLarge`] error; the
+/// API answers one that reaches it with a 413. Images given as a path or bytes
+/// above the inline threshold are uploaded, so a request with images stays
+/// far below it.
+pub const MAX_BODY_BYTES: usize = 26_214_400;
+
+/// The API's message for a body over [`MAX_BODY_BYTES`].
+const BODY_TOO_LARGE: &str = "The request body is over 26,214,400 bytes (25 MiB). Send large images as uploads \
+                              (POST /v1/uploads) and name them by upload_id.";
 
 pub(crate) const USER_AGENT_VALUE: &str = concat!("decisionnode-rust/", env!("CARGO_PKG_VERSION"));
 
@@ -203,6 +214,20 @@ impl DecideRequest {
     /// value that cannot be serialised is an argument error; a request the
     /// API would refuse is the API's own error, before any request.
     pub(crate) fn prepare(self, client: &DecisionNode) -> Result<Prepared> {
+        self.prepare_sized(client, 0)
+    }
+
+    /// [`DecideRequest::prepare`] for a batch line, whose `custom_id` counts
+    /// toward the body limit with the rest of the line.
+    pub(crate) fn prepare_line(self, client: &DecisionNode, custom_id: &str) -> Result<Prepared> {
+        // `"custom_id":` and the comma after the value.
+        let extra = encoded_len(custom_id)? + 13;
+        self.prepare_sized(client, extra)
+    }
+
+    /// The checks of [`DecideRequest::prepare`], with the body limit counting
+    /// `extra` bytes beside the decide body.
+    fn prepare_sized(self, client: &DecisionNode, extra: usize) -> Result<Prepared> {
         let questions = build_questions(self.questions)?;
         let state = match self.state {
             None | Some(Ok(Value::Null)) => Value::String(String::new()),
@@ -235,8 +260,44 @@ impl DecideRequest {
             let videos = check_videos(&self.videos, &self.images)?;
             body.insert("videos".into(), Value::Array(videos));
         }
+        // The body as it would be sent: `,"images":` and the images in the
+        // form they would take, without uploading or encoding anything.
+        let images = if self.images.is_empty() { 0 } else { 10 + client.projected_images_len(&self.images)? };
+        check_body_size(encoded_len(&body)? + images + extra)?;
         Ok(Prepared { body, images: self.images })
     }
+}
+
+/// Counts the bytes of an encoding without keeping them.
+struct Counter(usize);
+
+impl std::io::Write for Counter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0 += buf.len();
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// The length of a value's JSON encoding, as the client sends it.
+pub(crate) fn encoded_len(value: &(impl Serialize + ?Sized)) -> Result<usize> {
+    let mut counter = Counter(0);
+    serde_json::to_writer(&mut counter, value)
+        .map_err(|e| Error::invalid("the body cannot be serialised").with_source(e))?;
+    Ok(counter.0)
+}
+
+/// The API's body limit: a body over [`MAX_BODY_BYTES`] is refused before
+/// anything is sent, as the API's 413 would refuse it.
+pub(crate) fn check_body_size(size: usize) -> Result<()> {
+    if size > MAX_BODY_BYTES {
+        return Err(Error::local(ErrorKind::RequestTooLarge, Some("request_too_large_error"), BODY_TOO_LARGE)
+            .with_reason(format!("the body is {size} bytes; the limit is {MAX_BODY_BYTES}")));
+    }
+    Ok(())
 }
 
 /// Images, videos, boosters and a model for the one-question helpers
@@ -1694,5 +1755,97 @@ mod tests {
     #[test]
     fn user_agent_names_the_language() {
         assert!(USER_AGENT_VALUE.starts_with("decisionnode-rust/"));
+    }
+
+    /// A 2x2 PNG header, padded with zeros to `size` bytes.
+    fn png(size: usize) -> Vec<u8> {
+        let mut data = vec![
+            0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44, 0x52, 0x00, 0x00,
+            0x00, 0x02, 0x00, 0x00, 0x00, 0x02, 0x08, 0x02, 0x00, 0x00, 0x00, 0xFD, 0xD4, 0x9A, 0x73,
+        ];
+        data.resize(size, 0);
+        data
+    }
+
+    #[test]
+    fn the_body_limit_is_on_the_exact_byte() {
+        let dn = DecisionNode::builder().model("decisionnode-latest").build().unwrap();
+        let request = |state: String| DecideRequest::new().state(state).question("q", truth("?"));
+        // An ASCII state adds exactly its length to the encoded body.
+        let rest =
+            Payload::json(&Value::Object(request(String::new()).prepare(&dn).unwrap().body)).unwrap().bytes.len();
+        let fits = request("a".repeat(MAX_BODY_BYTES - rest));
+        let sent = Payload::json(&Value::Object(fits.clone().prepare(&dn).unwrap().body)).unwrap();
+        assert_eq!(sent.bytes.len(), MAX_BODY_BYTES);
+        assert!(dn.check_decide(&fits).is_ok());
+
+        let over = request("a".repeat(MAX_BODY_BYTES - rest + 1));
+        let err = dn.check_decide(&over).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::RequestTooLarge);
+        assert_eq!(err.kind().name(), "RequestTooLargeError");
+        assert!(err.is_local());
+        assert_eq!((err.status(), err.request_id()), (None, None));
+        assert_eq!(err.error_type(), Some("request_too_large_error"));
+        assert_eq!(
+            err.message(),
+            "The request body is over 26,214,400 bytes (25 MiB). Send large images as uploads (POST /v1/uploads) \
+             and name them by upload_id."
+        );
+        assert_eq!(err.reason(), Some("the body is 26214401 bytes; the limit is 26214400"));
+    }
+
+    #[tokio::test]
+    async fn inline_images_count_and_large_ones_are_named_by_upload_id() {
+        // Inline, the projection is the images array exactly as placed.
+        let dn = DecisionNode::builder().build().unwrap();
+        let small = vec![
+            Image::bytes("a", png(1000)),
+            Image::url("b", "https://x.example/b.jpg"),
+            Image::upload_id("c", "upl_1"),
+        ];
+        let placed = dn.place_images(&small, true, false).await.unwrap();
+        assert!(placed.uploaded.is_empty());
+        assert_eq!(dn.projected_images_len(&small).unwrap(), encoded_len(&Value::Array(placed.wires)).unwrap());
+
+        // Two 9.9 MB images are uploaded, so the body names them and stays
+        // far under the limit; inline they would be over it.
+        let large = || {
+            DecideRequest::new()
+                .question("q", truth("?"))
+                .image(Image::bytes("front", png(9_900_000)))
+                .image(Image::bytes("back", png(9_900_000)))
+        };
+        assert!(dn.check_decide(&large()).is_ok());
+        let inline = DecisionNode::builder().inline_threshold(usize::MAX).build().unwrap();
+        assert_eq!(inline.check_decide(&large()).unwrap_err().kind(), ErrorKind::RequestTooLarge);
+    }
+
+    #[tokio::test]
+    async fn a_413_is_request_too_large_and_never_retried() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = hits.clone();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let mut buf = [0u8; 4096];
+                let _ = sock.read(&mut buf).await;
+                let body = r#"{"detail":{"error_type":"request_too_large_error","message":"too large"}}"#;
+                let reply = format!(
+                    "HTTP/1.1 413 Payload Too Large\r\nContent-Type: application/json\r\nx-request-id: req_9\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = sock.write_all(reply.as_bytes()).await;
+            }
+        });
+        let dn = DecisionNode::builder().api_key("k").base_url(format!("http://{addr}")).build().unwrap();
+        let err = dn.decide(DecideRequest::new().question("q", truth("?"))).await.unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::RequestTooLarge);
+        assert_eq!((err.status(), err.request_id()), (Some(413), Some("req_9")));
+        assert_eq!(err.error_type(), Some("request_too_large_error"));
+        assert!(!err.is_local());
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 }
