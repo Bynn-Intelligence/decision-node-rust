@@ -282,10 +282,15 @@ pub struct AiGeneratedReading {
     /// `inference` (read from the pixels) or `c2pa` (the file's Content
     /// Credentials say so); any other value is kept as received.
     pub method: String,
-    /// The likeliest generator.
-    pub top_generator: TopGenerator,
+    /// The likeliest generator. `None` unless the reading says the picture
+    /// is likely generated, and on every `c2pa` reading.
+    pub top_generator: Option<TopGenerator>,
     /// Who signed the file's Content Credentials; `None` when it has none.
     pub c2pa_signer: Option<String>,
+    /// `"untrusted"` when the file's Content Credentials validate but their
+    /// signer is not trusted, any other value as received, or `None` when the
+    /// reading has none.
+    pub c2pa: Option<String>,
     /// The reading as received.
     pub raw: Value,
 }
@@ -346,15 +351,22 @@ impl Reading {
 
     fn parse_ai_generated(obj: &Map<String, Value>, raw: &Value) -> Option<Reading> {
         let n = |k: &str| obj.get(k).and_then(Value::as_f64);
-        let g = obj.get("top_generator")?.as_object()?;
-        let top_generator =
-            TopGenerator { name: g.get("name")?.as_str()?.to_owned(), probability: g.get("probability")?.as_f64()? };
-        // The key is always sent: `null` when the file carries no Content
-        // Credentials.
-        let c2pa_signer = match obj.get("c2pa_signer")? {
+        // The `top_generator` and `c2pa_signer` keys are always sent, `null`
+        // when unset; `c2pa` only when the file carries Content Credentials.
+        let top_generator = match obj.get("top_generator")? {
             Value::Null => None,
-            v => Some(v.as_str()?.to_owned()),
+            Value::Object(g) => Some(TopGenerator {
+                name: g.get("name")?.as_str()?.to_owned(),
+                probability: g.get("probability")?.as_f64()?,
+            }),
+            _ => return None,
         };
+        let text = |v: &Value| match v {
+            Value::Null => Some(None),
+            v => v.as_str().map(|s| Some(s.to_owned())),
+        };
+        let c2pa_signer = text(obj.get("c2pa_signer")?)?;
+        let c2pa = obj.get("c2pa").map_or(Some(None), text)?;
         Some(Reading::AiGenerated(AiGeneratedReading {
             image: obj.get("image")?.as_str()?.to_owned(),
             generated: n("generated")?,
@@ -362,6 +374,7 @@ impl Reading {
             method: obj.get("method")?.as_str()?.to_owned(),
             top_generator,
             c2pa_signer,
+            c2pa,
             raw: raw.clone(),
         }))
     }
@@ -488,11 +501,17 @@ mod tests {
                 {"image": "c3d4", "generated": 0.93, "confidence": 0.86, "method": "inference",
                  "top_generator": {"name": "gen-a", "probability": 0.71}, "c2pa_signer": null},
                 {"image": "e5", "generated": 0.99, "confidence": 0.99, "method": "c2pa",
-                 "top_generator": {"name": "gen-b", "probability": 0.9}, "c2pa_signer": "Example Signer"},
+                 "top_generator": null, "c2pa_signer": "Example Signer"},
                 {"image": "f6", "generated": "high", "confidence": 0.5, "method": "inference"},
                 {"image": "g7", "generated": 0.1, "confidence": 0.5, "method": "inference",
                  "top_generator": {"name": "gen-a", "probability": 0.1}},
-                {"image": "h8", "generated": 0.1, "confidence": 0.5, "method": "inference", "top_generator": null, "c2pa_signer": null}
+                {"image": "h8", "generated": 0.1, "confidence": 0.5, "method": "inference", "top_generator": null,
+                 "c2pa_signer": null, "c2pa": "untrusted", "region": {"x": 4}},
+                {"image": "i9", "generated": 0.1, "confidence": 0.5, "method": "inference", "c2pa_signer": null},
+                {"image": "j0", "generated": 0.1, "confidence": 0.5, "method": "inference", "top_generator": "gen-a",
+                 "c2pa_signer": null},
+                {"image": "k1", "generated": 0.1, "confidence": 0.5, "method": "inference", "top_generator": null,
+                 "c2pa_signer": null, "c2pa": true}
             ]},
             "slow": {"version": "slow-v1", "status": "timeout", "latency_ms": 800, "results": []},
             "colour": {"version": "colour-v1", "status": "ok", "latency_ms": 5, "results": [{"image": "a1b2", "hue": 3}]}
@@ -515,14 +534,22 @@ mod tests {
         assert!(matches!(age.results[3], Reading::Unknown(_)));
         let g = ev["ai_generated"].results[0].as_ai_generated().unwrap();
         assert_eq!((g.generated, g.method.as_str(), g.c2pa_signer.as_deref()), (0.93, "inference", None));
-        assert_eq!(g.top_generator.probability, 0.71);
+        assert_eq!(g.top_generator.as_ref().unwrap().probability, 0.71);
+        assert_eq!(g.c2pa, None);
         let c = ev["ai_generated"].results[1].as_ai_generated().unwrap();
         assert_eq!((c.method.as_str(), c.c2pa_signer.as_deref()), ("c2pa", Some("Example Signer")));
+        assert_eq!(c.top_generator, None);
         assert!(matches!(ev["ai_generated"].results[2], Reading::Unknown(_)));
         assert_eq!(ev["ai_generated"].results[2].image(), Some("f6"));
-        // A missing c2pa_signer key and a null top_generator are fields missing.
+        // A missing c2pa_signer or top_generator key is a field missing.
         assert!(matches!(ev["ai_generated"].results[3], Reading::Unknown(_)));
-        assert!(matches!(ev["ai_generated"].results[4], Reading::Unknown(_)));
+        // A photograph: no top generator; untrusted Content Credentials; an
+        // unknown field ignored.
+        let photo = ev["ai_generated"].results[4].as_ai_generated().unwrap();
+        assert_eq!((photo.top_generator.as_ref(), photo.c2pa.as_deref()), (None, Some("untrusted")));
+        for i in 5..8 {
+            assert!(matches!(ev["ai_generated"].results[i], Reading::Unknown(_)), "{i}");
+        }
         assert!(ev["slow"].results.is_empty());
         assert_eq!(ev["slow"].status.as_deref(), Some("timeout"));
         assert!(matches!(&ev["colour"].results[0], Reading::Unknown(r) if r.booster == "colour" && r.raw["hue"] == 3));

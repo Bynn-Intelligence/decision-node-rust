@@ -1072,8 +1072,8 @@ fn norm_reading(r: &Reading) -> Value {
             "low": a.low.map(num), "high": a.high.map(num), "confidence": a.confidence.map(num)}),
         Reading::AiGenerated(g) => json!({"kind": "ai_generated", "image": g.image, "generated": num(g.generated),
             "confidence": num(g.confidence), "method": g.method,
-            "top_generator": json!({"name": g.top_generator.name, "probability": num(g.top_generator.probability)}),
-            "c2pa_signer": g.c2pa_signer}),
+            "top_generator": g.top_generator.as_ref().map(|t| json!({"name": t.name, "probability": num(t.probability)})),
+            "c2pa_signer": g.c2pa_signer, "c2pa": g.c2pa}),
         _ => json!({"kind": "unknown", "raw": r.raw()}),
     }
 }
