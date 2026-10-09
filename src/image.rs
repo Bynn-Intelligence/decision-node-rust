@@ -510,6 +510,16 @@ const MAX_IMAGE_ID_CHARS: usize = 64;
 /// most 40 megapixels by their header. A fault is a
 /// [`ErrorKind::BadRequest`] error with no status, as the API would answer.
 pub(crate) fn check_images(images: &[Image], limits: &Limits) -> Result<()> {
+    check_image_list(images, limits, true)
+}
+
+/// [`check_images`] without the id length: a session frame's image goes
+/// without its id, and `upload` sends no id at all.
+pub(crate) fn check_images_without_ids(images: &[Image], limits: &Limits) -> Result<()> {
+    check_image_list(images, limits, false)
+}
+
+fn check_image_list(images: &[Image], limits: &Limits, id_length: bool) -> Result<()> {
     let held = |key: &str| limits.count(&[key]).or_else(|| limits.count(&["images", key]));
     let biggest = held("max_image_bytes").map_or(MAX_IMAGE_BYTES, |n| n as usize);
     for (n, image) in images.iter().enumerate() {
@@ -517,7 +527,7 @@ pub(crate) fn check_images(images: &[Image], limits: &Limits) -> Result<()> {
             return Err(refuse(format!("Image {n} needs an id.")));
         }
         // Counted in characters (code points), as the API counts them.
-        if image.id.chars().count() > MAX_IMAGE_ID_CHARS {
+        if id_length && image.id.chars().count() > MAX_IMAGE_ID_CHARS {
             return Err(refuse(format!("Image {n}: its id is longer than {MAX_IMAGE_ID_CHARS} characters.")));
         }
         if images[..n].iter().any(|other| other.id == image.id) {
@@ -680,6 +690,9 @@ mod tests {
         assert_eq!(e.message(), "Image 0: its id is longer than 64 characters.");
         // The empty-id check comes first.
         assert_eq!(refused(&[Image::url("", url)]).message(), "Image 0 needs an id.");
+        // A session frame's image and `upload` send no id: no length check.
+        let frame = Image::bytes("é".repeat(65), PNG_2X2);
+        assert!(check_images_without_ids(std::slice::from_ref(&frame), &Limits::default()).is_ok());
     }
 
     #[test]

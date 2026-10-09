@@ -15,7 +15,7 @@ use serde_json::{json, Value};
 
 use crate::client::{backoff, encoded_len, is_loopback, transport_error, DecisionNode, Policy};
 use crate::error::{parse_rfc3339, Error, ErrorKind, Result};
-use crate::image::{check_images, Image, Local};
+use crate::image::{check_images_without_ids, Image, Local};
 
 /// The most entries the cache holds; the least recently used goes first.
 const CACHE_ENTRIES: usize = 256;
@@ -420,7 +420,7 @@ impl DecisionNode {
                 )));
             }
         }
-        check_images(&images, &self.limits(&self.inner.model))?;
+        check_images_without_ids(&images, &self.limits(&self.inner.model))?;
         let placed = self.place_images(&images, true, true).await?;
         Ok(placed
             .wires

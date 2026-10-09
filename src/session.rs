@@ -26,7 +26,7 @@ use tokio_tungstenite::WebSocketStream;
 use crate::check::{check_session_open, nesting_depth, object_depth, usage_error, MAX_NESTING};
 use crate::client::{build_questions, is_loopback, transport_error, DecisionNode, Policy, USER_AGENT_VALUE};
 use crate::error::{Error, ErrorKind, Result};
-use crate::image::{check_images, Image};
+use crate::image::{check_images_without_ids, Image};
 use crate::question::Question;
 use crate::response::{Answer, Usage};
 use crate::safety::Safety;
@@ -674,7 +674,7 @@ impl Session {
                 return Err(usage_error("image: a frame takes bytes or an upload, not a url."));
             }
             let model = self.model().map(str::to_owned).unwrap_or_else(|| self.client.inner.model.clone());
-            check_images(std::slice::from_ref(image), &self.client.limits(&model))?;
+            check_images_without_ids(std::slice::from_ref(image), &self.client.limits(&model))?;
         }
         Ok(())
     }
