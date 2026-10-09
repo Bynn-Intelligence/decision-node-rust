@@ -83,8 +83,8 @@ pub use question::{
     Score, Truth,
 };
 pub use response::{
-    Answer, BoxAnswer, ChoiceAnswer, Decision, DecisionResult, ModelInfo, NumberAnswer, PointAnswer, ScoreAnswer,
-    TruthAnswer, UnknownAnswer, Usage,
+    Answer, BoxAnswer, ChoiceAnswer, Decision, DecisionResult, Fallback, ModelInfo, NumberAnswer, PointAnswer,
+    ScoreAnswer, TruthAnswer, UnknownAnswer, Usage,
 };
 pub use safety::Safety;
 #[cfg(feature = "sessions")]

@@ -451,8 +451,36 @@ pub struct Decision {
     /// request's order. `None` when the request named none (or the response
     /// carries no evidence, as for a request the refusal check refused).
     pub evidence: Option<IndexMap<String, Evidence>>,
+    /// Set when another model answered than the one asked for: a request for
+    /// `decisionnode-1.0` that no ready worker could take at once is answered
+    /// by `decisionnode-1.0-flash`, unless it was sent with `fallback(false)`.
+    /// Read from the `x-decisionnode-fallback` and
+    /// `x-decisionnode-requested-model` headers; `None` on an ordinary answer.
+    /// [`Decision::model`] is the model that answered.
+    pub fallback: Option<Fallback>,
     /// The parsed response body.
     pub raw: Value,
+}
+
+/// A fallback answer: the model that answered in place of the one asked for.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Fallback {
+    /// The model that answered, from the `x-decisionnode-fallback` header.
+    pub served_model: String,
+    /// The model the request asked for, from the
+    /// `x-decisionnode-requested-model` header.
+    pub requested_model: Option<String>,
+}
+
+impl Fallback {
+    /// Reads the two headers; `None` without `x-decisionnode-fallback`.
+    pub(crate) fn from_headers(headers: &HeaderMap) -> Option<Fallback> {
+        Some(Fallback {
+            served_model: header(headers, "x-decisionnode-fallback")?,
+            requested_model: header(headers, "x-decisionnode-requested-model"),
+        })
+    }
 }
 
 impl Decision {
@@ -480,6 +508,7 @@ impl Decision {
                 .map(|w| w.iter().filter_map(Value::as_str).map(str::to_owned).collect())
                 .unwrap_or_default(),
             evidence: evidence_from_body(obj.get("evidence")),
+            fallback: Fallback::from_headers(headers),
             request_id,
             raw: body,
         })
@@ -748,6 +777,28 @@ mod tests {
         assert_eq!(m[1].adapter_version, Some(3));
         assert_eq!(m[1].status.as_deref(), Some("deployed"));
         assert_eq!(m[1].limits.get("version"), Some(&json!("decisionnode-1.0-flash@acme/fraud:3")));
+    }
+
+    #[test]
+    fn fallback_from_the_headers() {
+        let body = json!({"model": "decisionnode-1.0-flash", "answers": {}});
+        let h = headers(&[
+            ("x-decisionnode-fallback", "decisionnode-1.0-flash"),
+            ("x-decisionnode-requested-model", "decisionnode-1.0"),
+        ]);
+        let d = Decision::from_response(body.clone(), 200, &h).unwrap();
+        let f = d.fallback.unwrap();
+        assert_eq!(
+            (f.served_model.as_str(), f.requested_model.as_deref()),
+            ("decisionnode-1.0-flash", Some("decisionnode-1.0"))
+        );
+        assert_eq!(d.model.as_deref(), Some("decisionnode-1.0-flash"));
+        let d = Decision::from_response(body.clone(), 200, &HeaderMap::new()).unwrap();
+        assert_eq!(d.fallback, None);
+        // The requested model alone is not a fallback answer.
+        let d = Decision::from_response(body, 200, &headers(&[("x-decisionnode-requested-model", "decisionnode-1.0")]))
+            .unwrap();
+        assert_eq!(d.fallback, None);
     }
 
     #[test]

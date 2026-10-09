@@ -97,6 +97,7 @@ pub struct DecideRequest {
     videos: Vec<Video>,
     boosters: Vec<Booster>,
     model: Option<String>,
+    fallback: Option<bool>,
 }
 
 /// A request checked and ready to send: its body without the images, and the
@@ -210,6 +211,17 @@ impl DecideRequest {
         self
     }
 
+    /// Whether another model may answer when the one asked for has no ready
+    /// worker: a request for `decisionnode-1.0` that no worker can take at
+    /// once is answered by `decisionnode-1.0-flash` unless this is `false`, in
+    /// which case it gets the `529` ([`crate::ErrorKind::Overloaded`], retried
+    /// like any `529`). Sent as `"fallback"` only when set; the API's default
+    /// is `true`. [`Decision::fallback`] says when another model answered.
+    pub fn fallback(mut self, fallback: bool) -> DecideRequest {
+        self.fallback = Some(fallback);
+        self
+    }
+
     /// Checks the request and builds its body: an empty question map or a
     /// value that cannot be serialised is an argument error; a request the
     /// API would refuse is the API's own error, before any request.
@@ -244,6 +256,9 @@ impl DecideRequest {
         // nesting limit with the rest of the body.
         if let Some(boosters) = boosters_value(self.boosters)? {
             body.insert("boosters".into(), boosters);
+        }
+        if let Some(fallback) = self.fallback {
+            body.insert("fallback".into(), Value::Bool(fallback));
         }
         // The images count toward the nesting as `[{...}]`, each video inside
         // the body's object and the videos array.
@@ -300,14 +315,15 @@ pub(crate) fn check_body_size(size: usize) -> Result<()> {
     Ok(())
 }
 
-/// Images, videos, boosters and a model for the one-question helpers
-/// ([`DecisionNode::check_with`] and the others).
+/// Images, videos, boosters, a model and the fallback setting for the
+/// one-question helpers ([`DecisionNode::check_with`] and the others).
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct CallOptions {
     images: Vec<Image>,
     videos: Vec<Video>,
     boosters: Vec<Booster>,
     model: Option<String>,
+    fallback: Option<bool>,
 }
 
 impl CallOptions {
@@ -359,10 +375,19 @@ impl CallOptions {
         self
     }
 
+    /// Whether another model may answer, see [`DecideRequest::fallback`].
+    pub fn fallback(mut self, fallback: bool) -> CallOptions {
+        self.fallback = Some(fallback);
+        self
+    }
+
     fn apply(self, mut request: DecideRequest) -> DecideRequest {
         request = request.images(self.images).videos(self.videos).boosters(self.boosters);
         if let Some(m) = self.model {
             request = request.model(m);
+        }
+        if let Some(f) = self.fallback {
+            request = request.fallback(f);
         }
         request
     }
@@ -1365,6 +1390,19 @@ mod tests {
         let options = CallOptions::new().booster("age").boosters(["ai_generated"]);
         let helper = body(options.apply(DecideRequest::new().question("check", truth("?")))).unwrap();
         assert_eq!(helper["boosters"], json!(["age", "ai_generated"]));
+    }
+
+    #[test]
+    fn fallback_only_when_given() {
+        let plain = body(DecideRequest::new().question("q", truth("?"))).unwrap();
+        assert!(plain.get("fallback").is_none());
+        let off = body(DecideRequest::new().question("q", truth("?")).fallback(false)).unwrap();
+        assert_eq!(off["fallback"], json!(false));
+        let on = body(DecideRequest::new().question("q", truth("?")).fallback(true)).unwrap();
+        assert_eq!(on["fallback"], json!(true));
+        let helper =
+            body(CallOptions::new().fallback(false).apply(DecideRequest::new().question("check", truth("?")))).unwrap();
+        assert_eq!(helper["fallback"], json!(false));
     }
 
     #[test]

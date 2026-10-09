@@ -309,6 +309,16 @@ A booster call is one booster reading one picture with status `ok`: `age` costs 
 
 A model your workspace fine-tuned in the console is called by its name in `model`, by your workspace's keys only: `decisionnode-1.0-flash@acme/fraud` for the version deployed most recently, `decisionnode-1.0-flash@acme/fraud:3` to pin version 3. The name is sent as given and `d.model` carries the pinned name that answered. `models()` lists your fine-tuned models beside the catalogue, with `fine_tuned`, `base` (the model it was trained from), `adapter_version` and `status` (`deployed`, or `ready` when trained but not deployed). A name that does not exist, is not deployed or is another workspace's is the API's `400` "Unknown model", a `BadRequest` error.
 
+### Fallback
+
+A request for `decisionnode-1.0` that no ready worker can take at once is answered by `decisionnode-1.0-flash` instead of waiting. `d.fallback` says when that happened: `Some(Fallback { served_model, requested_model })`, read from the `x-decisionnode-fallback` and `x-decisionnode-requested-model` headers, and `None` on an ordinary answer; `d.model` is the model that answered. To have only the model you asked for answer, send `.fallback(false)`: the request then gets the `529`, an `Overloaded` error retried like any other.
+
+```rust
+let d = dn.decide(DecideRequest::new().model("decisionnode-1.0").question("q", truth("?")).fallback(false)).await?;
+```
+
+`CallOptions::fallback`, `decide_many` and batch requests take it as `decide` does; it is sent only when set.
+
 ### Safety
 
 On the hosted API every decision carries the result of the safety check, parsed from the `x-decisionnode-safety` header:

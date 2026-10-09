@@ -626,6 +626,9 @@ fn decide_request(root: &Path, args: &Value) -> Result<DecideRequest, Error> {
     if let Some(m) = opt(args, "model").and_then(Value::as_str) {
         r = r.model(m);
     }
+    if let Some(f) = opt(args, "fallback").and_then(Value::as_bool) {
+        r = r.fallback(f);
+    }
     Ok(r)
 }
 
@@ -644,11 +647,14 @@ fn batch_requests(root: &Path, args: &Value) -> Result<Vec<BatchRequest>, Error>
         .collect()
 }
 
-/// The images, videos, boosters and model of a helper call.
+/// The images, videos, boosters, model and fallback setting of a helper call.
 fn call_options(root: &Path, args: &Value) -> Result<CallOptions, Error> {
     let mut o = CallOptions::new().images(images(root, args)?).videos(videos(root, args)).boosters(boosters(args));
     if let Some(m) = opt(args, "model").and_then(Value::as_str) {
         o = o.model(m);
+    }
+    if let Some(f) = opt(args, "fallback").and_then(Value::as_bool) {
+        o = o.fallback(f);
     }
     Ok(o)
 }
@@ -1105,6 +1111,7 @@ fn norm_decision(d: &Decision) -> Value {
             Value::Object(m.iter().map(|(k, e)| (k.clone(), norm_evidence(e))).collect())
         }),
         "warnings": d.warnings,
+        "fallback": d.fallback.as_ref().map(|f| json!({"served_model": f.served_model, "requested_model": f.requested_model})),
         "safety": norm_safety(&d.safety),
         "answers": norm_answers(&d.answers),
         "raw": d.raw,
