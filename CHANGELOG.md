@@ -21,6 +21,8 @@ Implements DecisionNode SDK specification version 1.3 (`SPEC_VERSION`): boosters
 - `SPEC_VERSION` is `"1.3"`.
 - A fine-tuned model's name (`decisionnode-1.0-flash@acme/fraud`, `...:3`) is a model like any other: sent as given, never parsed locally, and `Decision::model` carries the pinned name that answered.
 - The API's 413 is `RequestTooLarge`, never retried (the base kind before).
+- An error status whose body is not JSON (a proxy's or the network edge's own page, or no body) is classified by its status alone, with `error_type` `None`, the request id and reason from their headers, and the message `HTTP <status> <status text>` (for example `HTTP 413 Content Too Large`, then ` (request id <id>)` when sent); the body is never read into any field. A 400 without a JSON body is `BadRequest`, a 403 `PermissionDenied` and a 422 `Validation` with empty entries. Retries follow the status as before.
+- An image id longer than 64 characters, counted as Unicode code points, is refused before sending with the API's `BadRequest` `api_usage_error` `Image <n>: its id is longer than 64 characters.` (the image counted from 0), after the empty-id check and before the duplicate check.
 - `booster_unknown`, `booster_input_mismatch` and a malformed `boosters` list are `BadRequest` errors; `booster_not_enabled` and any other 403 that is not a refusal are `PermissionDenied`; `booster_unavailable` is `Overloaded` and retried like every 529.
 
 ## [0.2.0] - Unreleased

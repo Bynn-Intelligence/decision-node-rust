@@ -155,6 +155,45 @@ struct Inner {
     source: Option<Box<dyn std::error::Error + Send + Sync + 'static>>,
 }
 
+/// The status text of an error whose body is not JSON, the same in every
+/// DecisionNode SDK and never the HTTP library's own wording.
+fn status_text(status: u16) -> Option<&'static str> {
+    Some(match status {
+        400 => "Bad Request",
+        401 => "Unauthorized",
+        402 => "Payment Required",
+        403 => "Forbidden",
+        404 => "Not Found",
+        405 => "Method Not Allowed",
+        408 => "Request Timeout",
+        409 => "Conflict",
+        410 => "Gone",
+        413 => "Content Too Large",
+        422 => "Unprocessable Content",
+        429 => "Too Many Requests",
+        500 => "Internal Server Error",
+        502 => "Bad Gateway",
+        503 => "Service Unavailable",
+        504 => "Gateway Timeout",
+        529 => "Overloaded",
+        _ => return None,
+    })
+}
+
+/// The message of an error whose body is not JSON: `HTTP 413 Content Too
+/// Large`, then ` (request id <id>)` when the response named one.
+fn edge_message(status: u16, request_id: Option<&str>) -> String {
+    let mut text = format!("HTTP {status}");
+    if let Some(t) = status_text(status) {
+        text.push(' ');
+        text.push_str(t);
+    }
+    if let Some(id) = request_id {
+        text.push_str(&format!(" (request id {id})"));
+    }
+    text
+}
+
 impl Error {
     pub(crate) fn new(kind: ErrorKind, message: impl Into<String>) -> Error {
         Error {
@@ -241,8 +280,14 @@ impl Error {
     }
 
     /// Builds the error for a response outside 200 to 299.
+    ///
+    /// A body that is not JSON (an edge's or a proxy's page, or no body) is
+    /// never read into any field: the kind follows the status alone, the
+    /// `error_type` is empty and the message is the client's own
+    /// description, `HTTP <status> <status text>` with the request id.
     pub(crate) fn from_response(status: u16, headers: &HeaderMap, body: &[u8]) -> Error {
         let parsed: Option<Value> = serde_json::from_slice(body).ok();
+        let request_id = header(headers, "x-request-id");
         let detail = parsed.as_ref().and_then(|b| b.get("detail"));
         let mut error_type = None;
         let mut message = None;
@@ -257,6 +302,10 @@ impl Error {
             Some(Value::String(text)) => message = Some(text.clone()),
             Some(Value::Array(list)) => entries = Some(list.clone()),
             _ => {}
+        }
+        if parsed.is_none() {
+            message = Some(edge_message(status, request_id.as_deref()));
+            entries = Some(Vec::new());
         }
 
         let kind = match status {
@@ -293,7 +342,7 @@ impl Error {
                 status: Some(status),
                 error_type,
                 message,
-                request_id: header(headers, "x-request-id"),
+                request_id,
                 reason: header(headers, "x-decisionnode-error"),
                 category: if kind == ErrorKind::Refusal { category } else { None },
                 safety,
@@ -358,7 +407,8 @@ impl Error {
         self.inner.safety.as_ref()
     }
 
-    /// For a [`ErrorKind::Validation`]: the server's list of validation entries.
+    /// For a [`ErrorKind::Validation`]: the server's list of validation entries,
+    /// empty for a `422` whose body is not JSON.
     pub fn entries(&self) -> Option<&[Value]> {
         self.inner.entries.as_deref()
     }
@@ -768,5 +818,59 @@ mod tests {
         assert_eq!(e.message(), "");
         assert!(!e.is_argument());
         assert!(Error::invalid("x").is_argument());
+    }
+
+    #[test]
+    fn a_body_that_is_not_json_is_classified_by_its_status() {
+        let page = b"<html><body><h1>413 Request Entity Too Large</h1></body></html>";
+        let e = Error::from_response(413, &HeaderMap::new(), page);
+        assert_eq!(e.kind(), ErrorKind::RequestTooLarge);
+        assert_eq!((e.status(), e.error_type(), e.request_id(), e.reason()), (Some(413), None, None, None));
+        assert_eq!(e.message(), "HTTP 413 Content Too Large");
+        assert!(e.body().is_none());
+
+        let mut h = HeaderMap::new();
+        h.insert("x-request-id", HeaderValue::from_static("req_edge_0408"));
+        h.insert("x-decisionnode-error", HeaderValue::from_static("stalled"));
+        let e = Error::from_response(408, &h, b"<html><body><h1>408 Request Time-out</h1></body></html>");
+        assert_eq!(e.kind(), ErrorKind::Other);
+        assert_eq!(e.message(), "HTTP 408 Request Timeout (request id req_edge_0408)");
+        assert_eq!((e.request_id(), e.reason()), (Some("req_edge_0408"), Some("stalled")));
+
+        for (status, kind, text) in [
+            (400, ErrorKind::BadRequest, "HTTP 400 Bad Request"),
+            (401, ErrorKind::Authentication, "HTTP 401 Unauthorized"),
+            (402, ErrorKind::InsufficientCredit, "HTTP 402 Payment Required"),
+            (403, ErrorKind::PermissionDenied, "HTTP 403 Forbidden"),
+            (404, ErrorKind::NotFound, "HTTP 404 Not Found"),
+            (405, ErrorKind::Other, "HTTP 405 Method Not Allowed"),
+            (409, ErrorKind::Other, "HTTP 409 Conflict"),
+            (410, ErrorKind::Other, "HTTP 410 Gone"),
+            (418, ErrorKind::Other, "HTTP 418"),
+            (422, ErrorKind::Validation, "HTTP 422 Unprocessable Content"),
+            (429, ErrorKind::RateLimit, "HTTP 429 Too Many Requests"),
+            (500, ErrorKind::Server, "HTTP 500 Internal Server Error"),
+            (502, ErrorKind::Server, "HTTP 502 Bad Gateway"),
+            (503, ErrorKind::Server, "HTTP 503 Service Unavailable"),
+            (504, ErrorKind::Server, "HTTP 504 Gateway Timeout"),
+            (507, ErrorKind::Server, "HTTP 507"),
+            (529, ErrorKind::Overloaded, "HTTP 529 Overloaded"),
+        ] {
+            // An empty body and a plain-text page alike.
+            for body in [&b""[..], b"upstream error"] {
+                let e = Error::from_response(status, &HeaderMap::new(), body);
+                assert_eq!((e.kind(), e.message(), e.error_type()), (kind, text, None), "{status}");
+            }
+        }
+        // Never a context limit, a refusal or a session limit without a JSON body.
+        assert_eq!(Error::from_response(400, &HeaderMap::new(), b"max_tokens_exceeded").kind(), ErrorKind::BadRequest);
+        assert_eq!(Error::from_response(403, &HeaderMap::new(), b"refusal_error").kind(), ErrorKind::PermissionDenied);
+        assert_eq!(Error::from_response(422, &HeaderMap::new(), b"").entries(), Some(&[][..]));
+        let mut h = HeaderMap::new();
+        h.insert("retry-after-ms", HeaderValue::from_static("1500"));
+        let e = Error::from_response(529, &h, b"<html>busy</html>");
+        assert_eq!(e.retry_after(), Some(Duration::from_millis(1500)));
+        // A JSON body without a message keeps the empty message.
+        assert_eq!(Error::from_response(500, &HeaderMap::new(), b"{}").message(), "");
     }
 }

@@ -499,9 +499,12 @@ pub(crate) fn max_images(limits: &Limits) -> usize {
     limits.count(&["max_images"]).or_else(|| limits.count(&["images", "max_images"])).map_or(MAX_IMAGES, |n| n as usize)
 }
 
+/// The longest image id the API takes, in characters (code points).
+const MAX_IMAGE_ID_CHARS: usize = 64;
+
 /// The API's image rules, checked before any request (their count is one of
-/// the request's `422` entries, see `video::count_entries`): ids present and
-/// unique; a URL by [`check_url`]; an upload reference's media type one of
+/// the request's `422` entries, see `video::count_entries`): ids present, at
+/// most 64 characters and unique; a URL by [`check_url`]; an upload reference's media type one of
 /// the three; local bytes JPEG, PNG or WebP by their first bytes (a declared
 /// type must match), at most 10 MB (or the held `max_image_bytes`) and at
 /// most 40 megapixels by their header. A fault is a
@@ -512,6 +515,10 @@ pub(crate) fn check_images(images: &[Image], limits: &Limits) -> Result<()> {
     for (n, image) in images.iter().enumerate() {
         if image.id.is_empty() {
             return Err(refuse(format!("Image {n} needs an id.")));
+        }
+        // Counted in characters (code points), as the API counts them.
+        if image.id.chars().count() > MAX_IMAGE_ID_CHARS {
+            return Err(refuse(format!("Image {n}: its id is longer than {MAX_IMAGE_ID_CHARS} characters.")));
         }
         if images[..n].iter().any(|other| other.id == image.id) {
             return Err(refuse(format!("Duplicate image id: {}", image.id)));
@@ -651,6 +658,28 @@ mod tests {
         assert_eq!(e.status(), None);
         assert_eq!(e.request_id(), None);
         e
+    }
+
+    #[test]
+    fn image_ids_of_at_most_64_characters() {
+        let url = "https://example.com/x.png";
+        // 64 characters outside the Basic Multilingual Plane: 256 bytes, sent.
+        let wide = "\u{20000}".repeat(64);
+        assert_eq!(wide.len(), 256);
+        assert!(check_images_default(&[Image::url(wide.clone(), url)]).is_ok());
+        assert!(check_images_default(&[Image::url("é".repeat(64), url)]).is_ok());
+        let e = refused(&[Image::url(format!("{wide}a"), url)]);
+        assert_eq!(e.message(), "Image 0: its id is longer than 64 characters.");
+        assert_eq!(e.error_type(), Some("api_usage_error"));
+        // Counted from 0, image by image: the second image is Image 1.
+        let long = "é".repeat(65);
+        let e = refused(&[Image::url("a", url), Image::url(long.clone(), url)]);
+        assert_eq!(e.message(), "Image 1: its id is longer than 64 characters.");
+        // The length check comes before the duplicate check.
+        let e = refused(&[Image::url(long.clone(), url), Image::url(long, url)]);
+        assert_eq!(e.message(), "Image 0: its id is longer than 64 characters.");
+        // The empty-id check comes first.
+        assert_eq!(refused(&[Image::url("", url)]).message(), "Image 0 needs an id.");
     }
 
     #[test]
