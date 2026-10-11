@@ -1781,11 +1781,8 @@ mod tests {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let attempts = Arc::new(AtomicUsize::new(0));
-        let seen = attempts.clone();
         tokio::spawn(async move {
             while let Ok((mut sock, _)) = listener.accept().await {
-                seen.fetch_add(1, Ordering::SeqCst);
                 tokio::spawn(async move {
                     let mut buf = [0u8; 4096];
                     let _ = sock.read(&mut buf).await;
@@ -1795,20 +1792,28 @@ mod tests {
                 });
             }
         });
+        // The client waits once before each retry, so its waits count the
+        // retries exactly; counting accepted connections races the client's
+        // timeout on some platforms.
+        let waits = Arc::new(AtomicUsize::new(0));
+        let seen = waits.clone();
         let dn = DecisionNode::builder()
             .api_key("k")
             .base_url(format!("http://{addr}"))
             .timeout(Duration::from_millis(100))
-            .sleeper(|_| Box::pin(async {}))
+            .sleeper(move |_| {
+                seen.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async {})
+            })
             .build()
             .unwrap();
         let ocr = DecideRequest::new().question("q", truth("?")).booster("ocr");
         assert_eq!(dn.decide(ocr).await.unwrap_err().kind(), ErrorKind::Timeout);
-        assert_eq!(attempts.swap(0, Ordering::SeqCst), 1);
-        // Without ocr the timeout is retried as always.
+        assert_eq!(waits.swap(0, Ordering::SeqCst), 0);
+        // Without ocr the timeout is retried as always: two retries.
         let plain = DecideRequest::new().question("q", truth("?")).booster("age");
         assert_eq!(dn.decide(plain).await.unwrap_err().kind(), ErrorKind::Timeout);
-        assert_eq!(attempts.load(Ordering::SeqCst), 3);
+        assert_eq!(waits.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]
