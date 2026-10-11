@@ -317,55 +317,53 @@ pub struct AiGeneratedReading {
     pub raw: Value,
 }
 
-/// A reading of the `face_detection` booster: the faces found in a picture.
+/// A reading of the `face_detection` booster, its fields as sent.
 #[derive(Clone, Debug, PartialEq)]
 #[non_exhaustive]
 pub struct FaceDetectionReading {
     /// The id of the image read.
     pub image: String,
-    /// How many faces were found. It may be more than `detections` lists.
+    /// The `faces` count as sent. It may be more than `detections` lists.
     pub faces: u64,
-    /// Each face found, its box and confidence, in the order sent.
+    /// The `detections`, in the order sent.
     pub detections: Vec<FaceDetection>,
     /// The reading as received.
     pub raw: Value,
 }
 
-/// One face of a [`FaceDetectionReading`].
+/// One entry of a [`FaceDetectionReading`]'s detections.
 #[derive(Clone, Debug, PartialEq)]
 #[non_exhaustive]
 pub struct FaceDetection {
-    /// Where the face is.
+    /// Its box.
     pub bbox: FaceBox,
-    /// How sure the detection is, 0 to 1.
+    /// Its `confidence`, as sent.
     pub confidence: f64,
 }
 
-/// A reading of the `wanted_person` booster: the faces in a picture checked
-/// against a list of wanted persons, and the ones that match an entry.
+/// A reading of the `wanted_person` booster, its fields as sent.
 #[derive(Clone, Debug, PartialEq)]
 #[non_exhaustive]
 pub struct WantedPersonReading {
     /// The id of the image read.
     pub image: String,
-    /// How many faces were checked. It may be more than `matches` lists.
+    /// The `faces` count as sent. It may be more than `matches` lists.
     pub faces: u64,
-    /// Each face that matches an entry of the list, in the order sent. The
-    /// booster's `threshold` option is sent as given and checked by the API.
+    /// The `matches`, in the order sent.
     pub matches: Vec<WantedMatch>,
     /// The reading as received.
     pub raw: Value,
 }
 
-/// One matching face of a [`WantedPersonReading`].
+/// One entry of a [`WantedPersonReading`]'s matches.
 #[derive(Clone, Debug, PartialEq)]
 #[non_exhaustive]
 pub struct WantedMatch {
-    /// Where the face is.
+    /// Its box.
     pub bbox: FaceBox,
-    /// How closely the face matches the entry.
+    /// Its `score`, as sent.
     pub score: f64,
-    /// The id of the list entry it matches.
+    /// Its `reference`, as sent.
     pub reference: String,
 }
 
@@ -392,17 +390,15 @@ fn face_box(value: Option<&Value>) -> Option<FaceBox> {
     Some(FaceBox { x1: n("x1")?, y1: n("y1")?, x2: n("x2")?, y2: n("y2")? })
 }
 
-/// A reading of the `ocr` booster: the text a picture shows, or the answer
-/// to the booster's `prompt` option (at most 2,000 characters, which the API
-/// checks) when one was given.
+/// A reading of the `ocr` booster, its fields as sent.
 #[derive(Clone, Debug, PartialEq)]
 #[non_exhaustive]
 pub struct OcrReading {
     /// The id of the image read.
     pub image: String,
-    /// The text read, exactly as sent; `""` when the picture shows none.
+    /// The `text`, exactly as sent, `""` included.
     pub text: String,
-    /// True when the text was cut to fit.
+    /// The `truncated` flag, as sent.
     pub truncated: bool,
     /// The reading as received.
     pub raw: Value,
