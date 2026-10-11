@@ -87,7 +87,7 @@ let answer = dn
     .check_with(
         json!({"claim": {"total": "740.00"}}),
         "Does the total on the receipt equal the total in the claim?",
-        CallOptions::new().image(Image::url("receipt", "https://files.example.com/receipt.jpg")).model("decisionnode-1.0-flash"),
+        CallOptions::new().image(Image::url("receipt", "https://files.example.com/receipt.jpg")).model("decisionnode-flash"),
     )
     .await?;
 ```
@@ -307,14 +307,14 @@ A booster call is one booster reading one picture with status `ok`, billed from 
 
 ### Fine-tuned models
 
-A model your workspace fine-tuned in the console is called by its name in `model`, by your workspace's keys only: `decisionnode-1.0-flash@acme/fraud` for the version deployed most recently, `decisionnode-1.0-flash@acme/fraud:3` to pin version 3. The name is sent as given and `d.model` carries the pinned name that answered. `models()` lists your fine-tuned models beside the catalogue, with `fine_tuned`, `base` (the model it was trained from), `adapter_version` and `status` (`deployed`, or `ready` when trained but not deployed). A name that does not exist, is not deployed or is another workspace's is the API's `400` "Unknown model", a `BadRequest` error.
+A model your workspace fine-tuned in the console is called by its name in `model`, by your workspace's keys only: `decisionnode-flash@acme/fraud` for the version deployed most recently, `decisionnode-flash@acme/fraud:3` to pin version 3. The name is sent as given and `d.model` carries the pinned name that answered. `models()` lists your fine-tuned models beside the catalogue, with `fine_tuned`, `base` (the model it was trained from), `adapter_version` and `status` (`deployed`, or `ready` when trained but not deployed). A name that does not exist, is not deployed or is another workspace's is the API's `400` "Unknown model", a `BadRequest` error.
 
 ### Fallback
 
-A request for `decisionnode-1.0` that no ready worker can take at once is answered by `decisionnode-1.0-flash` instead of waiting. `d.fallback` says when that happened: `Some(Fallback { served_model, requested_model })`, read from the `x-decisionnode-fallback` and `x-decisionnode-requested-model` headers, and `None` on an ordinary answer; `d.model` is the model that answered. To have only the model you asked for answer, send `.fallback(false)`: the request then gets the `529`, an `Overloaded` error retried like any other.
+A request for `decisionnode-moe` that no ready worker can take at once is answered by `decisionnode-flash` instead of waiting. `d.fallback` says when that happened: `Some(Fallback { served_model, requested_model })`, read from the `x-decisionnode-fallback` and `x-decisionnode-requested-model` headers, and `None` on an ordinary answer; `d.model` is the model that answered. To have only the model you asked for answer, send `.fallback(false)`: the request then gets the `529`, an `Overloaded` error retried like any other.
 
 ```rust
-let d = dn.decide(DecideRequest::new().model("decisionnode-1.0").question("q", truth("?")).fallback(false)).await?;
+let d = dn.decide(DecideRequest::new().model("decisionnode-moe").question("q", truth("?")).fallback(false)).await?;
 ```
 
 `CallOptions::fallback`, `decide_many` and batch requests take it as `decide` does; it is sent only when set.
@@ -449,7 +449,7 @@ use decisionnode::{reqwest, DecisionNode, HttpSettings};
 let dn = DecisionNode::builder()
     .api_key("dn_...")                              // default: DECISIONNODE_API_KEY
     .base_url("https://api.decisionnode.com")       // default: DECISIONNODE_BASE_URL, else this URL
-    .model("decisionnode-latest")                   // default: DECISIONNODE_MODEL, else decisionnode-latest
+    .model("decisionnode-moe")                      // default: DECISIONNODE_MODEL, else decisionnode-moe
     .timeout(Duration::from_secs(10))               // per attempt, above 0; or .timeout_secs(10.0)
     .max_retries(2)                                 // 0 or more
     .inline_threshold(524_288)                      // local images under this many bytes go inline
@@ -460,7 +460,7 @@ let dn = DecisionNode::builder()
     .build()?;                                      // .build_blocking()? for the blocking client
 ```
 
-An explicit setting wins over the environment, and the environment over the default. An empty string, for the key, the base URL or the model (also a request's own model), counts as not given. The base URL must be `https`; plain `http` is accepted only for `localhost`, `127.0.0.1` and `::1`, so a key never travels unencrypted, and anything else fails `build()`. The SDK builds its own HTTP client and takes no client or `reqwest::ClientBuilder` of yours, because it could not show that such a client refuses redirects and keeps its TLS checks on. `http_settings` takes an `HttpSettings` instead: a proxy (`https` requests tunnel through it, so TLS stays end to end), extra root certificates or only your own (`add_root_certificate`, `tls_built_in_root_certs`), a client certificate (`identity`), `connect_timeout`, pool and TCP options, `local_address`, `http1_only` and `resolve`. They apply to every connection the client opens: API calls, uploads to storage and session sockets. None of them can turn on redirects or turn off certificate or hostname checks, and with an `https` base URL the client sends nothing over plain HTTP. Models are `decisionnode-latest`, `decisionnode-flash-latest` and the pinned ids such as `decisionnode-1.0` and `decisionnode-1.0-flash`; `models()` lists the ones your key may use. A request picks its own with `DecideRequest::model`.
+An explicit setting wins over the environment, and the environment over the default. An empty string, for the key, the base URL or the model (also a request's own model), counts as not given. The base URL must be `https`; plain `http` is accepted only for `localhost`, `127.0.0.1` and `::1`, so a key never travels unencrypted, and anything else fails `build()`. The SDK builds its own HTTP client and takes no client or `reqwest::ClientBuilder` of yours, because it could not show that such a client refuses redirects and keeps its TLS checks on. `http_settings` takes an `HttpSettings` instead: a proxy (`https` requests tunnel through it, so TLS stays end to end), extra root certificates or only your own (`add_root_certificate`, `tls_built_in_root_certs`), a client certificate (`identity`), `connect_timeout`, pool and TCP options, `local_address`, `http1_only` and `resolve`. They apply to every connection the client opens: API calls, uploads to storage and session sockets. None of them can turn on redirects or turn off certificate or hostname checks, and with an `https` base URL the client sends nothing over plain HTTP. Models are the family ids `decisionnode-moe` (the default) and `decisionnode-flash` (faster and lower cost), each meaning the current release of its family. Every answer names the pinned id that answered, `decisionnode-<family>-<version>`, in `d.model`; `models()` lists the family ids and the pinned ids your key may use, and a request pinned to one sends that id as `model`. A request picks its own with `DecideRequest::model`.
 
 | Feature | Default | |
 |---|---|---|

@@ -27,7 +27,7 @@ use crate::video::{check_videos, count_entries, Video};
 /// The base URL of the hosted API.
 pub const DEFAULT_BASE_URL: &str = "https://api.decisionnode.com";
 /// The model used when none is given.
-pub const DEFAULT_MODEL: &str = "decisionnode-latest";
+pub const DEFAULT_MODEL: &str = "decisionnode-moe";
 /// The timeout of each attempt.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 /// Retries after the first attempt.
@@ -203,7 +203,7 @@ impl DecideRequest {
     }
 
     /// The model for this request, over the client's: a model id, or a
-    /// fine-tuned model's name (`decisionnode-1.0-flash@acme/fraud`, `:3` to
+    /// fine-tuned model's name (`decisionnode-flash@acme/fraud`, `:3` to
     /// pin a version), sent as given. An empty string counts as not given: the
     /// client's model applies.
     pub fn model(mut self, model: impl Into<String>) -> DecideRequest {
@@ -212,8 +212,8 @@ impl DecideRequest {
     }
 
     /// Whether another model may answer when the one asked for has no ready
-    /// worker: a request for `decisionnode-1.0` that no worker can take at
-    /// once is answered by `decisionnode-1.0-flash` unless this is `false`, in
+    /// worker: a request for `decisionnode-moe` that no worker can take at
+    /// once is answered by `decisionnode-flash` unless this is `false`, in
     /// which case it gets the `529` ([`crate::ErrorKind::Overloaded`], retried
     /// like any `529`). Sent as `"fallback"` only when set; the API's default
     /// is `true`. [`Decision::fallback`] says when another model answered.
@@ -449,7 +449,7 @@ impl ClientBuilder {
     }
 
     /// The model sent when a request names none. Default:
-    /// `DECISIONNODE_MODEL`, else `decisionnode-latest`.
+    /// `DECISIONNODE_MODEL`, else `decisionnode-moe`.
     pub fn model(mut self, model: impl Into<String>) -> ClientBuilder {
         self.model = given(model.into());
         self
@@ -1362,7 +1362,7 @@ mod tests {
     use serde_json::json;
 
     fn body(request: DecideRequest) -> Result<Value> {
-        let dn = DecisionNode::builder().model("decisionnode-latest").build().unwrap();
+        let dn = DecisionNode::builder().model("decisionnode-moe").build().unwrap();
         request.prepare(&dn).map(|p| Value::Object(p.body))
     }
 
@@ -1378,14 +1378,14 @@ mod tests {
                 .booster("age")
                 .booster(Booster::new("ai_generated").image("c3d4").require(true))
                 .booster(json!({"name": "x", "options": {"k": 1}}))
-                .model("decisionnode-1.0-flash@acme/fraud:3"),
+                .model("decisionnode-flash@acme/fraud:3"),
         )
         .unwrap();
         assert_eq!(
             b["boosters"],
             json!(["age", {"name": "ai_generated", "images": ["c3d4"], "require": true}, {"name": "x", "options": {"k": 1}}])
         );
-        assert_eq!(b["model"], "decisionnode-1.0-flash@acme/fraud:3");
+        assert_eq!(b["model"], "decisionnode-flash@acme/fraud:3");
         // A helper's boosters reach its request.
         let options = CallOptions::new().booster("age").boosters(["ai_generated"]);
         let helper = body(options.apply(DecideRequest::new().question("check", truth("?")))).unwrap();
@@ -1520,7 +1520,7 @@ mod tests {
         let body = body(DecideRequest::new().question("q", truth("?"))).unwrap();
         assert_eq!(
             body,
-            json!({"model": "decisionnode-latest", "state": "", "questions": {"q": {"type": "truth", "instructions": "?"}}})
+            json!({"model": "decisionnode-moe", "state": "", "questions": {"q": {"type": "truth", "instructions": "?"}}})
         );
     }
 
@@ -1531,10 +1531,10 @@ mod tests {
                 .state(json!(["a", 1]))
                 .question("q", truth("first"))
                 .question("q", truth("second"))
-                .model("decisionnode-1.0-flash"),
+                .model("decisionnode-flash"),
         )
         .unwrap();
-        assert_eq!(body["model"], "decisionnode-1.0-flash");
+        assert_eq!(body["model"], "decisionnode-flash");
         assert_eq!(body["state"], json!(["a", 1]));
         assert_eq!(body["questions"]["q"]["instructions"], "second");
         assert!(body.get("images").is_none());
@@ -1807,7 +1807,7 @@ mod tests {
 
     #[test]
     fn the_body_limit_is_on_the_exact_byte() {
-        let dn = DecisionNode::builder().model("decisionnode-latest").build().unwrap();
+        let dn = DecisionNode::builder().model("decisionnode-moe").build().unwrap();
         let request = |state: String| DecideRequest::new().state(state).question("q", truth("?"));
         // An ASCII state adds exactly its length to the encoded body.
         let rest =

@@ -430,8 +430,8 @@ pub struct Decision {
     /// The answers by question id, in the order the server sent them. Read them
     /// by id, never by position.
     pub answers: IndexMap<String, Answer>,
-    /// The resolved model version, for example `decisionnode-1.0`; for a
-    /// fine-tuned model its pinned name, `decisionnode-1.0-flash@acme/fraud:3`.
+    /// The pinned id of the model that answered, `decisionnode-<family>-<version>`;
+    /// for a fine-tuned model its pinned name, `decisionnode-flash@acme/fraud:3`.
     pub model: Option<String>,
     /// Token counts, each `None` when the response does not carry it.
     pub usage: Usage,
@@ -452,8 +452,8 @@ pub struct Decision {
     /// carries no evidence, as for a request the refusal check refused).
     pub evidence: Option<IndexMap<String, Evidence>>,
     /// Set when another model answered than the one asked for: a request for
-    /// `decisionnode-1.0` that no ready worker could take at once is answered
-    /// by `decisionnode-1.0-flash`, unless it was sent with `fallback(false)`.
+    /// `decisionnode-moe` that no ready worker could take at once is answered
+    /// by `decisionnode-flash`, unless it was sent with `fallback(false)`.
     /// Read from the `x-decisionnode-fallback` and
     /// `x-decisionnode-requested-model` headers; `None` on an ordinary answer.
     /// [`Decision::model`] is the model that answered.
@@ -543,7 +543,8 @@ pub type DecisionResult = Result<Decision>;
 #[derive(Clone, Debug, PartialEq)]
 #[non_exhaustive]
 pub struct ModelInfo {
-    /// The model id to send, for example `decisionnode-1.0`.
+    /// The model id to send: a family id such as `decisionnode-moe`, or the
+    /// pinned id `decisionnode-<family>-<version>` it resolves to.
     pub name: String,
     /// What the model is.
     pub description: String,
@@ -615,7 +616,7 @@ mod tests {
     #[test]
     fn parses_the_three_types_and_keeps_long_floats() {
         let body: Value = serde_json::from_str(
-            r#"{"model":"decisionnode-1.0","answers":{
+            r#"{"model":"decisionnode-moe-0.9.0-rc1","answers":{
                 "route":{"type":"choice","choice":"billing","confidence":0.81,"probabilities":{"billing":0.8200000000000001,"bug":0.08,"account":0.1}},
                 "urgency":{"type":"score","score":2.31,"confidence":0.31,"legend":{"0":"routine","1":{"what":"today"}},"probabilities":{"0":0.060000000000000005,"1":0.94}},
                 "escalate":{"type":"truth","truth":0.94}},
@@ -638,7 +639,7 @@ mod tests {
         assert_eq!(d.request_id.as_deref(), Some("req_1"));
         assert_eq!(d.latency_ms, Some(23.0));
         assert_eq!(d.safety.as_ref().unwrap().harm, Some(0.031));
-        assert_eq!(d.model.as_deref(), Some("decisionnode-1.0"));
+        assert_eq!(d.model.as_deref(), Some("decisionnode-moe-0.9.0-rc1"));
     }
 
     #[test]
@@ -744,12 +745,12 @@ mod tests {
 
     #[test]
     fn evidence_and_booster_usage() {
-        let body = json!({"model": "decisionnode-1.0-flash@acme/fraud:3", "answers": {"adult": {"type": "truth", "truth": 0.97}},
+        let body = json!({"model": "decisionnode-flash@acme/fraud:3", "answers": {"adult": {"type": "truth", "truth": 0.97}},
             "evidence": {"age": {"version": "age-v3", "status": "ok", "latency_ms": 212,
                 "results": [{"image": "a1b2", "age_years": 27, "low": 22, "high": 33, "confidence": 0.81, "faces": 1}]}},
             "usage": {"input_tokens": 341, "output_tokens": 0, "booster_tokens": 72, "boosters": 3}});
         let d = Decision::from_response(body, 200, &HeaderMap::new()).unwrap();
-        assert_eq!(d.model.as_deref(), Some("decisionnode-1.0-flash@acme/fraud:3"));
+        assert_eq!(d.model.as_deref(), Some("decisionnode-flash@acme/fraud:3"));
         assert_eq!((d.usage.booster_tokens, d.usage.boosters), (Some(72), Some(3)));
         let ev = d.evidence.as_ref().unwrap();
         assert_eq!(ev["age"].results[0].as_age().unwrap().age_years, Some(27.0));
@@ -763,49 +764,49 @@ mod tests {
     #[test]
     fn fine_tuned_models() {
         let body = json!({"models": [
-            {"name": "decisionnode-1.0-flash", "description": "d", "release_date": "2026-10-01", "version": "decisionnode-1.0-flash"},
-            {"name": "decisionnode-1.0-flash@acme/fraud:3", "description": "Claims fraud", "release_date": "2026-10-09",
-             "fine_tuned": true, "base": "decisionnode-1.0-flash", "adapter_version": 3, "status": "deployed",
-             "version": "decisionnode-1.0-flash@acme/fraud:3"}]});
+            {"name": "decisionnode-flash", "description": "d", "release_date": "2026-10-01", "version": "decisionnode-flash-0.9.0-rc1"},
+            {"name": "decisionnode-flash@acme/fraud:3", "description": "Claims fraud", "release_date": "2026-10-09",
+             "fine_tuned": true, "base": "decisionnode-flash-0.9.0-rc1", "adapter_version": 3, "status": "deployed",
+             "version": "decisionnode-flash@acme/fraud:3"}]});
         let m = ModelInfo::list_from(body, 200, &HeaderMap::new()).unwrap();
         assert_eq!(
             (m[0].fine_tuned, m[0].base.as_deref(), m[0].adapter_version, m[0].status.as_deref()),
             (None, None, None, None)
         );
         assert_eq!(m[1].fine_tuned, Some(true));
-        assert_eq!(m[1].base.as_deref(), Some("decisionnode-1.0-flash"));
+        assert_eq!(m[1].base.as_deref(), Some("decisionnode-flash-0.9.0-rc1"));
         assert_eq!(m[1].adapter_version, Some(3));
         assert_eq!(m[1].status.as_deref(), Some("deployed"));
-        assert_eq!(m[1].limits.get("version"), Some(&json!("decisionnode-1.0-flash@acme/fraud:3")));
+        assert_eq!(m[1].limits.get("version"), Some(&json!("decisionnode-flash@acme/fraud:3")));
     }
 
     #[test]
     fn fallback_from_the_headers() {
-        let body = json!({"model": "decisionnode-1.0-flash", "answers": {}});
+        let body = json!({"model": "decisionnode-flash-0.9.0-rc1", "answers": {}});
         let h = headers(&[
-            ("x-decisionnode-fallback", "decisionnode-1.0-flash"),
-            ("x-decisionnode-requested-model", "decisionnode-1.0"),
+            ("x-decisionnode-fallback", "decisionnode-flash-0.9.0-rc1"),
+            ("x-decisionnode-requested-model", "decisionnode-moe"),
         ]);
         let d = Decision::from_response(body.clone(), 200, &h).unwrap();
         let f = d.fallback.unwrap();
         assert_eq!(
             (f.served_model.as_str(), f.requested_model.as_deref()),
-            ("decisionnode-1.0-flash", Some("decisionnode-1.0"))
+            ("decisionnode-flash-0.9.0-rc1", Some("decisionnode-moe"))
         );
-        assert_eq!(d.model.as_deref(), Some("decisionnode-1.0-flash"));
+        assert_eq!(d.model.as_deref(), Some("decisionnode-flash-0.9.0-rc1"));
         let d = Decision::from_response(body.clone(), 200, &HeaderMap::new()).unwrap();
         assert_eq!(d.fallback, None);
         // The requested model alone is not a fallback answer.
-        let d = Decision::from_response(body, 200, &headers(&[("x-decisionnode-requested-model", "decisionnode-1.0")]))
+        let d = Decision::from_response(body, 200, &headers(&[("x-decisionnode-requested-model", "decisionnode-moe")]))
             .unwrap();
         assert_eq!(d.fallback, None);
     }
 
     #[test]
     fn models_split_limits() {
-        let body = json!({"models": [{"name": "decisionnode-1.0", "description": "d", "release_date": "2026-10-01", "max_images": 4}]});
+        let body = json!({"models": [{"name": "decisionnode-moe-0.9.0-rc1", "description": "d", "release_date": "2026-10-01", "max_images": 4}]});
         let m = ModelInfo::list_from(body, 200, &HeaderMap::new()).unwrap();
-        assert_eq!(m[0].name, "decisionnode-1.0");
+        assert_eq!(m[0].name, "decisionnode-moe-0.9.0-rc1");
         assert_eq!(m[0].limits.get("max_images"), Some(&json!(4)));
         assert!(!m[0].limits.contains_key("name"));
     }

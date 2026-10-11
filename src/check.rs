@@ -854,12 +854,12 @@ mod tests {
     #[test]
     fn held_limits_by_alias_or_version() {
         let mut held = HashMap::new();
-        let entry = json!({"name": "decisionnode-1.0", "version": "decisionnode-1.0", "alias": "decisionnode-latest",
-                           "max_choice_options": 2});
-        held.insert("decisionnode-1.0".to_owned(), entry.as_object().unwrap().clone());
-        for name in ["decisionnode-1.0", "decisionnode-latest"] {
+        let entry = json!({"name": "decisionnode-moe-0.9.0-rc1", "version": "decisionnode-moe-0.9.0-rc1",
+                           "alias": "decisionnode-moe", "max_choice_options": 2});
+        held.insert("decisionnode-moe-0.9.0-rc1".to_owned(), entry.as_object().unwrap().clone());
+        for name in ["decisionnode-moe-0.9.0-rc1", "decisionnode-moe"] {
             assert_eq!(Limits::of(name, &held).count(&["max_choice_options"]), Some(2), "{name}");
         }
-        assert_eq!(Limits::of("decisionnode-9", &held).count(&["max_choice_options"]), None);
+        assert_eq!(Limits::of("decisionnode-flash", &held).count(&["max_choice_options"]), None);
     }
 }

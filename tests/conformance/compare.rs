@@ -23,9 +23,28 @@ fn same_order(a: &Value, b: &Value) -> bool {
     }
 }
 
+/// `{"$pattern": regex}` in an expectation: the regular expression it holds.
+fn pattern(expected: &Value) -> Option<&str> {
+    match expected.as_object() {
+        Some(m) if m.len() == 1 => m.get("$pattern").and_then(Value::as_str),
+        _ => None,
+    }
+}
+
+/// True when the actual value is a string the expectation's pattern finds a
+/// match in.
+fn pattern_matches(regex: &str, actual: &Value) -> bool {
+    let re = regex::Regex::new(regex).unwrap_or_else(|e| panic!("the case's pattern {regex:?} is not valid: {e}"));
+    actual.as_str().is_some_and(|text| re.is_match(text))
+}
+
 /// JSON equality with numbers compared exactly as IEEE doubles and objects by
-/// key, regardless of order.
+/// key, regardless of order. An expected `{"$pattern": regex}` matches any
+/// string the regular expression finds a match in.
 pub fn same(a: &Value, b: &Value) -> bool {
+    if let Some(regex) = pattern(a) {
+        return pattern_matches(regex, b);
+    }
     match (a, b) {
         (Value::Number(x), Value::Number(y)) => match (x.as_f64(), y.as_f64()) {
             (Some(x), Some(y)) => x == y,
@@ -42,6 +61,13 @@ pub fn same(a: &Value, b: &Value) -> bool {
 /// Every key of `expected` must be in `actual` with the same value. Keys in
 /// [`EXACT`] compare whole; other objects compare by the keys expected.
 pub fn matches(expected: &Value, actual: &Value, path: &str) -> Result<(), Fail> {
+    if let Some(regex) = pattern(expected) {
+        return if pattern_matches(regex, actual) {
+            Ok(())
+        } else {
+            Err(Fail(format!("{path}: expected a match of {regex:?}, got {}", short(actual))))
+        };
+    }
     if let (Value::Object(e), Value::Object(a)) = (expected, actual) {
         for (k, v) in e {
             let Some(got) = a.get(k) else {

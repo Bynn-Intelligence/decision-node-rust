@@ -18,8 +18,9 @@ Implements DecisionNode SDK specification version 1.3 (`SPEC_VERSION`): boosters
 
 ### Changed
 
+- The default model is `decisionnode-moe` (it was `decisionnode-latest`). The documentation and examples use the family ids `decisionnode-moe` and `decisionnode-flash`, which mean the current release of each family; an answer names the pinned id that answered (`decisionnode-<family>-<version>`), and `models()` lists the pinned ids. `model` stays free text.
 - `SPEC_VERSION` is `"1.3"`.
-- A fine-tuned model's name (`decisionnode-1.0-flash@acme/fraud`, `...:3`) is a model like any other: sent as given, never parsed locally, and `Decision::model` carries the pinned name that answered.
+- A fine-tuned model's name (`decisionnode-flash@acme/fraud`, `...:3`) is a model like any other: sent as given, never parsed locally, and `Decision::model` carries the pinned name that answered.
 - The API's 413 is `RequestTooLarge`, never retried (the base kind before).
 - An error status whose body is not JSON (a proxy's or the network edge's own page, or no body) is classified by its status alone, with `error_type` `None`, the request id and reason from their headers, and the message `HTTP <status> <status text>` (for example `HTTP 413 Content Too Large`, then ` (request id <id>)` when sent); the body is never read into any field. A 400 without a JSON body is `BadRequest`, a 403 `PermissionDenied` and a 422 `Validation` with empty entries. Retries follow the status as before.
 - An image id longer than 64 characters, counted as Unicode code points, is refused before sending with the API's `BadRequest` `api_usage_error` `Image <n>: its id is longer than 64 characters.` (the image counted from 0), after the empty-id check and before the duplicate check, on every body that carries the ids: `decide`, the helpers, `decide_many`, batch lines and the checks. A session frame's image, which goes without its id, and `upload` are not checked for it.

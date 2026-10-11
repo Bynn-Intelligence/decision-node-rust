@@ -1030,11 +1030,11 @@ mod tests {
 
     #[test]
     fn open_bodies_send_only_what_is_given() {
-        let dn = DecisionNode::builder().model("decisionnode-latest").build().unwrap();
+        let dn = DecisionNode::builder().model("decisionnode-moe").build().unwrap();
         let body = SessionOptions::new().question("abort", crate::truth("Abort?")).body(&dn).unwrap();
         assert_eq!(
             body,
-            json!({"model": "decisionnode-latest", "questions": {"abort": {"type": "truth", "instructions": "Abort?"}}})
+            json!({"model": "decisionnode-moe", "questions": {"abort": {"type": "truth", "instructions": "Abort?"}}})
         );
         assert!(SessionOptions::new().body(&dn).unwrap_err().is_argument());
         let local = SessionOptions::new().question("s", crate::score("?", Vec::<String>::new())).body(&dn).unwrap_err();

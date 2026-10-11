@@ -807,7 +807,7 @@ mod tests {
     #[test]
     fn result_lines() {
         let text = concat!(
-            r#"{"custom_id":"a","status":200,"body":{"model":"decisionnode-1.0","answers":{"t":{"type":"truth","truth":0.88}},"usage":{"input_tokens":5,"output_tokens":0}},"headers":{"X-Request-Id":"req_1"}}"#,
+            r#"{"custom_id":"a","status":200,"body":{"model":"decisionnode-moe-0.9.0-rc1","answers":{"t":{"type":"truth","truth":0.88}},"usage":{"input_tokens":5,"output_tokens":0}},"headers":{"X-Request-Id":"req_1"}}"#,
             "\n\n",
             r#"{"custom_id":"b","status":403,"body":{"detail":{"error_type":"refusal_error","message":"no","category":"harm"}},"headers":{"x-decisionnode-safety":"harm=0.9;blocked"}}"#,
             "\r\n",
