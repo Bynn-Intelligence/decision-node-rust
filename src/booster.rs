@@ -698,7 +698,7 @@ mod tests {
                 {"image": 7, "faces": 1, "detections": []}
             ]},
             "wanted_person": {"version": "wanted_person-v1", "status": "ok", "latency_ms": 60, "billed_calls": 1, "results": [
-                {"image": "door", "faces": 2, "matches": [{"box": b, "score": 0.91, "reference": "case-17"}]},
+                {"image": "door", "faces": 2, "matches": [{"box": b, "score": 0.91, "reference": "wanted:2024-12345"}]},
                 {"image": "x", "faces": 1, "matches": [{"box": b, "score": "0.9", "reference": "r"}]},
                 {"image": "y", "faces": 1, "matches": [{"box": b, "score": 0.9}]},
                 {"image": "z", "faces": 1, "matches": [{"box": b, "score": 0.9, "reference": 5}]},
@@ -719,7 +719,7 @@ mod tests {
         let w = wp[0].as_wanted_person().unwrap();
         assert_eq!(
             (w.image.as_str(), w.faces, w.matches[0].score, w.matches[0].reference.as_str()),
-            ("door", 2, 0.91, "case-17")
+            ("door", 2, 0.91, "wanted:2024-12345")
         );
         assert_eq!(w.matches[0].bbox.y1, 20.5);
         for (i, reading) in wp.iter().enumerate().skip(1) {
