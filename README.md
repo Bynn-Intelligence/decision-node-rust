@@ -440,7 +440,9 @@ match dn.decide(request).await {
 
 ## Timeouts and retries
 
-Each attempt times out after 10 seconds, counted from sending the request to the last byte of the response body. A call is retried twice after the first attempt on 408, 429, every 5xx (529 included), timeouts and connection errors. The wait is `retry-after-ms` when the server sends it, else `Retry-After` in seconds or as an HTTP date, capped at 60 s; without either, an exponential backoff from 0.5 s with jitter, capped at 8 s. `ClientBuilder::sleeper` replaces the wait, for tests that record it instead of spending it. 400, 401, 402, 403, 404 and 422 are never retried. A decision changes nothing on the server, so a retry is always safe.
+Each attempt times out after 10 seconds, counted from sending the request to the last byte of the response body. A call is retried twice after the first attempt on 408, 429, every 5xx (529 included), timeouts and connection errors. The wait is `retry-after-ms` when the server sends it, else `Retry-After` in seconds or as an HTTP date, capped at 60 s; without either, an exponential backoff from 0.5 s with jitter, capped at 8 s. `ClientBuilder::sleeper` replaces the wait, for tests that record it instead of spending it. 400, 401, 402, 403, 404 and 422 are never retried. A decision changes nothing on the server, so a retry is always safe, with one exception:
+
+A decision whose boosters name `ocr` (by its name or as `Booster::new("ocr")`) reads the text of its pictures, which takes longer. Without a timeout of your own, each attempt waits 30 seconds (`DEFAULT_OCR_TIMEOUT`) instead of 10; a timeout you set with `ClientBuilder::timeout` is used as given, even a shorter one. Such a decision is never retried after a timeout, since the server finishes the attempt it was sent and may bill it: the call returns the `Timeout` error. Its other retries (408, 429, 5xx and connection errors) stay. If you set a timeout, make it at least 30 seconds for decisions that name `ocr`. Sessions, batches and `decide_raw` are not affected.
 
 ## Configuration
 

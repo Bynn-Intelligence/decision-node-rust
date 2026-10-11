@@ -30,6 +30,10 @@ pub const DEFAULT_BASE_URL: &str = "https://api.decisionnode.com";
 pub const DEFAULT_MODEL: &str = "decisionnode-moe";
 /// The timeout of each attempt.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
+/// The timeout of each attempt of a decision whose boosters name `ocr`, when
+/// no timeout was set: reading a picture's text takes longer than a
+/// decision. A timeout set with [`ClientBuilder::timeout`] is used as given.
+pub const DEFAULT_OCR_TIMEOUT: Duration = Duration::from_secs(30);
 /// Retries after the first attempt.
 pub const DEFAULT_MAX_RETRIES: u32 = 2;
 /// How many requests [`DecisionNode::decide_many`] sends at a time.
@@ -456,8 +460,10 @@ impl ClientBuilder {
     }
 
     /// The timeout of each attempt, from sending the request to the last byte
-    /// of the response body. Default: 10 seconds. Zero fails
-    /// [`ClientBuilder::build`].
+    /// of the response body. Default: 10 seconds, and
+    /// [`DEFAULT_OCR_TIMEOUT`] (30 seconds) for a decision whose boosters name
+    /// `ocr`; a timeout set here holds for every call, those included. Zero
+    /// fails [`ClientBuilder::build`].
     pub fn timeout(mut self, timeout: Duration) -> ClientBuilder {
         self.timeout = Some(Ok(timeout));
         self
@@ -620,6 +626,7 @@ impl ClientBuilder {
             .trim_end_matches('/')
             .to_owned();
         check_base_url(&base_url)?;
+        let timeout_set = self.timeout.is_some();
         let timeout = self.timeout.unwrap_or(Ok(DEFAULT_TIMEOUT)).map_err(Error::invalid)?;
         if timeout.is_zero() {
             return Err(Error::invalid("timeout must be above 0"));
@@ -640,6 +647,7 @@ impl ClientBuilder {
                 base_url,
                 model: self.model.or_else(|| env("DECISIONNODE_MODEL")).unwrap_or_else(|| DEFAULT_MODEL.to_owned()),
                 timeout,
+                timeout_set,
                 max_retries,
                 inline_threshold,
                 upload_timeout,
@@ -705,6 +713,9 @@ pub(crate) struct Inner {
     pub(crate) base_url: String,
     pub(crate) model: String,
     pub(crate) timeout: Duration,
+    /// True when the caller set the timeout: it then also holds for a
+    /// decision naming `ocr`, which otherwise waits [`DEFAULT_OCR_TIMEOUT`].
+    pub(crate) timeout_set: bool,
     pub(crate) max_retries: u32,
     pub(crate) inline_threshold: usize,
     pub(crate) upload_timeout: Duration,
@@ -803,6 +814,9 @@ impl DecisionNode {
     /// not counted as a retry.
     pub(crate) async fn decision_call(&self, path: &str, prepared: Prepared) -> Result<Answered> {
         let Prepared { body, images } = prepared;
+        // A decision naming `ocr` waits longer and is never repeated after a
+        // timeout, since the server finishes the attempt and may bill it.
+        let policy = if names_ocr(&body) { Policy::Ocr } else { Policy::Default };
         let mut body = Value::Object(body);
         let mut resent = false;
         loop {
@@ -810,7 +824,7 @@ impl DecisionNode {
             if let (false, Value::Object(map)) = (images.is_empty(), &mut body) {
                 map.insert("images".into(), Value::Array(placed.wires));
             }
-            let reply = self.request_json(Method::POST, path, Some(&body), Policy::Default).await;
+            let reply = self.request_json(Method::POST, path, Some(&body), policy).await;
             match reply {
                 Ok(reply) => {
                     let decision = Decision::from_response(reply.body, reply.status, &reply.headers)?;
@@ -1103,6 +1117,7 @@ impl DecisionNode {
         let auth = self.authorization()?;
         let url = format!("{}{}", inner.base_url, path);
 
+        let timeout = self.attempt_timeout(policy);
         let mut attempt: u32 = 0;
         loop {
             let started = Instant::now();
@@ -1119,7 +1134,7 @@ impl DecisionNode {
                 rb = rb.headers(inner.headers.clone());
             }
             if !open {
-                rb = rb.timeout(inner.timeout);
+                rb = rb.timeout(timeout);
             }
 
             // The timeout covers the whole attempt, from sending to the last
@@ -1128,21 +1143,20 @@ impl DecisionNode {
             // read line by line is covered up to its headers here, and chunk
             // by chunk by its reader.
             let attempt_future = async {
-                let resp = rb.send().await.map_err(|e| transport_error(e, inner.timeout))?;
+                let resp = rb.send().await.map_err(|e| transport_error(e, timeout))?;
                 let status = resp.status().as_u16();
                 let headers = resp.headers().clone();
                 if open && (200..=299).contains(&status) {
                     return Ok((status, headers, Body::Open(resp)));
                 }
-                let bytes = resp.bytes().await.map_err(|e| transport_error(e, inner.timeout))?;
+                let bytes = resp.bytes().await.map_err(|e| transport_error(e, timeout))?;
                 Ok((status, headers, Body::Bytes(bytes)))
             };
-            let result = match tokio::time::timeout(inner.timeout, attempt_future).await {
+            let result = match tokio::time::timeout(timeout, attempt_future).await {
                 Ok(r) => r,
-                Err(_) => Err(Error::new(
-                    ErrorKind::Timeout,
-                    format!("no response within {:.1} s", inner.timeout.as_secs_f64()),
-                )),
+                Err(_) => {
+                    Err(Error::new(ErrorKind::Timeout, format!("no response within {:.1} s", timeout.as_secs_f64())))
+                }
             };
 
             match result {
@@ -1155,7 +1169,13 @@ impl DecisionNode {
                     );
                     // A batch call that may have been applied is never repeated
                     // after an unseen answer.
-                    if !err.is_transport() || attempt >= inner.max_retries || policy == Policy::Mutation {
+                    // A decision naming `ocr` is never repeated after a timeout:
+                    // the server finishes that attempt and may bill it.
+                    if !err.is_transport()
+                        || attempt >= inner.max_retries
+                        || policy == Policy::Mutation
+                        || (policy == Policy::Ocr && err.kind() == ErrorKind::Timeout)
+                    {
                         return Err(err);
                     }
                     self.wait(backoff(attempt)).await;
@@ -1176,7 +1196,7 @@ impl DecisionNode {
                     }
                     let retryable = match policy {
                         Policy::Mutation => matches!(status, 429 | 529),
-                        Policy::Default | Policy::SessionOpen => is_retryable(status),
+                        Policy::Default | Policy::Ocr | Policy::SessionOpen => is_retryable(status),
                     };
                     if !retryable || attempt >= inner.max_retries {
                         return Err(Error::from_response(status, &headers, &body));
@@ -1191,6 +1211,17 @@ impl DecisionNode {
                 }
             }
             attempt += 1;
+        }
+    }
+
+    /// The timeout of one attempt: a decision naming `ocr` waits
+    /// [`DEFAULT_OCR_TIMEOUT`] unless the caller set a timeout, which is then
+    /// used as given, even a shorter one.
+    fn attempt_timeout(&self, policy: Policy) -> Duration {
+        if policy == Policy::Ocr && !self.inner.timeout_set {
+            DEFAULT_OCR_TIMEOUT
+        } else {
+            self.inner.timeout
         }
     }
 
@@ -1214,6 +1245,22 @@ pub(crate) enum Policy {
     /// Opening a session: as `Default`, except that a 429
     /// `session_limit_exceeded` is never retried.
     SessionOpen,
+    /// A decision whose boosters name `ocr`: as `Default`, except that a
+    /// timeout is never retried, and the attempt waits
+    /// [`DEFAULT_OCR_TIMEOUT`] unless the caller set a timeout.
+    Ocr,
+}
+
+/// True when a decision body's `boosters` names `ocr`, by its bare name or in
+/// the object form `{"name": "ocr", ...}`.
+pub(crate) fn names_ocr(body: &Map<String, Value>) -> bool {
+    body.get("boosters").and_then(Value::as_array).is_some_and(|list| {
+        list.iter().any(|b| match b {
+            Value::String(name) => name == "ocr",
+            Value::Object(m) => m.get("name").and_then(Value::as_str) == Some("ocr"),
+            _ => false,
+        })
+    })
 }
 
 /// A request body and its content type.
@@ -1585,6 +1632,7 @@ mod tests {
             base_url: dn.inner.base_url.clone(),
             model: dn.inner.model.clone(),
             timeout: dn.inner.timeout,
+            timeout_set: dn.inner.timeout_set,
             max_retries: dn.inner.max_retries,
             inline_threshold: dn.inner.inline_threshold,
             upload_timeout: dn.inner.upload_timeout,
@@ -1700,6 +1748,67 @@ mod tests {
         assert_eq!(err.status(), Some(200));
         assert_eq!(err.request_id(), Some("req_7"));
         assert_eq!(err.reason(), Some("upstream returned html"));
+    }
+
+    #[test]
+    fn a_decision_naming_ocr_is_found_by_name() {
+        let body = |boosters: Value| json!({"boosters": boosters}).as_object().unwrap().clone();
+        assert!(names_ocr(&body(json!(["age", "ocr"]))));
+        assert!(names_ocr(&body(json!([{"name": "ocr", "options": {"prompt": "the total"}}]))));
+        assert!(!names_ocr(&body(json!(["age", {"name": "ai_generated"}]))));
+        assert!(!names_ocr(&body(json!([{"booster": "ocr"}]))));
+        assert!(!names_ocr(&Map::new()));
+        let wire = DecideRequest::new().question("q", truth("?")).booster(Booster::new("ocr").require(true));
+        let dn = DecisionNode::builder().api_key("k").build().unwrap();
+        assert!(names_ocr(&wire.prepare(&dn).unwrap().body));
+    }
+
+    #[test]
+    fn ocr_waits_30_seconds_unless_a_timeout_is_set() {
+        let unset = DecisionNode::builder().api_key("k").build().unwrap();
+        assert_eq!(unset.attempt_timeout(Policy::Ocr), DEFAULT_OCR_TIMEOUT);
+        assert_eq!(unset.attempt_timeout(Policy::Default), DEFAULT_TIMEOUT);
+        // A timeout the caller set is used as given, never raised.
+        let set = DecisionNode::builder().api_key("k").timeout(Duration::from_secs(1)).build().unwrap();
+        assert_eq!(set.attempt_timeout(Policy::Ocr), Duration::from_secs(1));
+        let ten = DecisionNode::builder().api_key("k").timeout_secs(10.0).build().unwrap();
+        assert_eq!(ten.attempt_timeout(Policy::Ocr), Duration::from_secs(10));
+    }
+
+    #[tokio::test]
+    async fn a_decision_naming_ocr_is_not_retried_after_a_timeout() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let seen = attempts.clone();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                seen.fetch_add(1, Ordering::SeqCst);
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    let _ = sock.read(&mut buf).await;
+                    tokio::time::sleep(Duration::from_millis(400)).await;
+                    let _ =
+                        sock.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}").await;
+                });
+            }
+        });
+        let dn = DecisionNode::builder()
+            .api_key("k")
+            .base_url(format!("http://{addr}"))
+            .timeout(Duration::from_millis(100))
+            .sleeper(|_| Box::pin(async {}))
+            .build()
+            .unwrap();
+        let ocr = DecideRequest::new().question("q", truth("?")).booster("ocr");
+        assert_eq!(dn.decide(ocr).await.unwrap_err().kind(), ErrorKind::Timeout);
+        assert_eq!(attempts.swap(0, Ordering::SeqCst), 1);
+        // Without ocr the timeout is retried as always.
+        let plain = DecideRequest::new().question("q", truth("?")).booster("age");
+        assert_eq!(dn.decide(plain).await.unwrap_err().kind(), ErrorKind::Timeout);
+        assert_eq!(attempts.load(Ordering::SeqCst), 3);
     }
 
     #[tokio::test]

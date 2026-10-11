@@ -73,8 +73,8 @@ pub use booster::{
 };
 pub use client::{
     gate_questions, CallOptions, ClientBuilder, DecideRequest, DecisionNode, Sleeper, DEFAULT_BASE_URL,
-    DEFAULT_CONCURRENCY, DEFAULT_INLINE_THRESHOLD, DEFAULT_MAX_RETRIES, DEFAULT_MODEL, DEFAULT_TIMEOUT,
-    DEFAULT_UPLOAD_TIMEOUT, MAX_BODY_BYTES,
+    DEFAULT_CONCURRENCY, DEFAULT_INLINE_THRESHOLD, DEFAULT_MAX_RETRIES, DEFAULT_MODEL, DEFAULT_OCR_TIMEOUT,
+    DEFAULT_TIMEOUT, DEFAULT_UPLOAD_TIMEOUT, MAX_BODY_BYTES,
 };
 pub use error::{DecisionNodeError, Error, ErrorKind, Result};
 pub use http::HttpSettings;
