@@ -26,12 +26,12 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use base64::Engine;
-use decisionnode::Evidence;
 use decisionnode::{
     Batch, BatchPage, BatchRequest, BatchResult, BatchStatus, Booster, BoundingBox, CallOptions, Choice, ChoiceAnswer,
     ClientBuilder, DecideRequest, Decision, DecisionNode, DecisionResult, Error, Image, Levels, ModelInfo, Number,
     NumberAnswer, Options, Point, Question, Reading, Safety, Score, ScoreAnswer, Truth, TruthAnswer, Video, VideoFrame,
 };
+use decisionnode::{Evidence, FaceBox};
 use serde_json::{json, Map, Value};
 use sha2::Digest;
 
@@ -1072,6 +1072,10 @@ fn norm_answers(answers: &indexmap::IndexMap<String, decisionnode::Answer>) -> V
     Value::Object(answers.iter().map(|(k, v)| (k.clone(), norm_answer(v))).collect())
 }
 
+fn norm_box(b: &FaceBox) -> Value {
+    json!({"x1": num(b.x1), "y1": num(b.y1), "x2": num(b.x2), "y2": num(b.y2)})
+}
+
 fn norm_reading(r: &Reading) -> Value {
     match r {
         Reading::Age(a) => json!({"kind": "age", "image": a.image, "faces": a.faces, "age_years": a.age_years.map(num),
@@ -1081,6 +1085,11 @@ fn norm_reading(r: &Reading) -> Value {
             "top_generator": g.top_generator.as_ref().map(|t| json!({"name": t.name, "probability": num(t.probability)})),
             "c2pa_signer": g.c2pa_signer, "c2pa": g.c2pa}),
         Reading::Ocr(o) => json!({"kind": "ocr", "image": o.image, "text": o.text, "truncated": o.truncated}),
+        Reading::FaceDetection(f) => json!({"kind": "face_detection", "image": f.image, "faces": f.faces,
+            "detections": f.detections.iter().map(|d| json!({"box": norm_box(&d.bbox), "confidence": num(d.confidence)})).collect::<Vec<_>>()}),
+        Reading::WantedPerson(w) => json!({"kind": "wanted_person", "image": w.image, "faces": w.faces,
+            "matches": w.matches.iter().map(|m| json!({"box": norm_box(&m.bbox), "score": num(m.score), "reference": m.reference}))
+                .collect::<Vec<_>>()}),
         _ => json!({"kind": "unknown", "raw": r.raw()}),
     }
 }
