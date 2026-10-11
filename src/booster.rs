@@ -257,6 +257,8 @@ pub enum Reading {
     Age(AgeReading),
     /// A reading of the `ai_generated` booster.
     AiGenerated(AiGeneratedReading),
+    /// A reading of the `ocr` booster.
+    Ocr(OcrReading),
     /// A reading of a booster this version does not know, or a malformed
     /// reading.
     Unknown(UnknownReading),
@@ -311,6 +313,22 @@ pub struct AiGeneratedReading {
     pub raw: Value,
 }
 
+/// A reading of the `ocr` booster: the text a picture shows, or the answer
+/// to the booster's `prompt` option (at most 2,000 characters, which the API
+/// checks) when one was given.
+#[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
+pub struct OcrReading {
+    /// The id of the image read.
+    pub image: String,
+    /// The text read, exactly as sent; `""` when the picture shows none.
+    pub text: String,
+    /// True when the text was cut to fit.
+    pub truncated: bool,
+    /// The reading as received.
+    pub raw: Value,
+}
+
 /// The likeliest generator of an [`AiGeneratedReading`].
 #[derive(Clone, Debug, PartialEq)]
 #[non_exhaustive]
@@ -347,9 +365,20 @@ impl Reading {
         let known = raw.as_object().and_then(|obj| match booster {
             "age" => Self::parse_age(obj, &raw),
             "ai_generated" => Self::parse_ai_generated(obj, &raw),
+            "ocr" => Self::parse_ocr(obj, &raw),
             _ => None,
         });
         known.unwrap_or_else(|| Reading::Unknown(UnknownReading { booster: booster.to_owned(), raw }))
+    }
+
+    fn parse_ocr(obj: &Map<String, Value>, raw: &Value) -> Option<Reading> {
+        // `text` and `truncated` are always sent.
+        Some(Reading::Ocr(OcrReading {
+            image: obj.get("image")?.as_str()?.to_owned(),
+            text: obj.get("text")?.as_str()?.to_owned(),
+            truncated: obj.get("truncated")?.as_bool()?,
+            raw: raw.clone(),
+        }))
     }
 
     fn parse_age(obj: &Map<String, Value>, raw: &Value) -> Option<Reading> {
@@ -411,11 +440,20 @@ impl Reading {
         }
     }
 
+    /// The OCR reading, if this is one.
+    pub fn as_ocr(&self) -> Option<&OcrReading> {
+        match self {
+            Reading::Ocr(r) => Some(r),
+            _ => None,
+        }
+    }
+
     /// The id of the image read, when the reading names one.
     pub fn image(&self) -> Option<&str> {
         match self {
             Reading::Age(r) => Some(&r.image),
             Reading::AiGenerated(r) => Some(&r.image),
+            Reading::Ocr(r) => Some(&r.image),
             Reading::Unknown(r) => r.raw.get("image").and_then(Value::as_str),
         }
     }
@@ -425,6 +463,7 @@ impl Reading {
         match self {
             Reading::Age(r) => &r.raw,
             Reading::AiGenerated(r) => &r.raw,
+            Reading::Ocr(r) => &r.raw,
             Reading::Unknown(r) => &r.raw,
         }
     }
@@ -503,6 +542,32 @@ mod tests {
         bad.insert(vec![1u8], 1);
         let e = Booster::new("age").options(bad).into_value().unwrap_err();
         assert!(e.is_argument());
+    }
+
+    #[test]
+    fn ocr_readings() {
+        let body = json!({"ocr": {"version": "ocr-v1", "status": "ok", "latency_ms": 90, "billed_calls": 6, "results": [
+            {"image": "receipt", "text": "TOTAL 42.00 EUR", "truncated": false, "region": {"x": 1}},
+            {"image": "blank", "text": "", "truncated": false},
+            {"image": "long", "text": "page", "truncated": true},
+            {"image": "n", "text": "x", "truncated": null},
+            {"image": "m", "text": "x"},
+            {"image": "a", "truncated": false},
+            {"image": "b", "text": 7, "truncated": false},
+            {"image": 3, "text": "x", "truncated": false},
+            {"image": "c", "text": "x", "truncated": "yes"}
+        ]}});
+        let r = &evidence_from_body(Some(&body)).unwrap()["ocr"].results;
+        let o = r[0].as_ocr().unwrap();
+        assert_eq!((o.image.as_str(), o.text.as_str(), o.truncated), ("receipt", "TOTAL 42.00 EUR", false));
+        assert_eq!(r[1].as_ocr().unwrap().text, "");
+        assert!(r[2].as_ocr().unwrap().truncated);
+        // A truncated that is null, missing or not a boolean; a missing or
+        // non-string text; a non-string image.
+        for (i, reading) in r.iter().enumerate().skip(3) {
+            assert!(matches!(reading, Reading::Unknown(u) if u.booster == "ocr"), "{i}");
+        }
+        assert_eq!(r[0].image(), Some("receipt"));
     }
 
     #[test]

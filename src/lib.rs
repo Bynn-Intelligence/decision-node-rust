@@ -68,7 +68,7 @@ pub use batch::{
     Batches, DEFAULT_BATCH_TIMEOUT, DEFAULT_POLL_INTERVAL, MIN_POLL_INTERVAL,
 };
 pub use booster::{
-    AgeReading, AiGeneratedReading, Booster, BoosterStatus, Evidence, Reading, TopGenerator, UnknownReading,
+    AgeReading, AiGeneratedReading, Booster, BoosterStatus, Evidence, OcrReading, Reading, TopGenerator, UnknownReading,
 };
 pub use client::{
     gate_questions, CallOptions, ClientBuilder, DecideRequest, DecisionNode, Sleeper, DEFAULT_BASE_URL,

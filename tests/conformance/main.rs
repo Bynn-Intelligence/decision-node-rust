@@ -1080,6 +1080,7 @@ fn norm_reading(r: &Reading) -> Value {
             "confidence": num(g.confidence), "method": g.method,
             "top_generator": g.top_generator.as_ref().map(|t| json!({"name": t.name, "probability": num(t.probability)})),
             "c2pa_signer": g.c2pa_signer, "c2pa": g.c2pa}),
+        Reading::Ocr(o) => json!({"kind": "ocr", "image": o.image, "text": o.text, "truncated": o.truncated}),
         _ => json!({"kind": "unknown", "raw": r.raw()}),
     }
 }
