@@ -147,7 +147,7 @@ A question id is any string and comes back as the key of its answer. Without a s
 
 | Type | Fields |
 |---|---|
-| `Decision` | `answers` (by question id, also `decision["id"]` and `decision.get("id")`), `model`, `usage.input_tokens`, `usage.output_tokens`, `usage.video_frames`, `usage.video_seconds`, `usage.booster_tokens`, `usage.boosters`, `warnings`, `evidence`, `request_id`, `latency_ms`, `safety`, `raw` |
+| `Decision` | `answers` (by question id, also `decision["id"]` and `decision.get("id")`), `model`, `usage.input_tokens`, `usage.output_tokens`, `usage.video_frames`, `usage.video_seconds`, `usage.booster_tokens`, `usage.boosters`, `usage.cost`, `warnings`, `evidence`, `request_id`, `latency_ms`, `safety`, `raw` |
 | `ModelInfo` | `name`, `description`, `release_date`, `fine_tuned`, `base`, `adapter_version`, `status` (the last four on a fine-tuned model only), `limits` (every other field of the entry), `raw` |
 | `Answer::Truth(TruthAnswer)` | `truth` |
 | `Answer::Choice(ChoiceAnswer)` | `choice`, `confidence`, `probabilities` (by option name, exactly as sent) |
@@ -158,6 +158,8 @@ A question id is any string and comes back as the key of its answer. Without a s
 | `Answer::Unknown(UnknownAnswer)` | `answer_type` and `raw`, for a question type this version does not know, or a known type whose fields are missing or of the wrong type. Such an answer never fails the decision. |
 
 `model` is read from the body; `request_id`, `latency_ms` and `safety` from the `x-request-id`, `x-decisionnode-latency-ms` and `x-decisionnode-safety` headers. A value the response does not carry is `None`: the token counts are `Option<u64>` and `latency_ms` is `Option<f64>`, never 0 in place of a missing value. For a request with videos, `usage.video_frames` is the number of frames read and `usage.video_seconds` the seconds of the windows read (`None` without videos), and `warnings` holds the server's notes exactly as sent when it read a video at a lower rate or resolution than asked (empty when there are none).
+
+`usage.cost` is what the answer cost in USD, as the API booked it: `usd` (the amount booked), `model_usd` (the model's part), `boosters_usd` (the boosters' part) and `free_tier` (`true` when the free tier covered the model's part). Every amount is read as sent and never computed by the client, so `usd` is the API's own figure, not `model_usd` plus `boosters_usd`. A batch result's decision and a session's open and frame replies carry it too; it is `None` from a server that does not send it, never zeros.
 
 Numbers are passed through as received: no rounding and no renormalising, so a probability list may sum to 0.99 or 1.01 and an entry may read `0.8200000000000001`. Read answers by id, never by position.
 

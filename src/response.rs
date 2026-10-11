@@ -387,7 +387,7 @@ impl Answer {
 /// Token counts of a decision and, for a request with videos or boosters,
 /// what was read of them. A value the response does not carry is `None`,
 /// never 0.
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 #[non_exhaustive]
 pub struct Usage {
     /// The tokens of the state, the questions, the images and the videos.
@@ -405,6 +405,46 @@ pub struct Usage {
     pub booster_tokens: Option<u64>,
     /// The booster calls billed. `None` for a request without boosters.
     pub boosters: Option<u64>,
+    /// What the answer cost, as the API booked it. `None` from a server that
+    /// does not send it.
+    pub cost: Option<Cost>,
+}
+
+/// What one answer cost, in USD, exactly as the API sent it.
+///
+/// Every amount is read as received and never computed here: `usd` is the
+/// amount booked for the answer, which the API writes itself, so it is not
+/// recomputed from `model_usd` and `boosters_usd` (two doubles added can
+/// differ from it in the last digits). A field the API did not send, or sent
+/// as another type, is `None`, never 0.
+#[derive(Clone, Debug, Default, PartialEq)]
+#[non_exhaustive]
+pub struct Cost {
+    /// The amount booked for this answer: the model's part and the boosters'.
+    pub usd: Option<f64>,
+    /// The model's part: the input tokens at the model's price.
+    pub model_usd: Option<f64>,
+    /// The boosters' part: the booster calls billed on this answer.
+    pub boosters_usd: Option<f64>,
+    /// True when the free tier covered the model's part of the request.
+    pub free_tier: Option<bool>,
+    /// The `cost` object as received.
+    pub raw: Value,
+}
+
+impl Cost {
+    /// Reads a `cost` object; anything that is not an object is no cost.
+    fn from_value(value: &Value) -> Option<Cost> {
+        let obj = value.as_object()?;
+        let amount = |k: &str| obj.get(k).and_then(Value::as_f64);
+        Some(Cost {
+            usd: amount("usd"),
+            model_usd: amount("model_usd"),
+            boosters_usd: amount("boosters_usd"),
+            free_tier: obj.get("free_tier").and_then(Value::as_bool),
+            raw: value.clone(),
+        })
+    }
 }
 
 impl Usage {
@@ -419,6 +459,7 @@ impl Usage {
             video_seconds: field("video_seconds").and_then(Value::as_f64),
             booster_tokens: field("booster_tokens").and_then(Value::as_u64),
             boosters: field("boosters").and_then(Value::as_u64),
+            cost: field("cost").and_then(Cost::from_value),
         }
     }
 }
@@ -778,6 +819,35 @@ mod tests {
         assert_eq!(m[1].adapter_version, Some(3));
         assert_eq!(m[1].status.as_deref(), Some("deployed"));
         assert_eq!(m[1].limits.get("version"), Some(&json!("decisionnode-flash@acme/fraud:3")));
+    }
+
+    #[test]
+    fn cost_as_sent() {
+        let body = json!({"answers": {}, "usage": {"input_tokens": 341, "output_tokens": 0, "booster_tokens": 72, "boosters": 3,
+            "cost": {"usd": 0.036014322, "model_usd": 0.000014322, "boosters_usd": 0.036, "free_tier": false}}});
+        let d = Decision::from_response(body, 200, &HeaderMap::new()).unwrap();
+        let c = d.usage.cost.as_ref().unwrap();
+        // Read as sent, never summed: the two parts add up to 0.036014321999999994 as doubles.
+        assert_eq!(c.usd, Some(0.036014322));
+        assert_ne!(c.model_usd.unwrap() + c.boosters_usd.unwrap(), 0.036014322);
+        assert_eq!((c.model_usd, c.boosters_usd, c.free_tier), (Some(0.000014322), Some(0.036), Some(false)));
+        assert_eq!(c.raw["usd"], json!(0.036014322));
+
+        let free = json!({"answers": {}, "usage": {"input_tokens": 62, "output_tokens": 0,
+            "cost": {"usd": 0, "model_usd": 0, "boosters_usd": 0, "free_tier": true}}});
+        let c = Decision::from_response(free, 200, &HeaderMap::new()).unwrap().usage.cost.unwrap();
+        assert_eq!((c.usd, c.model_usd, c.free_tier), (Some(0.0), Some(0.0), Some(true)));
+
+        // Absent, or not an object: no cost, never zeros. A field of another type is None.
+        let d = Decision::from_response(json!({"answers": {}, "usage": {"input_tokens": 62}}), 200, &HeaderMap::new())
+            .unwrap();
+        assert_eq!(d.usage.cost, None);
+        let d =
+            Decision::from_response(json!({"answers": {}, "usage": {"cost": "0.1"}}), 200, &HeaderMap::new()).unwrap();
+        assert_eq!(d.usage.cost, None);
+        let odd = json!({"answers": {}, "usage": {"cost": {"usd": "0.1", "free_tier": 1}}});
+        let c = Decision::from_response(odd, 200, &HeaderMap::new()).unwrap().usage.cost.unwrap();
+        assert_eq!((c.usd, c.model_usd, c.boosters_usd, c.free_tier), (None, None, None, None));
     }
 
     #[test]

@@ -6,8 +6,19 @@ use serde_json::Value;
 pub struct Fail(pub String);
 
 /// Keys whose values compare whole instead of key by key.
-const EXACT: [&str; 9] =
-    ["probabilities", "legend", "raw", "entries", "safety", "body", "limits", "evidence", "boosters"];
+const EXACT: [&str; 11] = [
+    "probabilities",
+    "legend",
+    "raw",
+    "entries",
+    "safety",
+    "body",
+    "limits",
+    "evidence",
+    "boosters",
+    "fallback",
+    "cost",
+];
 
 /// Keys compared whole whose top-level key order must also be the order
 /// expected: a decision's `evidence` (the request's order) and an error's

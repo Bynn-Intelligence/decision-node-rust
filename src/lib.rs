@@ -83,7 +83,7 @@ pub use question::{
     Score, Truth,
 };
 pub use response::{
-    Answer, BoxAnswer, ChoiceAnswer, Decision, DecisionResult, Fallback, ModelInfo, NumberAnswer, PointAnswer,
+    Answer, BoxAnswer, ChoiceAnswer, Cost, Decision, DecisionResult, Fallback, ModelInfo, NumberAnswer, PointAnswer,
     ScoreAnswer, TruthAnswer, UnknownAnswer, Usage,
 };
 pub use safety::Safety;

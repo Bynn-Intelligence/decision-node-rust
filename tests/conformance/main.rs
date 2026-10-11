@@ -1106,6 +1106,8 @@ fn norm_decision(d: &Decision) -> Value {
             "video_seconds": d.usage.video_seconds.map(num),
             "booster_tokens": d.usage.booster_tokens,
             "boosters": d.usage.boosters,
+            "cost": d.usage.cost.as_ref().map(|c| json!({"usd": c.usd.map(num), "model_usd": c.model_usd.map(num),
+                "boosters_usd": c.boosters_usd.map(num), "free_tier": c.free_tier})),
         },
         "evidence": d.evidence.as_ref().map(|m| {
             Value::Object(m.iter().map(|(k, e)| (k.clone(), norm_evidence(e))).collect())
