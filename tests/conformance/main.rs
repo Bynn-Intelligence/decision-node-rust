@@ -312,6 +312,10 @@ enum Outcome {
     BatchPage(BatchPage),
     BatchResults(Vec<BatchResult>),
     BatchRun(Batch, Vec<BatchResult>),
+    /// A collections call's result: the API's object as sent.
+    Collection(Value),
+    /// `collections.list`: the collections, in order.
+    CollectionList(Vec<Value>),
     #[cfg_attr(not(feature = "sessions"), allow(dead_code))]
     Session(SessionHandle),
     #[cfg(feature = "sessions")]
@@ -323,6 +327,12 @@ enum Outcome {
 
 /// Values saved by earlier steps, for `$ref`.
 type Refs = HashMap<String, Outcome>;
+
+/// A string argument as the SDK takes it: a string as given, anything else
+/// as its JSON text.
+fn text_of(v: &Value) -> String {
+    v.as_str().map_or_else(|| v.to_string(), str::to_owned)
+}
 
 fn opt<'a>(args: &'a Value, key: &str) -> Option<&'a Value> {
     args.get(key).filter(|v| !v.is_null())
@@ -343,6 +353,8 @@ fn ref_json(o: &Outcome) -> Value {
         Outcome::BatchPage(p) => p.raw.clone(),
         Outcome::UploadIds(ids) => json!(ids),
         Outcome::Raw(v) => v.clone(),
+        Outcome::Collection(v) => v.clone(),
+        Outcome::CollectionList(list) => json!(list),
         Outcome::Decision(d) => d.raw.clone(),
         #[cfg(feature = "sessions")]
         Outcome::Session(s) => s.raw().clone(),
@@ -744,6 +756,13 @@ enum Prepared {
     BatchResults(String),
     BatchCancel(String),
     RunBatch(Vec<BatchRequest>, Duration),
+    CollectionCreate(String, Option<String>),
+    CollectionList,
+    CollectionGet(String),
+    CollectionDelete(String),
+    CollectionEnroll(String, Image, String, Option<String>),
+    CollectionListItems(String, Option<i64>, Option<i64>),
+    CollectionDeleteItem(String, String),
 }
 
 /// The call of a case. An argument the SDK refuses while it is being built
@@ -757,6 +776,7 @@ fn prepare(root: &Path, call: &Value, refs: &Refs) -> Result<Prepared, Error> {
     let state = || args.get("state").cloned().unwrap_or_else(|| json!(""));
     let options = || call_options(root, args);
     let batch_id = || args["batch_id"].as_str().unwrap_or_default().to_owned();
+    let text = |k: &str| args.get(k).map(text_of).unwrap_or_default();
     Ok(match method {
         "decide" => Prepared::Decide(decide_request(root, args)?),
         "decide_many" => Prepared::Many(
@@ -794,6 +814,22 @@ fn prepare(root: &Path, call: &Value, refs: &Refs) -> Result<Prepared, Error> {
             Duration::try_from_secs_f64(args.get("poll_interval").and_then(Value::as_f64).unwrap_or(60.0))
                 .unwrap_or(Duration::ZERO),
         ),
+        "collections.create" => Prepared::CollectionCreate(text("name"), opt(args, "type").map(text_of)),
+        "collections.list" => Prepared::CollectionList,
+        "collections.get" => Prepared::CollectionGet(text("collection_id")),
+        "collections.delete" => Prepared::CollectionDelete(text("collection_id")),
+        "collections.enroll" => Prepared::CollectionEnroll(
+            text("collection_id"),
+            image(root, &args["image"])?,
+            text("reference"),
+            opt(args, "label").map(text_of),
+        ),
+        "collections.list_items" => Prepared::CollectionListItems(
+            text("collection_id"),
+            opt(args, "offset").and_then(Value::as_i64),
+            opt(args, "limit").and_then(Value::as_i64),
+        ),
+        "collections.delete_item" => Prepared::CollectionDeleteItem(text("collection_id"), text("item_id")),
         other => panic!("unknown method {other} (is the sessions feature on?)"),
     })
 }
@@ -898,6 +934,22 @@ async fn invoke_async(c: &DecisionNode, p: Prepared) -> Outcome {
         Prepared::RunBatch(rs, poll) => {
             batch_run(c.run_batch_with(rs, poll, decisionnode::DEFAULT_BATCH_TIMEOUT).await)
         }
+        Prepared::CollectionCreate(name, None) => wrap(c.collections().create(name).await, Outcome::Collection),
+        Prepared::CollectionCreate(name, Some(t)) => {
+            wrap(c.collections().create_with_type(name, t).await, Outcome::Collection)
+        }
+        Prepared::CollectionList => wrap(c.collections().list().await, Outcome::CollectionList),
+        Prepared::CollectionGet(id) => wrap(c.collections().get(&id).await, Outcome::Collection),
+        Prepared::CollectionDelete(id) => wrap(c.collections().delete(&id).await, Outcome::Collection),
+        Prepared::CollectionEnroll(id, image, reference, label) => {
+            wrap(c.collections().enroll(&id, image, reference, label.as_deref()).await, Outcome::Collection)
+        }
+        Prepared::CollectionListItems(id, o, l) => {
+            wrap(c.collections().list_items(&id, o, l).await, Outcome::Collection)
+        }
+        Prepared::CollectionDeleteItem(id, item) => {
+            wrap(c.collections().delete_item(&id, &item).await, Outcome::Collection)
+        }
     }
 }
 
@@ -939,6 +991,18 @@ fn invoke_blocking(c: &decisionnode::blocking::DecisionNode, p: Prepared) -> Out
         }
         Prepared::BatchCancel(id) => wrap(c.batches().cancel(&id), Outcome::Batch),
         Prepared::RunBatch(rs, poll) => batch_run(c.run_batch_with(rs, poll, decisionnode::DEFAULT_BATCH_TIMEOUT)),
+        Prepared::CollectionCreate(name, None) => wrap(c.collections().create(name), Outcome::Collection),
+        Prepared::CollectionCreate(name, Some(t)) => {
+            wrap(c.collections().create_with_type(name, t), Outcome::Collection)
+        }
+        Prepared::CollectionList => wrap(c.collections().list(), Outcome::CollectionList),
+        Prepared::CollectionGet(id) => wrap(c.collections().get(&id), Outcome::Collection),
+        Prepared::CollectionDelete(id) => wrap(c.collections().delete(&id), Outcome::Collection),
+        Prepared::CollectionEnroll(id, image, reference, label) => {
+            wrap(c.collections().enroll(&id, image, reference, label.as_deref()), Outcome::Collection)
+        }
+        Prepared::CollectionListItems(id, o, l) => wrap(c.collections().list_items(&id, o, l), Outcome::Collection),
+        Prepared::CollectionDeleteItem(id, item) => wrap(c.collections().delete_item(&id, &item), Outcome::Collection),
     }
 }
 
@@ -1116,9 +1180,9 @@ fn norm_reading(r: &Reading) -> Value {
         Reading::Ocr(o) => json!({"kind": "ocr", "image": o.image, "text": o.text, "truncated": o.truncated}),
         Reading::FaceDetection(f) => json!({"kind": "face_detection", "image": f.image, "faces": f.faces,
             "detections": f.detections.iter().map(|d| json!({"box": norm_box(&d.bbox), "confidence": num(d.confidence)})).collect::<Vec<_>>()}),
-        Reading::WantedPerson(w) => json!({"kind": "wanted_person", "image": w.image, "faces": w.faces,
-            "matches": w.matches.iter().map(|m| json!({"box": norm_box(&m.bbox), "score": num(m.score), "reference": m.reference}))
-                .collect::<Vec<_>>()}),
+        Reading::FaceRecognition(w) => json!({"kind": "face_recognition", "image": w.image, "faces": w.faces,
+            "matches": w.matches.iter().map(|m| json!({"box": norm_box(&m.bbox), "score": num(m.score), "collection": m.collection,
+                "reference": m.reference, "name": m.name, "label": m.label})).collect::<Vec<_>>()}),
         _ => json!({"kind": "unknown", "raw": r.raw()}),
     }
 }
@@ -1420,6 +1484,19 @@ fn check_outcome(spec: &Value, result: &OutcomeRef<'_>, path: &str) -> Result<()
             check_results_outcome(spec, r, path)
         }
         ("checked", Outcome::Checked) => Ok(()),
+        ("collection" | "item" | "item_page" | "deleted", Outcome::Collection(v)) => {
+            matches(spec.get(kind).unwrap_or(&empty), v, &format!("{path}.{kind}"))
+        }
+        ("collections", Outcome::CollectionList(list)) => {
+            let exp = spec.get("collections").and_then(Value::as_array).cloned().unwrap_or_default();
+            if exp.len() != list.len() {
+                return Err(Fail(format!("{path}: expected {} collections, got {}", exp.len(), list.len())));
+            }
+            exp.iter()
+                .zip(list)
+                .enumerate()
+                .try_for_each(|(i, (e, got))| matches(e, got, &format!("{path}.collections[{i}]")))
+        }
         #[cfg(feature = "sessions")]
         ("session", Outcome::Session(s)) => {
             matches(spec.get("session").unwrap_or(&empty), &norm_session(s), &format!("{path}.session"))
@@ -1847,7 +1924,9 @@ fn run_response(ctx: &Ctx, driver: Driver, case: &Value) -> Result<(), Fail> {
             o => Err(Fail(format!("expected a raw body, got {}", describe(o)))),
         }
     } else if let Some(kind) =
-        ["batch", "batch_page", "batch_results", "session"].into_iter().find(|k| exp.get(*k).is_some())
+        ["batch", "batch_page", "batch_results", "session", "collection", "collections", "item", "item_page", "deleted"]
+            .into_iter()
+            .find(|k| exp.get(*k).is_some())
     {
         check(kind)
     } else if let Some(ids) = exp.get("upload_ids") {

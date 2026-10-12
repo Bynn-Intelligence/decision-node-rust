@@ -52,6 +52,7 @@ pub mod blocking;
 mod booster;
 mod check;
 mod client;
+mod collections;
 pub mod error;
 mod http;
 mod image;
@@ -69,13 +70,14 @@ pub use batch::{
 };
 pub use booster::{
     AgeReading, AiGeneratedReading, Booster, BoosterStatus, Evidence, FaceBox, FaceDetection, FaceDetectionReading,
-    OcrReading, Reading, TopGenerator, UnknownReading, WantedMatch, WantedPersonReading,
+    FaceMatch, FaceRecognitionReading, OcrReading, Reading, TopGenerator, UnknownReading,
 };
 pub use client::{
     gate_questions, CallOptions, ClientBuilder, DecideRequest, DecisionNode, Sleeper, DEFAULT_BASE_URL,
     DEFAULT_CONCURRENCY, DEFAULT_INLINE_THRESHOLD, DEFAULT_MAX_RETRIES, DEFAULT_MODEL, DEFAULT_OCR_TIMEOUT,
     DEFAULT_TIMEOUT, DEFAULT_UPLOAD_TIMEOUT, MAX_BODY_BYTES,
 };
+pub use collections::Collections;
 pub use error::{DecisionNodeError, Error, ErrorKind, Result};
 pub use http::HttpSettings;
 pub use image::Image;

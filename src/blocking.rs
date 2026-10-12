@@ -194,6 +194,12 @@ impl DecisionNode {
         self.run(self.client.upload(images))
     }
 
+    /// The workspace's collections of faces. See
+    /// [`crate::DecisionNode::collections`].
+    pub fn collections(&self) -> Collections<'_> {
+        Collections { client: self }
+    }
+
     /// The Batch API. See [`crate::DecisionNode::batches`].
     pub fn batches(&self) -> Batches<'_> {
         Batches { client: self }
@@ -212,6 +218,60 @@ impl DecisionNode {
         timeout: Duration,
     ) -> Result<BatchRun> {
         self.run(self.client.run_batch_with(requests, poll_interval, timeout))
+    }
+}
+
+/// The collections of a blocking client. See [`crate::Collections`].
+#[derive(Clone, Copy, Debug)]
+pub struct Collections<'a> {
+    client: &'a DecisionNode,
+}
+
+impl Collections<'_> {
+    /// See [`crate::Collections::create`].
+    pub fn create(&self, name: impl Into<String>) -> Result<Value> {
+        self.client.run(self.client.client.collections().create(name))
+    }
+
+    /// See [`crate::Collections::create_with_type`].
+    pub fn create_with_type(&self, name: impl Into<String>, collection_type: impl Into<String>) -> Result<Value> {
+        self.client.run(self.client.client.collections().create_with_type(name, collection_type))
+    }
+
+    /// See [`crate::Collections::list`].
+    pub fn list(&self) -> Result<Vec<Value>> {
+        self.client.run(self.client.client.collections().list())
+    }
+
+    /// See [`crate::Collections::get`].
+    pub fn get(&self, collection_id: &str) -> Result<Value> {
+        self.client.run(self.client.client.collections().get(collection_id))
+    }
+
+    /// See [`crate::Collections::delete`].
+    pub fn delete(&self, collection_id: &str) -> Result<Value> {
+        self.client.run(self.client.client.collections().delete(collection_id))
+    }
+
+    /// See [`crate::Collections::enroll`].
+    pub fn enroll(
+        &self,
+        collection_id: &str,
+        image: Image,
+        reference: impl Into<String>,
+        label: Option<&str>,
+    ) -> Result<Value> {
+        self.client.run(self.client.client.collections().enroll(collection_id, image, reference, label))
+    }
+
+    /// See [`crate::Collections::list_items`].
+    pub fn list_items(&self, collection_id: &str, offset: Option<i64>, limit: Option<i64>) -> Result<Value> {
+        self.client.run(self.client.client.collections().list_items(collection_id, offset, limit))
+    }
+
+    /// See [`crate::Collections::delete_item`].
+    pub fn delete_item(&self, collection_id: &str, item_id: &str) -> Result<Value> {
+        self.client.run(self.client.client.collections().delete_item(collection_id, item_id))
     }
 }
 

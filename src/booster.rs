@@ -261,8 +261,8 @@ pub enum Reading {
     Ocr(OcrReading),
     /// A reading of the `face_detection` booster.
     FaceDetection(FaceDetectionReading),
-    /// A reading of the `wanted_person` booster.
-    WantedPerson(WantedPersonReading),
+    /// A reading of the `face_recognition` booster.
+    FaceRecognition(FaceRecognitionReading),
     /// A reading of a booster this version does not know, or a malformed
     /// reading.
     Unknown(UnknownReading),
@@ -341,30 +341,39 @@ pub struct FaceDetection {
     pub confidence: f64,
 }
 
-/// A reading of the `wanted_person` booster, its fields as sent.
+/// A reading of the `face_recognition` booster: the faces of a picture
+/// searched in a collection, and the ones that match an enrolled face. The
+/// booster's `collection` and `threshold` options are sent as given and
+/// checked by the API.
 #[derive(Clone, Debug, PartialEq)]
 #[non_exhaustive]
-pub struct WantedPersonReading {
+pub struct FaceRecognitionReading {
     /// The id of the image read.
     pub image: String,
-    /// The `faces` count as sent. It may be more than `matches` lists.
+    /// How many faces were searched. It may be more than `matches` lists.
     pub faces: u64,
-    /// The `matches`, in the order sent.
-    pub matches: Vec<WantedMatch>,
+    /// The faces that match an enrolled one, in the order sent.
+    pub matches: Vec<FaceMatch>,
     /// The reading as received.
     pub raw: Value,
 }
 
-/// One entry of a [`WantedPersonReading`]'s matches.
+/// One match of a [`FaceRecognitionReading`].
 #[derive(Clone, Debug, PartialEq)]
 #[non_exhaustive]
-pub struct WantedMatch {
-    /// Its box.
+pub struct FaceMatch {
+    /// Where the face is in the picture.
     pub bbox: FaceBox,
-    /// Its `score`, as sent.
+    /// How closely it matches the enrolled face, as sent.
     pub score: f64,
-    /// Its `reference`, as sent.
+    /// The collection the enrolled face is in.
+    pub collection: String,
+    /// The enrolled face's reference.
     pub reference: String,
+    /// The enrolled person's name, when the collection names it.
+    pub name: Option<String>,
+    /// The enrolled face's label, when it has one.
+    pub label: Option<String>,
 }
 
 /// A face's box: its top-left and bottom-right corners, exactly as sent (in
@@ -442,7 +451,7 @@ impl Reading {
             "ai_generated" => Self::parse_ai_generated(obj, &raw),
             "ocr" => Self::parse_ocr(obj, &raw),
             "face_detection" => Self::parse_face_detection(obj, &raw),
-            "wanted_person" => Self::parse_wanted_person(obj, &raw),
+            "face_recognition" => Self::parse_face_recognition(obj, &raw),
             _ => None,
         });
         known.unwrap_or_else(|| Reading::Unknown(UnknownReading { booster: booster.to_owned(), raw }))
@@ -466,21 +475,29 @@ impl Reading {
         }))
     }
 
-    fn parse_wanted_person(obj: &Map<String, Value>, raw: &Value) -> Option<Reading> {
+    fn parse_face_recognition(obj: &Map<String, Value>, raw: &Value) -> Option<Reading> {
+        // `name` and `label` may be absent or null; present, they are strings.
+        let text = |m: &Map<String, Value>, k: &str| match m.get(k) {
+            None | Some(Value::Null) => Some(None),
+            Some(v) => v.as_str().map(|s| Some(s.to_owned())),
+        };
         let matches = obj
             .get("matches")?
             .as_array()?
             .iter()
             .map(|m| {
                 let m = m.as_object()?;
-                Some(WantedMatch {
+                Some(FaceMatch {
                     bbox: face_box(m.get("box"))?,
                     score: m.get("score")?.as_f64()?,
+                    collection: m.get("collection")?.as_str()?.to_owned(),
                     reference: m.get("reference")?.as_str()?.to_owned(),
+                    name: text(m, "name")?,
+                    label: text(m, "label")?,
                 })
             })
             .collect::<Option<Vec<_>>>()?;
-        Some(Reading::WantedPerson(WantedPersonReading {
+        Some(Reading::FaceRecognition(FaceRecognitionReading {
             image: obj.get("image")?.as_str()?.to_owned(),
             faces: obj.get("faces")?.as_u64()?,
             matches,
@@ -565,10 +582,10 @@ impl Reading {
         }
     }
 
-    /// The wanted person reading, if this is one.
-    pub fn as_wanted_person(&self) -> Option<&WantedPersonReading> {
+    /// The face recognition reading, if this is one.
+    pub fn as_face_recognition(&self) -> Option<&FaceRecognitionReading> {
         match self {
-            Reading::WantedPerson(r) => Some(r),
+            Reading::FaceRecognition(r) => Some(r),
             _ => None,
         }
     }
@@ -588,7 +605,7 @@ impl Reading {
             Reading::AiGenerated(r) => Some(&r.image),
             Reading::Ocr(r) => Some(&r.image),
             Reading::FaceDetection(r) => Some(&r.image),
-            Reading::WantedPerson(r) => Some(&r.image),
+            Reading::FaceRecognition(r) => Some(&r.image),
             Reading::Unknown(r) => r.raw.get("image").and_then(Value::as_str),
         }
     }
@@ -600,7 +617,7 @@ impl Reading {
             Reading::AiGenerated(r) => &r.raw,
             Reading::Ocr(r) => &r.raw,
             Reading::FaceDetection(r) => &r.raw,
-            Reading::WantedPerson(r) => &r.raw,
+            Reading::FaceRecognition(r) => &r.raw,
             Reading::Unknown(r) => &r.raw,
         }
     }
@@ -697,12 +714,18 @@ mod tests {
                 {"image": "g", "faces": 1, "detections": [{"box": b}]},
                 {"image": 7, "faces": 1, "detections": []}
             ]},
-            "wanted_person": {"version": "wanted_person-v1", "status": "ok", "latency_ms": 60, "billed_calls": 1, "results": [
-                {"image": "door", "faces": 2, "matches": [{"box": b, "score": 0.91, "reference": "wanted:2024-12345"}]},
-                {"image": "x", "faces": 1, "matches": [{"box": b, "score": "0.9", "reference": "r"}]},
-                {"image": "y", "faces": 1, "matches": [{"box": b, "score": 0.9}]},
-                {"image": "z", "faces": 1, "matches": [{"box": b, "score": 0.9, "reference": 5}]},
-                {"image": "w", "faces": 1}
+            "face_recognition": {"version": "face_recognition-v1", "status": "ok", "latency_ms": 60, "billed_calls": 1, "results": [
+                {"image": "door", "faces": 2, "matches": [
+                    {"box": b, "score": 0.91, "collection": "col_1", "reference": "emp-1042", "name": "Ada", "label": null},
+                    {"box": b, "score": 0.74, "collection": "celebrities", "reference": "c-7"}]},
+                {"image": "x", "faces": 1, "matches": [{"box": b, "score": "0.9", "collection": "c", "reference": "r"}]},
+                {"image": "y", "faces": 1, "matches": [{"box": b, "score": 0.9, "collection": "c"}]},
+                {"image": "z", "faces": 1, "matches": [{"box": b, "score": 0.9, "collection": "c", "reference": 5}]},
+                {"image": "v", "faces": 1, "matches": [{"box": b, "score": 0.9, "reference": "r"}]},
+                {"image": "u", "faces": 1, "matches": [{"box": b, "score": 0.9, "collection": "c", "reference": "r", "name": 3}]},
+                {"image": "t", "faces": 1, "matches": [{"box": b, "score": 0.9, "collection": "c", "reference": "r", "label": false}]},
+                {"image": "w", "faces": 1},
+                {"image": "s", "matches": []}
             ]}
         });
         let ev = evidence_from_body(Some(&body)).unwrap();
@@ -715,17 +738,20 @@ mod tests {
         for (i, reading) in fd.iter().enumerate().skip(2) {
             assert!(matches!(reading, Reading::Unknown(u) if u.booster == "face_detection"), "{i}");
         }
-        let wp = &ev["wanted_person"].results;
-        let w = wp[0].as_wanted_person().unwrap();
+        let fr = &ev["face_recognition"].results;
+        let w = fr[0].as_face_recognition().unwrap();
+        assert_eq!((w.image.as_str(), w.faces, w.matches.len()), ("door", 2, 2));
+        let m = &w.matches[0];
         assert_eq!(
-            (w.image.as_str(), w.faces, w.matches[0].score, w.matches[0].reference.as_str()),
-            ("door", 2, 0.91, "wanted:2024-12345")
+            (m.score, m.collection.as_str(), m.reference.as_str(), m.name.as_deref(), m.label.as_deref()),
+            (0.91, "col_1", "emp-1042", Some("Ada"), None)
         );
-        assert_eq!(w.matches[0].bbox.y1, 20.5);
-        for (i, reading) in wp.iter().enumerate().skip(1) {
-            assert!(matches!(reading, Reading::Unknown(u) if u.booster == "wanted_person"), "{i}");
+        assert_eq!(m.bbox.y1, 20.5);
+        assert_eq!((w.matches[1].name.as_deref(), w.matches[1].collection.as_str()), (None, "celebrities"));
+        for (i, reading) in fr.iter().enumerate().skip(1) {
+            assert!(matches!(reading, Reading::Unknown(u) if u.booster == "face_recognition"), "{i}");
         }
-        assert_eq!(wp[0].image(), Some("door"));
+        assert_eq!(fr[0].image(), Some("door"));
     }
 
     #[test]
