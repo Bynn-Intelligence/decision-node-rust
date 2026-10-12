@@ -1,15 +1,16 @@
+# Runs only while the repository is public: nothing is analysed or published while it is private.
+# Push and branch protection events carry the visibility in their payload; a
+# scheduled run carries no repository, so its first job reads it from the API.
+#
 # OpenSSF Scorecard: an automated, weekly audit of this repo's supply-chain
-# security posture — Signed-Releases, Token-Permissions, Pinned-Dependencies,
-# Dangerous-Workflow, and more. publish_results feeds the badge in the README
-# and the public report at scorecard.dev; the SARIF upload surfaces findings in
-# this repo's Security tab.
+# security posture (Signed-Releases, Token-Permissions, Pinned-Dependencies,
+# Dangerous-Workflow, and more). publish_results feeds the public report at
+# scorecard.dev; the SARIF upload surfaces findings in this repo's Security
+# tab.
 #
 # Actions are pinned by commit SHA on purpose: Scorecard's own
 # Pinned-Dependencies check expects it, and it is the posture the rest of this
 # project's supply chain already takes.
-#
-# Runs only while the repository is public: nothing is bumped, tagged or
-# published while it is private, and no report is published.
 name: Scorecard
 
 on:
@@ -22,9 +23,24 @@ on:
 permissions: read-all
 
 jobs:
+  visibility:
+    name: Repository visibility
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      visibility: ${{ steps.read.outputs.visibility }}
+    steps:
+      - id: read
+        run: echo "visibility=$(gh api "repos/${GITHUB_REPOSITORY}" --jq .visibility)" >> "$GITHUB_OUTPUT"
+        env:
+          GH_TOKEN: ${{ github.token }}
+
   analysis:
     name: Scorecard analysis
-    if: github.event.repository.visibility == 'public'
+    needs: visibility
+    if: "!cancelled() && (github.event.repository.visibility == 'public' || needs.visibility.outputs.visibility == 'public')"
     runs-on: ubuntu-latest
     permissions:
       security-events: write # upload the SARIF result to code scanning
