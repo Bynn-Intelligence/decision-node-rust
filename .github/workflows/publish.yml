@@ -112,6 +112,10 @@ jobs:
           VERSION: ${{ steps.bump.outputs.version }}
         run: |
           set -- target/package/bynn-decisionnode-"$VERSION".crate
+          if grep -nE '\b(face_detection|face_recognition|wanted_person)\b' README.md; then
+            echo "::error::README.md names a booster the README does not list"
+            exit 1
+          fi
           python3 - "$@" <<'PY'
           # Fails when a file to publish holds an internal name, an internal
           # path or an attribution line. The names are kept only as SHA-256
