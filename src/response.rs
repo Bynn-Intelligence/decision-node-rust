@@ -36,6 +36,10 @@ pub enum Answer {
     Point(PointAnswer),
     /// The answer to a `box` question.
     Box(BoxAnswer),
+    /// The answer to a `point` question asked with `max`: several spots.
+    Points(PointsAnswer),
+    /// The answer to a `box` question asked with `max`: several rectangles.
+    Boxes(BoxesAnswer),
     /// An answer of a type this version does not know, or a known type with
     /// missing or wrongly typed fields.
     Unknown(UnknownAnswer),
@@ -156,6 +160,82 @@ pub struct BoxAnswer {
     pub raw: Value,
 }
 
+/// The answer to a `point` question asked with `max`: up to that many spots,
+/// left to right by their centre, every number exactly as sent.
+#[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
+pub struct PointsAnswer {
+    /// How many of what the instructions describe the image shows; it may be
+    /// more than `points` lists.
+    pub count: u64,
+    /// The probability that the image shows at least one.
+    pub present: f64,
+    /// The probability that `points` lists every one there is.
+    pub complete: f64,
+    /// The spots found, in the order sent.
+    pub points: Vec<PlacePoint>,
+    /// The id of the image looked in.
+    pub image: String,
+    /// The image's width in pixels.
+    pub width: f64,
+    /// The image's height in pixels.
+    pub height: f64,
+    /// The answer object as received.
+    pub raw: Value,
+}
+
+/// One spot of a [`PointsAnswer`], in the units of a [`PointAnswer`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[non_exhaustive]
+pub struct PlacePoint {
+    /// From the left.
+    pub x: f64,
+    /// From the top.
+    pub y: f64,
+    /// The probability that the spot lies on one of them.
+    pub confidence: f64,
+}
+
+/// The answer to a `box` question asked with `max`: up to that many
+/// rectangles, left to right by their centre, every number exactly as sent.
+#[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
+pub struct BoxesAnswer {
+    /// How many of what the instructions describe the image shows; it may be
+    /// more than `boxes` lists.
+    pub count: u64,
+    /// The probability that the image shows at least one.
+    pub present: f64,
+    /// The probability that `boxes` lists every one there is.
+    pub complete: f64,
+    /// The rectangles found, in the order sent.
+    pub boxes: Vec<PlaceBox>,
+    /// The id of the image looked in.
+    pub image: String,
+    /// The image's width in pixels.
+    pub width: f64,
+    /// The image's height in pixels.
+    pub height: f64,
+    /// The answer object as received.
+    pub raw: Value,
+}
+
+/// One rectangle of a [`BoxesAnswer`], in the units of a [`BoxAnswer`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[non_exhaustive]
+pub struct PlaceBox {
+    /// The top-left corner, from the left.
+    pub x1: f64,
+    /// The top-left corner, from the top.
+    pub y1: f64,
+    /// The bottom-right corner, from the left.
+    pub x2: f64,
+    /// The bottom-right corner, from the top.
+    pub y2: f64,
+    /// The probability that the rectangle holds one of them.
+    pub confidence: f64,
+}
+
 /// An answer of a type this version of the SDK does not know, or of a known
 /// type whose fields are missing or of the wrong type.
 #[derive(Clone, Debug, PartialEq)]
@@ -178,6 +258,8 @@ impl Answer {
             Answer::Number(_) => Some("number"),
             Answer::Point(_) => Some("point"),
             Answer::Box(_) => Some("box"),
+            Answer::Points(_) => Some("point"),
+            Answer::Boxes(_) => Some("box"),
             Answer::Unknown(o) => o.answer_type.as_deref(),
         }
     }
@@ -191,7 +273,27 @@ impl Answer {
             Answer::Number(a) => &a.raw,
             Answer::Point(a) => &a.raw,
             Answer::Box(a) => &a.raw,
+            Answer::Points(a) => &a.raw,
+            Answer::Boxes(a) => &a.raw,
             Answer::Unknown(a) => &a.raw,
+        }
+    }
+
+    /// The several-spots answer of a point question asked with `max`, if
+    /// this is one.
+    pub fn as_points(&self) -> Option<&PointsAnswer> {
+        match self {
+            Answer::Points(a) => Some(a),
+            _ => None,
+        }
+    }
+
+    /// The several-rectangles answer of a box question asked with `max`, if
+    /// this is one.
+    pub fn as_boxes(&self) -> Option<&BoxesAnswer> {
+        match self {
+            Answer::Boxes(a) => Some(a),
+            _ => None,
         }
     }
 
@@ -286,6 +388,9 @@ impl Answer {
             Some("choice") => Self::parse_choice(obj),
             Some("score") => Self::parse_score(obj),
             Some("number") => Self::parse_number(obj),
+            // A question asked with `max` is told by its answer's own list.
+            Some("point") if obj.contains_key("points") || obj.contains_key("boxes") => Self::parse_points(obj),
+            Some("box") if obj.contains_key("points") || obj.contains_key("boxes") => Self::parse_boxes(obj),
             Some("point") => Self::parse_point(obj),
             Some("box") => Self::parse_box(obj),
             _ => None,
@@ -308,6 +413,48 @@ impl Answer {
             .map(|(k, v)| v.as_f64().map(|p| (k.clone(), p)))
             .collect::<Option<_>>()?;
         Some(Answer::Number(NumberAnswer { number, expected, confidence, probabilities, raw: Value::Null }))
+    }
+
+    /// The fields a [`PointsAnswer`] and a [`BoxesAnswer`] share: `count`,
+    /// `present`, `complete`, `image`, `width` and `height`.
+    fn places_head(obj: &Map<String, Value>) -> Option<(u64, f64, f64, String, f64, f64)> {
+        let n = |k: &str| obj.get(k).and_then(Value::as_f64);
+        Some((
+            obj.get("count")?.as_u64()?,
+            n("present")?,
+            n("complete")?,
+            obj.get("image")?.as_str()?.to_owned(),
+            n("width")?,
+            n("height")?,
+        ))
+    }
+
+    fn parse_points(obj: &Map<String, Value>) -> Option<Answer> {
+        let (count, present, complete, image, width, height) = Self::places_head(obj)?;
+        let points = obj
+            .get("points")?
+            .as_array()?
+            .iter()
+            .map(|p| {
+                let n = |k: &str| p.as_object()?.get(k).and_then(Value::as_f64);
+                Some(PlacePoint { x: n("x")?, y: n("y")?, confidence: n("confidence")? })
+            })
+            .collect::<Option<Vec<_>>>()?;
+        Some(Answer::Points(PointsAnswer { count, present, complete, points, image, width, height, raw: Value::Null }))
+    }
+
+    fn parse_boxes(obj: &Map<String, Value>) -> Option<Answer> {
+        let (count, present, complete, image, width, height) = Self::places_head(obj)?;
+        let boxes = obj
+            .get("boxes")?
+            .as_array()?
+            .iter()
+            .map(|b| {
+                let n = |k: &str| b.as_object()?.get(k).and_then(Value::as_f64);
+                Some(PlaceBox { x1: n("x1")?, y1: n("y1")?, x2: n("x2")?, y2: n("y2")?, confidence: n("confidence")? })
+            })
+            .collect::<Option<Vec<_>>>()?;
+        Some(Answer::Boxes(BoxesAnswer { count, present, complete, boxes, image, width, height, raw: Value::Null }))
     }
 
     fn parse_point(obj: &Map<String, Value>) -> Option<Answer> {
@@ -378,6 +525,8 @@ impl Answer {
             Answer::Number(a) => a.raw = raw,
             Answer::Point(a) => a.raw = raw,
             Answer::Box(a) => a.raw = raw,
+            Answer::Points(a) => a.raw = raw,
+            Answer::Boxes(a) => a.raw = raw,
             Answer::Unknown(a) => a.raw = raw,
         }
         self
@@ -819,6 +968,35 @@ mod tests {
         assert_eq!(m[1].adapter_version, Some(3));
         assert_eq!(m[1].status.as_deref(), Some("deployed"));
         assert_eq!(m[1].limits.get("version"), Some(&json!("decisionnode-flash@acme/fraud:3")));
+    }
+
+    #[test]
+    fn several_places_are_told_by_their_list() {
+        let body = json!({"answers": {
+            "cars": {"type": "box", "count": 3, "present": 0.99, "complete": 0.62, "image": "lot", "width": 1920, "height": 1080,
+                "boxes": [{"x1": 10, "y1": 20, "x2": 110, "y2": 90.5, "confidence": 0.9}, {"x1": 300, "y1": 40, "x2": 420, "y2": 130, "confidence": 0.71}]},
+            "pins": {"type": "point", "count": 0, "present": 0.02, "complete": 0.97, "image": "lot", "width": 1920, "height": 1080, "points": []},
+            "spots": {"type": "point", "count": 1, "present": 0.9, "complete": 0.8, "image": "lot", "width": 2, "height": 2,
+                "points": [{"x": 0.25, "y": 0.5, "confidence": 0.8}]},
+            "crossed": {"type": "point", "count": 1, "present": 0.9, "complete": 0.8, "image": "lot", "width": 2, "height": 2, "boxes": []},
+            "negative": {"type": "box", "count": -1, "present": 0.9, "complete": 0.8, "image": "lot", "width": 2, "height": 2, "boxes": []},
+            "no_complete": {"type": "box", "count": 1, "present": 0.9, "image": "lot", "width": 2, "height": 2, "boxes": []},
+            "bad_corner": {"type": "box", "count": 1, "present": 0.9, "complete": 0.8, "image": "lot", "width": 2, "height": 2,
+                "boxes": [{"x1": 1, "y1": 1, "x2": "2", "y2": 2, "confidence": 0.5}]},
+            "not_a_list": {"type": "point", "count": 1, "present": 0.9, "complete": 0.8, "image": "lot", "width": 2, "height": 2, "points": {}}
+        }});
+        let d = Decision::from_response(body, 200, &HeaderMap::new()).unwrap();
+        let cars = d["cars"].as_boxes().unwrap();
+        assert_eq!((cars.count, cars.present, cars.complete, cars.boxes.len()), (3, 0.99, 0.62, 2));
+        assert_eq!((cars.boxes[0].x1, cars.boxes[0].y2, cars.boxes[1].confidence), (10.0, 90.5, 0.71));
+        assert_eq!(d["cars"].answer_type(), Some("box"));
+        let pins = d["pins"].as_points().unwrap();
+        assert_eq!((pins.count, pins.points.len(), pins.complete), (0, 0, 0.97));
+        let spot = d["spots"].as_points().unwrap().points[0];
+        assert_eq!((spot.x, spot.y, spot.confidence), (0.25, 0.5, 0.8));
+        for id in ["crossed", "negative", "no_complete", "bad_corner", "not_a_list"] {
+            assert!(matches!(d[id], Answer::Unknown(_)), "{id}");
+        }
     }
 
     #[test]

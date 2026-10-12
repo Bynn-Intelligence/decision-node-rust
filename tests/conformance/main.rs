@@ -453,6 +453,20 @@ fn build_number(args: &Value) -> Number {
 fn build_place(kind: &str, args: &Value) -> Question {
     let image = opt(args, "image").and_then(Value::as_str);
     let units = opt(args, "units").and_then(Value::as_str);
+    let max = opt(args, "max");
+    // The builders take `max` as a whole number; a case that gives another
+    // value goes as the wire-form question, which is checked the same.
+    let most = max.and_then(Value::as_u64).and_then(|n| u32::try_from(n).ok());
+    if max.is_some() && most.is_none() {
+        let mut q = serde_json::Map::new();
+        q.insert("type".into(), json!(kind));
+        for k in ["instructions", "image", "units", "max"] {
+            if let Some(v) = opt(args, k) {
+                q.insert(k.into(), v.clone());
+            }
+        }
+        return Value::Object(q).into();
+    }
     if kind == "point" {
         let mut p = Point::new();
         if let Some(i) = opt(args, "instructions") {
@@ -463,6 +477,9 @@ fn build_place(kind: &str, args: &Value) -> Question {
         }
         if let Some(u) = units {
             p = p.units(u);
+        }
+        if let Some(n) = most {
+            p = p.max(n);
         }
         return p.into();
     }
@@ -475,6 +492,9 @@ fn build_place(kind: &str, args: &Value) -> Question {
     }
     if let Some(u) = units {
         b = b.units(u);
+    }
+    if let Some(n) = most {
+        b = b.max(n);
     }
     b.into()
 }
@@ -1063,6 +1083,15 @@ fn norm_answer(a: &decisionnode::Answer) -> Value {
     } else if let Some(b) = a.as_box() {
         json!({"kind": "box", "x1": num(b.x1), "y1": num(b.y1), "x2": num(b.x2), "y2": num(b.y2), "present": num(b.present),
             "confidence": num(b.confidence), "image": b.image, "width": num(b.width), "height": num(b.height)})
+    } else if let Some(p) = a.as_points() {
+        json!({"kind": "points", "count": p.count, "present": num(p.present), "complete": num(p.complete),
+            "points": p.points.iter().map(|s| json!({"x": num(s.x), "y": num(s.y), "confidence": num(s.confidence)})).collect::<Vec<_>>(),
+            "image": p.image, "width": num(p.width), "height": num(p.height)})
+    } else if let Some(b) = a.as_boxes() {
+        json!({"kind": "boxes", "count": b.count, "present": num(b.present), "complete": num(b.complete),
+            "boxes": b.boxes.iter().map(|r| json!({"x1": num(r.x1), "y1": num(r.y1), "x2": num(r.x2), "y2": num(r.y2),
+                "confidence": num(r.confidence)})).collect::<Vec<_>>(),
+            "image": b.image, "width": num(b.width), "height": num(b.height)})
     } else {
         json!({"kind": "unknown", "type": a.answer_type(), "raw": a.raw()})
     }

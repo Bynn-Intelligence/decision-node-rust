@@ -486,6 +486,7 @@ struct Place {
     instructions: Option<Result<Value, String>>,
     image: Option<String>,
     units: Option<String>,
+    max: Option<u32>,
 }
 
 impl Place {
@@ -499,6 +500,9 @@ impl Place {
             if let Some(v) = value {
                 q.insert(name.into(), Value::String(v));
             }
+        }
+        if let Some(most) = self.max {
+            q.insert("max".into(), most.into());
         }
         Ok(Value::Object(q))
     }
@@ -551,6 +555,14 @@ impl Point {
         self.0.units = Some(units.into());
         self
     }
+
+    /// Asks for up to `max` spots (2 to 16) instead of one: the answer is
+    /// then a [`crate::PointsAnswer`], with `count`, `present`, `complete`
+    /// and the spots found.
+    pub fn max(mut self, max: u32) -> Point {
+        self.0.max = Some(max);
+        self
+    }
 }
 
 /// A `box` question: a rectangle in an image, answered by a
@@ -598,6 +610,14 @@ impl BoundingBox {
         self.0.units = Some(units.into());
         self
     }
+
+    /// Asks for up to `max` rectangles (2 to 16) instead of one: the answer
+    /// is then a [`crate::BoxesAnswer`], with `count`, `present`, `complete`
+    /// and the rectangles found.
+    pub fn max(mut self, max: u32) -> BoundingBox {
+        self.0.max = Some(max);
+        self
+    }
 }
 
 #[cfg(test)]
@@ -613,6 +633,12 @@ mod tests {
             json!({"type": "box", "instructions": "Where?", "image": "belt", "units": "normalized"})
         );
         assert_eq!(wire(Point::new().image("a")), json!({"type": "point", "image": "a"}));
+        // `max` is sent only when given.
+        assert_eq!(wire(point("Cars?").max(8)), json!({"type": "point", "instructions": "Cars?", "max": 8}));
+        assert_eq!(
+            wire(bounding_box("Cars?").image("lot").max(16)),
+            json!({"type": "box", "instructions": "Cars?", "image": "lot", "max": 16})
+        );
     }
 
     fn wire(q: impl Into<Question>) -> Value {

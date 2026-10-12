@@ -21,6 +21,9 @@ pub(crate) const MAX_SCORE_LEVELS: u64 = 10;
 /// The most values of a number grid.
 pub(crate) const MAX_GRID_VALUES: u64 = 4096;
 /// The most objects and arrays inside each other in a body.
+/// The fewest and the most places a point or box question asks for with `max`.
+const PLACES_MIN: i128 = 2;
+const PLACES_MAX: i128 = 16;
 pub(crate) const MAX_NESTING: usize = 128;
 /// The largest session window.
 #[cfg(feature = "sessions")]
@@ -239,6 +242,29 @@ fn check_place(
                 units,
                 Some(json!({"expected": "'pixels' or 'normalized'"})),
             ));
+        }
+    }
+    // Several places: `max` a whole number from 2 to 16 (decided 2026-10-12).
+    // Whether the model serves them is the server's to judge.
+    if let Some(most) = obj.get("max").filter(|v| !v.is_null()) {
+        let at = with(loc, "max");
+        match most.as_i64().map(i128::from).or_else(|| most.as_u64().map(i128::from)) {
+            None => entries.push(entry("int_type", &at, "Input should be a valid integer", most, None)),
+            Some(n) if n < PLACES_MIN => entries.push(entry(
+                "greater_than_equal",
+                &at,
+                format!("Input should be greater than or equal to {PLACES_MIN}"),
+                most,
+                Some(json!({"ge": PLACES_MIN})),
+            )),
+            Some(n) if n > PLACES_MAX => entries.push(entry(
+                "less_than_equal",
+                &at,
+                format!("Input should be less than or equal to {PLACES_MAX}"),
+                most,
+                Some(json!({"le": PLACES_MAX})),
+            )),
+            Some(_) => {}
         }
     }
     if obj.get("instructions").is_none_or(Value::is_null) {

@@ -1560,6 +1560,31 @@ mod tests {
             (e.kind(), e.error_type(), e.message()),
             (ErrorKind::BadRequest, None, "Point question must have instructions: pick")
         );
+        // Several places: `max` a whole number from 2 to 16, after the image and units.
+        assert!(super::tests::body(one().question("cars", bounding_box("Cars?").max(2))).is_ok());
+        assert!(super::tests::body(one().question("cars", point("Cars?").max(16))).is_ok());
+        let max = |q: Value| {
+            let e = super::tests::body(one().question("cars", q)).unwrap_err();
+            assert_eq!((e.kind(), e.status(), e.request_id()), (ErrorKind::Validation, None, None));
+            e.entries().unwrap().to_vec()
+        };
+        for bad in [json!(2.5), json!("8"), json!(true)] {
+            let got = max(json!({"type": "box", "instructions": "?", "max": bad}));
+            assert_eq!(
+                got,
+                [json!({"type": "int_type", "loc": ["body", "questions", "cars", "box", "max"],
+                    "msg": "Input should be a valid integer", "input": bad})]
+            );
+        }
+        let low = max(json!({"type": "point", "instructions": "?", "max": 1}));
+        assert_eq!(low[0]["type"], "greater_than_equal");
+        assert_eq!(low[0]["ctx"], json!({"ge": 2}));
+        assert_eq!(low[0]["msg"], "Input should be greater than or equal to 2");
+        let high = max(json!({"type": "point", "instructions": "?", "max": 17}));
+        assert_eq!((high[0]["type"].clone(), high[0]["ctx"].clone()), (json!("less_than_equal"), json!({"le": 16})));
+        let order = max(json!({"type": "box", "instructions": "?", "units": "inches", "max": 0}));
+        let kinds: Vec<&str> = order.iter().map(|x| x["type"].as_str().unwrap()).collect();
+        assert_eq!(kinds, ["literal_error", "greater_than_equal"]);
     }
 
     #[test]
