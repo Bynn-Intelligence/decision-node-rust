@@ -15,7 +15,7 @@ env:
   # The conformance suite commit this crate targets (suite 1.12, for
   # specification 1.3). Moving to a newer suite is a reviewed change to this
   # one line.
-  CONFORMANCE_REF: 72503ac0c7f79a1e74fc6f6ed125ad3cbff33958
+  CONFORMANCE_REF: 4e7c1ed89c01a920e6dec0f20abd0b8b52652f99
 
 # Every action is pinned to a full commit SHA, with its tag or branch in a
 # comment, and no checkout leaves credentials in the working copy.

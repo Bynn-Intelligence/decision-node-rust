@@ -877,6 +877,24 @@ mod tests {
         assert!(check_session_open(open.as_object().unwrap(), 3, &Limits::default()).is_ok());
     }
 
+    #[cfg(feature = "sessions")]
+    #[test]
+    fn a_session_open_checks_the_range_of_max() {
+        let open =
+            |most: Value| json!({"questions": {"cars": {"type": "box", "instructions": "Every car.", "max": most}}});
+        assert!(check_session_open(open(json!(8)).as_object().unwrap(), 4, &Limits::default()).is_ok());
+        for (most, kind) in [(json!(1), "greater_than_equal"), (json!(17), "less_than_equal"), (json!(2.5), "int_type")]
+        {
+            let e = check_session_open(open(most).as_object().unwrap(), 4, &Limits::default()).unwrap_err();
+            assert_eq!(e.kind(), ErrorKind::Validation);
+            let entry = &e.entries().unwrap()[0];
+            assert_eq!(
+                (entry["type"].as_str(), &entry["loc"]),
+                (Some(kind), &json!(["body", "questions", "cars", "box", "max"]))
+            );
+        }
+    }
+
     #[test]
     fn held_limits_by_alias_or_version() {
         let mut held = HashMap::new();
