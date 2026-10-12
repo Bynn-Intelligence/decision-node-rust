@@ -1,12 +1,11 @@
+# Runs only while the repository is public (nothing is bumped, tagged or published while it is private), and checks the files to publish for internal names before anything is pushed or published.
+#
 # Auto-release bynn-decisionnode on every push to main: bump the patch in
 # Cargo.toml, run the checks, package the crate, attest it, push the bump
 # commit and tag back to main, publish to crates.io, and cut the GitHub
 # release. The push back uses the default GITHUB_TOKEN, which does not
 # retrigger this workflow, and the bump commit carries [skip publish] as a
 # second guard.
-#
-# Runs only while the repository is public: nothing is bumped, tagged or
-# published while it is private.
 #
 # To ship without cutting a release (docs, CI tweaks), put [skip publish] in
 # the commit message.
@@ -106,6 +105,76 @@ jobs:
           echo "version=${NEW}" >> "$GITHUB_OUTPUT"
 
       - run: cargo package --locked --no-verify
+
+      - name: Check the files to publish for internal names
+        shell: bash
+        env:
+          VERSION: ${{ steps.bump.outputs.version }}
+        run: |
+          set -- target/package/bynn-decisionnode-"$VERSION".crate
+          python3 - "$@" <<'PY'
+          # Fails when a file to publish holds an internal name, an internal
+          # path or an attribution line. The names are kept only as SHA-256
+          # digests of each lowercase word, so this file does not spell them.
+          import base64, binascii, hashlib, io, re, sys, tarfile, zipfile
+          DIGESTS = {
+              "9e9b2efac0b62e4cf6f08cc6b7095e6ad7e18c447458c5849accb698f7149ef3",
+              "934a11e602682e862b4b4d1f881ae8da1e097e3f6964bd780e5bb1fb798a6fdd",
+              "b7933ed6180d9e2895a9d2df885e2a8b92e998a3c16297581f5b8698daacf492",
+              "31d1b3d540ecf85228db7797efbe7d198ec5406abd3f6e64f27f684e9a312d29",
+              "2e0b8d61fa2a6959d254b6ff5d0fb512249329097336a35568089933b49abdde",
+          }
+          PLAIN = re.compile(rb"docs/[0-9]{2}|backend/[0-9]{2}|products/|/users/|co-authored-by|generated with")
+          WORD = re.compile(rb"[a-z0-9]+")
+          B64 = re.compile(rb"[A-Za-z0-9+/]{8,}={0,2}")
+
+          def named(text):
+              return any(hashlib.sha256(w).hexdigest() in DIGESTS for w in set(WORD.findall(text.lower())))
+
+          def faults(data):
+              # Bytes as they are, and as UTF-16 for the strings of a .NET assembly.
+              views = [data, data.decode("utf-16-le", "ignore").encode("utf-8", "ignore")]
+              found = set()
+              for view in views:
+                  if named(view):
+                      found.add("an internal name")
+                  for token in B64.findall(view):
+                      try:
+                          decoded = base64.b64decode(token + b"=" * (-len(token) % 4), validate=True)
+                      except (binascii.Error, ValueError):
+                          continue
+                      if named(decoded):
+                          found.add("an internal name in base64")
+                  match = PLAIN.search(view.lower())
+                  if match:
+                      found.add(match.group(0).decode("ascii", "replace"))
+              return found
+
+          def members(path, data):
+              if zipfile.is_zipfile(io.BytesIO(data)):
+                  with zipfile.ZipFile(io.BytesIO(data)) as archive:
+                      for name in archive.namelist():
+                          yield from members(f"{path}!{name}", archive.read(name))
+              elif path.endswith((".crate", ".tar.gz", ".tgz")):
+                  with tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as archive:
+                      for member in archive.getmembers():
+                          if member.isfile():
+                              yield from members(f"{path}!{member.name}", archive.extractfile(member).read())
+              else:
+                  yield path, data
+
+          bad = 0
+          checked = 0
+          for path in sys.argv[1:]:
+              with open(path, "rb") as handle:
+                  for name, data in members(path, handle.read()):
+                      checked += 1
+                      for fault in sorted(faults(data)):
+                          print(f"::error::{name} holds {fault}")
+                          bad += 1
+          print(f"{checked} files checked")
+          sys.exit(1 if bad or not checked else 0)
+          PY
 
       # Sigstore build provenance over the exact .crate that is uploaded.
       - uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
