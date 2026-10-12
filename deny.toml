@@ -1,0 +1,40 @@
+# cargo-deny: licences, advisories, bans and sources for the dependency tree.
+# Run with `cargo deny check`.
+
+[graph]
+all-features = true
+
+[advisories]
+version = 2
+yanked = "deny"
+
+[licenses]
+version = 2
+confidence-threshold = 0.9
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Zlib",
+]
+# The list above is a policy, not an inventory: a permitted licence no crate
+# uses today is not an error.
+unused-allowed-license = "allow"
+# Mozilla's root certificate bundle, pulled in by the HTTP client's TLS roots,
+# is published as data under the Community Data License Agreement. The
+# exception is scoped to that one crate.
+exceptions = [
+    { crate = "webpki-roots", allow = ["CDLA-Permissive-2.0"] },
+]
+
+[bans]
+multiple-versions = "allow"
+wildcards = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

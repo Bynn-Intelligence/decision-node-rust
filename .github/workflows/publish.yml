@@ -1,0 +1,133 @@
+# Auto-release bynn-decisionnode on every push to main: bump the patch in
+# Cargo.toml, run the checks, package the crate, attest it, push the bump
+# commit and tag back to main, publish to crates.io, and cut the GitHub
+# release. The push back uses the default GITHUB_TOKEN, which does not
+# retrigger this workflow, and the bump commit carries [skip publish] as a
+# second guard.
+#
+# Runs only while the repository is public: nothing is bumped, tagged or
+# published while it is private.
+#
+# To ship without cutting a release (docs, CI tweaks), put [skip publish] in
+# the commit message.
+#
+# The version in Cargo.toml is released as it stands while neither crates.io
+# nor a tag knows it yet; after that every run bumps the patch first.
+#
+# Two jobs. `verify` compiles and runs everything (clippy, the unit and doc
+# tests, cargo deny, cargo audit) with a read-only token; the conformance
+# suite runs in ci.yml. `publish` holds the write, OIDC and attestation
+# permissions and runs no third-party build code: it bumps the version,
+# packages and publishes with --no-verify (the tree was just verified one job
+# earlier), and its checkout keeps no credential on disk.
+#
+# Publishes via crates.io trusted publishing bound to the crates-io-publish
+# environment: no CARGO_REGISTRY_TOKEN secret, no stored credential.
+# crates-io-auth-action exchanges the workflow's OIDC id-token for a
+# short-lived publish token that its post-step revokes. The packaged .crate is
+# also attested with Sigstore build provenance (verifiable with
+# `gh attestation verify`). Requires this repository, this workflow file and
+# the environment to be registered as a trusted publisher on crates.io.
+name: Publish to crates.io
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: publish
+  cancel-in-progress: false
+
+permissions: read-all
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  verify:
+    # Only main is released, whether pushed or dispatched by hand.
+    if: github.event.repository.visibility == 'public' && github.ref == 'refs/heads/main' && !contains(github.event.head_commit.message || '', '[skip publish]')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
+        with:
+          toolchain: stable
+          components: clippy
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: cargo test --locked --all-features --lib
+      - run: cargo test --locked --all-features --doc
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+      - uses: taiki-e/install-action@f7e5d7c961414b23f5b25b2da9294395d08513ad # v2.87.26
+        with:
+          tool: cargo-audit
+      - run: cargo audit
+
+  publish:
+    needs: verify
+    runs-on: ubuntu-latest
+    environment: crates-io-publish
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
+        with:
+          toolchain: stable
+
+      - id: bump
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          CURRENT=$(cargo metadata --locked --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "bynn-decisionnode") | .version')
+          PUBLISHED=$(curl -s -o /dev/null -w '%{http_code}' -A 'decision-node-rust release workflow' \
+            "https://crates.io/api/v1/crates/bynn-decisionnode/${CURRENT}")
+          if [ "$PUBLISHED" = "200" ] || git rev-parse -q --verify "refs/tags/v${CURRENT}" >/dev/null; then
+            NEW="${CURRENT%.*}.$(( ${CURRENT##*.} + 1 ))"
+            sed -i "0,/^version = \"${CURRENT}\"$/s//version = \"${NEW}\"/" Cargo.toml
+            # Resolves nothing new: only the root package's version changes
+            # in Cargo.lock. No build script runs.
+            cargo update --workspace
+            git add Cargo.toml Cargo.lock
+            git commit -m "Release v${NEW} [skip publish]"
+          else
+            NEW="${CURRENT}"
+          fi
+          echo "version=${NEW}" >> "$GITHUB_OUTPUT"
+
+      - run: cargo package --locked --no-verify
+
+      # Sigstore build provenance over the exact .crate that is uploaded.
+      - uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
+        with:
+          subject-path: "target/package/bynn-decisionnode-${{ steps.bump.outputs.version }}.crate"
+
+      - run: |
+          git tag "v${VERSION}"
+          git push "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" HEAD:main "v${VERSION}"
+        env:
+          VERSION: ${{ steps.bump.outputs.version }}
+          GH_TOKEN: ${{ github.token }}
+
+      # Trusted publishing: a short-lived token from the workflow's OIDC
+      # identity, revoked by the action's post-step.
+      - id: auth
+        uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
+      - run: cargo publish --locked --no-verify
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+
+      - run: gh release create "v${VERSION}" --title "v${VERSION}" --generate-notes
+        env:
+          VERSION: ${{ steps.bump.outputs.version }}
+          GH_TOKEN: ${{ github.token }}
