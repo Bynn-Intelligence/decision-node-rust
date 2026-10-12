@@ -2066,6 +2066,32 @@ fn check_sequence(expected: &[Value], log: &[Value]) -> Result<(), Fail> {
     Ok(())
 }
 
+/// Every logged attempt the spec selects (by `path_suffix` and `method`, at
+/// least `min`, 2 by default) carries the header, all with one value, which
+/// matches `pattern` when one is given.
+fn check_same_header(spec: &Value, log: &[Value]) -> Result<(), Fail> {
+    let name = spec["name"].as_str().unwrap().to_lowercase();
+    let suffix = spec.get("path_suffix").and_then(Value::as_str);
+    let method = spec.get("method").and_then(Value::as_str);
+    let values: Vec<Option<&str>> = log
+        .iter()
+        .filter(|r| suffix.is_none_or(|s| r["path"].as_str().unwrap_or_default().ends_with(s)))
+        .filter(|r| method.is_none_or(|m| r["method"].as_str() == Some(m)))
+        .map(|r| r["headers"][name.as_str()].as_str())
+        .collect();
+    let least = spec.get("min").and_then(Value::as_u64).unwrap_or(2) as usize;
+    let first = values.first().copied().flatten();
+    if values.len() < least || first.is_none() || values.iter().any(|v| *v != first) {
+        return Err(Fail(format!("same_header {name}: expected one value on every attempt, got {values:?}")));
+    }
+    if let (Some(p), Some(v)) = (spec.get("pattern").and_then(Value::as_str), first) {
+        if !regex::Regex::new(p).unwrap().is_match(v) {
+            return Err(Fail(format!("same_header {name}: {v:?} does not match {p}")));
+        }
+    }
+    Ok(())
+}
+
 fn check_counts(expected: &[Value], log: &[Value]) -> Result<(), Fail> {
     for spec in expected {
         let pattern = spec.get("path_pattern").and_then(Value::as_str).map(|p| regex::Regex::new(p).unwrap());
@@ -2183,6 +2209,9 @@ fn run_behaviour(ctx: &Ctx, driver: Driver, case: &Value) -> Result<(), Fail> {
     }
     if let Some(counts) = exp.get("request_counts").and_then(Value::as_array) {
         check_counts(counts, &log)?;
+    }
+    if let Some(spec) = exp.get("same_header") {
+        check_same_header(spec, &log)?;
     }
     if let Some(exp_events) = exp.get("session_events").and_then(Value::as_array) {
         check_events(exp_events, &events)?;

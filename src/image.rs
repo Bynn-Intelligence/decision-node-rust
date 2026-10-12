@@ -460,6 +460,15 @@ fn blocked_v6(ip: Ipv6Addr) -> bool {
     RANGES.iter().any(|&(net, bits)| n >> (128 - bits) == net >> (128 - bits))
 }
 
+/// An image's URL rules alone, for an enrollment: every other fault of its
+/// picture is the server's to judge.
+pub(crate) fn check_image_url(image: &Image) -> Result<()> {
+    match &image.source {
+        Source::Url(url) => check_url(&image.id, url),
+        _ => Ok(()),
+    }
+}
+
 /// The URL rules that need no network: `https` (else the API's
 /// `api_usage_error`), then `image_url_refused` for over 2,048 characters,
 /// user information, a port other than 443, no host or a literal address in

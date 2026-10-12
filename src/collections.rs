@@ -7,7 +7,7 @@ use serde_json::{json, Map, Value};
 use crate::check::{entry, usage_error};
 use crate::client::{DecisionNode, Policy};
 use crate::error::{Error, ErrorKind, Result};
-use crate::image::{check_images, Image};
+use crate::image::{check_image_url, Image};
 
 /// The longest collection name, in characters.
 const NAME_MAX: usize = 80;
@@ -15,18 +15,19 @@ const NAME_MAX: usize = 80;
 const REFERENCE_MAX: usize = 64;
 /// The longest item label, in characters.
 const LABEL_MAX: usize = 128;
-/// The characters an item reference is made of.
-const REFERENCE_PATTERN: &str = "^[A-Za-z0-9_.:-]+$";
+/// An item reference: 1 to 64 of these characters.
+const REFERENCE_PATTERN: &str = "^[A-Za-z0-9_.:-]{1,64}$";
 /// The largest page of `list_items`.
 const MAX_LIST_LIMIT: i64 = 100;
 
 /// The collections of a client, from [`DecisionNode::collections`].
 ///
-/// Every call returns the API's object exactly as sent. `get`, `list`,
-/// `list_items`, `delete` and `delete_item` are retried as every call is.
-/// `create` and `enroll` are retried only on `429` and `529`, which the API
-/// never applies, and never after a timeout or a lost answer: a repeated
-/// enrollment would enroll the face, and bill it, twice.
+/// Every call returns the API's object exactly as sent, and is retried as
+/// every call is. `create` and `enroll` send an `Idempotency-Key`, a new
+/// random UUID for each call and the same on every attempt of it, so the API
+/// creates, enrolls and bills once however often the call is tried; they are
+/// also retried on a `409` `idempotency_in_progress`, after the wait it asks
+/// for. A `409` `idempotency_key_reused` is returned as the base error.
 #[derive(Clone, Copy, Debug)]
 pub struct Collections<'a> {
     client: &'a DecisionNode,
@@ -80,7 +81,7 @@ fn string_entries(field: &str, value: &str, least: usize, most: usize, pattern: 
         return vec![entry("string_too_long", &loc, msg, &input, Some(json!({"max_length": most})))];
     }
     let allowed = |c: char| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | ':' | '-');
-    if pattern && !value.chars().all(allowed) {
+    if pattern && (value.is_empty() || !value.chars().all(allowed)) {
         let msg = format!("String should match pattern '{REFERENCE_PATTERN}'");
         return vec![entry("string_pattern_mismatch", &loc, msg, &input, Some(json!({"pattern": REFERENCE_PATTERN})))];
     }
@@ -117,7 +118,7 @@ impl Collections<'_> {
             return Err(Error::local_entries(entries));
         }
         let body = json!({"type": collection_type, "name": name});
-        self.call(Method::POST, "/v1/collections", Some(&body), Policy::Mutation).await
+        Ok(self.client.request_json_idempotent(Method::POST, "/v1/collections", &body).await?.body)
     }
 
     /// `GET /v1/collections`: the workspace's collections, then the public
@@ -144,9 +145,10 @@ impl Collections<'_> {
 
     /// `POST /v1/collections/{id}/items`: enrolls the face in an image under
     /// a reference (1 to 64 of `A-Z`, `a-z`, `0-9`, `_`, `.`, `:` and `-`)
-    /// and an optional label (at most 128 characters). The image is checked
-    /// and sent as a decision's is: a URL as given, local bytes inline or
-    /// uploaded by the inline threshold.
+    /// and an optional label (at most 128 characters). The image is sent as
+    /// a decision's is: a URL as given (after the URL rules a decision's
+    /// image follows), local bytes inline or uploaded by the inline
+    /// threshold. Whether the picture can be read is the API's to say.
     pub async fn enroll(
         &self,
         collection_id: &str,
@@ -155,15 +157,18 @@ impl Collections<'_> {
         label: Option<&str>,
     ) -> Result<Value> {
         let reference = reference.into();
-        let mut entries = string_entries("reference", &reference, 1, REFERENCE_MAX, true);
+        // Its length first, then its pattern, which an empty reference fails.
+        let mut entries = string_entries("reference", &reference, 0, REFERENCE_MAX, true);
         if let Some(l) = label {
             entries.extend(string_entries("label", l, 0, LABEL_MAX, false));
         }
         if !entries.is_empty() {
             return Err(Error::local_entries(entries));
         }
+        // Only a URL's rules are checked here; every other fault of the
+        // picture is the server's `422` `image_unreadable`.
+        check_image_url(&image)?;
         let images = [image];
-        check_images(&images, &self.client.limits(self.client.model()))?;
         let placed = self.client.place_images(&images, true, false).await?;
         let mut body = Map::new();
         body.insert("image".into(), placed.wires.into_iter().next().unwrap_or(Value::Null));
@@ -172,7 +177,7 @@ impl Collections<'_> {
             body.insert("label".into(), Value::String(l.to_owned()));
         }
         let path = format!("/v1/collections/{}/items", segment(collection_id));
-        self.call(Method::POST, &path, Some(&Value::Object(body)), Policy::Mutation).await
+        Ok(self.client.request_json_idempotent(Method::POST, &path, &Value::Object(body)).await?.body)
     }
 
     /// `GET /v1/collections/{id}/items`: one page of a collection's faces.
@@ -238,10 +243,11 @@ mod tests {
             (long[0]["type"].clone(), long[0]["ctx"].clone()),
             (json!("string_too_long"), json!({"max_length": 80}))
         );
-        assert!(string_entries("reference", "wanted:2024-12345_a.b", 1, REFERENCE_MAX, true).is_empty());
-        let bad = string_entries("reference", "emp 1042", 1, REFERENCE_MAX, true);
-        assert_eq!(bad[0]["msg"], "String should match pattern '^[A-Za-z0-9_.:-]+$'");
-        assert_eq!(bad[0]["ctx"], json!({"pattern": "^[A-Za-z0-9_.:-]+$"}));
+        assert!(string_entries("reference", "wanted:2024-12345_a.b", 0, REFERENCE_MAX, true).is_empty());
+        let bad = string_entries("reference", "emp 1042", 0, REFERENCE_MAX, true);
+        assert_eq!(bad[0]["msg"], "String should match pattern '^[A-Za-z0-9_.:-]{1,64}$'");
+        assert_eq!(bad[0]["ctx"], json!({"pattern": "^[A-Za-z0-9_.:-]{1,64}$"}));
+        assert_eq!(string_entries("reference", "", 0, REFERENCE_MAX, true)[0]["type"], "string_pattern_mismatch");
         assert!(string_entries("label", "", 0, LABEL_MAX, false).is_empty());
     }
 
@@ -260,17 +266,23 @@ mod tests {
         let e = c.create("x".repeat(81)).await.unwrap_err();
         assert_eq!(kinds(&e), [("string_too_long".to_owned(), json!(["body", "name"]))]);
         let badge = || Image::url("badge", "https://files.example.com/badge.jpg");
+        // An empty reference fails the pattern; its length is checked first.
         let e = c.enroll("col_1", badge(), "", Some(&"l".repeat(129))).await.unwrap_err();
         assert_eq!(
             kinds(&e),
             [
-                ("string_too_short".to_owned(), json!(["body", "reference"])),
+                ("string_pattern_mismatch".to_owned(), json!(["body", "reference"])),
                 ("string_too_long".to_owned(), json!(["body", "label"]))
             ]
         );
+        let e = c.enroll("col_1", badge(), " ".repeat(65), None).await.unwrap_err();
+        assert_eq!(kinds(&e), [("string_too_long".to_owned(), json!(["body", "reference"]))]);
         let e = c.enroll("col_1", badge(), "r".repeat(65), None).await.unwrap_err();
         assert_eq!(kinds(&e), [("string_too_long".to_owned(), json!(["body", "reference"]))]);
-        // The image is checked as a decision's image.
+        // Only the URL rules of the picture are checked here: bytes that are
+        // no image are the server's to refuse.
+        let e = c.enroll("col_1", Image::bytes("badge", &b"not an image"[..]), "emp-1", None).await.unwrap_err();
+        assert!(e.is_transport(), "{e:?}");
         let e =
             c.enroll("col_1", Image::url("badge", "http://files.example.com/b.jpg"), "emp-1", None).await.unwrap_err();
         assert_eq!((e.kind(), e.status()), (ErrorKind::BadRequest, None));

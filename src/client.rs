@@ -1069,6 +1069,24 @@ impl DecisionNode {
     ) -> Result<Reply> {
         let payload = body.map(Payload::json).transpose()?;
         let raw = self.request(method, path, payload, policy).await?;
+        Self::json_reply(raw)
+    }
+
+    /// [`DecisionNode::request_json`] for a call that may change something
+    /// on the server: it sends a new `Idempotency-Key` (a random UUID), the
+    /// same on every attempt, so the server applies the call once however
+    /// often it is tried, and it retries as [`Policy::Idempotent`].
+    pub(crate) async fn request_json_idempotent(&self, method: Method, path: &str, body: &Value) -> Result<Reply> {
+        let payload = Some(Payload::json(body)?);
+        let key = HeaderValue::from_str(&new_idempotency_key()).expect("a UUID is a valid header value");
+        match self.exchange(method, path, payload, Policy::Idempotent, false, Some(key)).await? {
+            Exchanged::Whole(raw) => Self::json_reply(raw),
+            Exchanged::Open(_) => unreachable!("a whole reply was asked for"),
+        }
+    }
+
+    /// A 2xx response parsed as JSON.
+    fn json_reply(raw: RawReply) -> Result<Reply> {
         match serde_json::from_slice::<Value>(&raw.body) {
             Ok(body) => Ok(Reply { body, status: raw.status, headers: raw.headers }),
             Err(e) => Err(Error::new(ErrorKind::Server, "the response is not JSON")
@@ -1089,7 +1107,7 @@ impl DecisionNode {
         payload: Option<Payload>,
         policy: Policy,
     ) -> Result<RawReply> {
-        match self.exchange(method, path, payload, policy, false).await? {
+        match self.exchange(method, path, payload, policy, false, None).await? {
             Exchanged::Whole(reply) => Ok(reply),
             Exchanged::Open(_) => unreachable!("a whole reply was asked for"),
         }
@@ -1099,7 +1117,7 @@ impl DecisionNode {
     /// body still to read, for a body read line by line. The timeout covers
     /// the attempt up to the response's headers.
     pub(crate) async fn request_open(&self, method: Method, path: &str, policy: Policy) -> Result<reqwest::Response> {
-        match self.exchange(method, path, None, policy, true).await? {
+        match self.exchange(method, path, None, policy, true, None).await? {
             Exchanged::Open(resp) => Ok(resp),
             Exchanged::Whole(_) => unreachable!("an open reply was asked for"),
         }
@@ -1112,6 +1130,7 @@ impl DecisionNode {
         payload: Option<Payload>,
         policy: Policy,
         open: bool,
+        idempotency_key: Option<HeaderValue>,
     ) -> Result<Exchanged> {
         let inner = &*self.inner;
         let auth = self.authorization()?;
@@ -1132,6 +1151,9 @@ impl DecisionNode {
             }
             if !inner.headers.is_empty() {
                 rb = rb.headers(inner.headers.clone());
+            }
+            if let Some(key) = &idempotency_key {
+                rb = rb.header("idempotency-key", key.clone());
             }
             if !open {
                 rb = rb.timeout(timeout);
@@ -1197,6 +1219,14 @@ impl DecisionNode {
                     let retryable = match policy {
                         Policy::Mutation => matches!(status, 429 | 529),
                         Policy::Default | Policy::Ocr | Policy::SessionOpen => is_retryable(status),
+                        // A first attempt with the same key still running on the
+                        // server: try again after the wait it asks for.
+                        Policy::Idempotent => {
+                            is_retryable(status)
+                                || (status == 409
+                                    && Error::from_response(status, &headers, &body).error_type()
+                                        == Some("idempotency_in_progress"))
+                        }
                     };
                     if !retryable || attempt >= inner.max_retries {
                         return Err(Error::from_response(status, &headers, &body));
@@ -1245,10 +1275,22 @@ pub(crate) enum Policy {
     /// Opening a session: as `Default`, except that a 429
     /// `session_limit_exceeded` is never retried.
     SessionOpen,
+    /// A call that carries its own `Idempotency-Key`, the same on every
+    /// attempt: as `Default`, and also a `409` `idempotency_in_progress`.
+    Idempotent,
     /// A decision whose boosters name `ocr`: as `Default`, except that a
     /// timeout is never retried, and the attempt waits
     /// [`DEFAULT_OCR_TIMEOUT`] unless the caller set a timeout.
     Ocr,
+}
+
+/// A new `Idempotency-Key`: a random UUID, version 4.
+pub(crate) fn new_idempotency_key() -> String {
+    let mut b: [u8; 16] = std::array::from_fn(|_| fastrand::u8(..));
+    b[6] = (b[6] & 0x0f) | 0x40;
+    b[8] = (b[8] & 0x3f) | 0x80;
+    let hex: String = b.iter().map(|x| format!("{x:02x}")).collect();
+    format!("{}-{}-{}-{}-{}", &hex[..8], &hex[8..12], &hex[12..16], &hex[16..20], &hex[20..])
 }
 
 /// True when a decision body's `boosters` names `ocr`, by its bare name or in
@@ -1773,6 +1815,57 @@ mod tests {
         assert_eq!(err.status(), Some(200));
         assert_eq!(err.request_id(), Some("req_7"));
         assert_eq!(err.reason(), Some("upstream returned html"));
+    }
+
+    #[test]
+    fn idempotency_keys_are_random_uuids() {
+        let re = regex::Regex::new("^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$").unwrap();
+        let (a, b) = (new_idempotency_key(), new_idempotency_key());
+        assert!(re.is_match(&a), "{a}");
+        assert_ne!(a, b);
+    }
+
+    #[tokio::test]
+    async fn an_idempotent_call_keeps_its_key_and_waits_out_a_running_one() {
+        use std::sync::Mutex as StdMutex;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let keys = Arc::new(StdMutex::new(Vec::<String>::new()));
+        let seen = keys.clone();
+        tokio::spawn(async move {
+            let mut n = 0;
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = vec![0u8; 8192];
+                let len = sock.read(&mut buf).await.unwrap_or(0);
+                let text = String::from_utf8_lossy(&buf[..len]).to_lowercase();
+                let key =
+                    text.lines().find_map(|l| l.strip_prefix("idempotency-key: ")).unwrap_or("").trim().to_owned();
+                seen.lock().unwrap().push(key);
+                n += 1;
+                let (status, body) = match n {
+                    1 => ("409 Conflict", r#"{"detail":{"error_type":"idempotency_in_progress","message":"running"}}"#),
+                    2 => ("500 Internal Server Error", r#"{"detail":{"error_type":"api_error","message":"x"}}"#),
+                    _ => ("201 Created", r#"{"id":"col_1"}"#),
+                };
+                let reply = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nretry-after-ms: 1\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = sock.write_all(reply.as_bytes()).await;
+            }
+        });
+        let dn = DecisionNode::builder()
+            .api_key("k")
+            .base_url(format!("http://{addr}"))
+            .sleeper(|_| Box::pin(async {}))
+            .build()
+            .unwrap();
+        let reply = dn.request_json_idempotent(Method::POST, "/v1/collections", &json!({"name": "a"})).await.unwrap();
+        assert_eq!(reply.body["id"], "col_1");
+        let keys = keys.lock().unwrap().clone();
+        assert_eq!(keys.len(), 3);
+        assert!(!keys[0].is_empty() && keys.iter().all(|k| k == &keys[0]), "{keys:?}");
     }
 
     #[test]
