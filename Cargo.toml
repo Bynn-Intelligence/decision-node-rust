@@ -11,7 +11,7 @@ documentation = "https://docs.rs/bynn-decisionnode"
 readme = "README.md"
 keywords = ["decisionnode", "decision", "classification", "api", "sdk"]
 categories = ["api-bindings", "web-programming::http-client"]
-exclude = ["/.github", "/tests"]
+exclude = ["/.github", "/tests", "/.gitignore", "/rustfmt.toml"]
 
 [lib]
 name = "decisionnode"
