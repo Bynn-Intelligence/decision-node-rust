@@ -19,6 +19,104 @@ const LABEL_MAX: usize = 128;
 const REFERENCE_PATTERN: &str = "^[A-Za-z0-9_.:-]{1,64}$";
 /// The largest page of `list_items`.
 const MAX_LIST_LIMIT: i64 = 100;
+/// The most keys an item's metadata holds.
+const METADATA_KEYS: usize = 20;
+/// The longest metadata key, in characters.
+const METADATA_KEY_CHARS: usize = 40;
+/// The longest metadata text, in characters.
+const METADATA_TEXT_CHARS: usize = 500;
+
+/// A change to an enrolled face, for [`Collections::update_item`]: only the
+/// fields set are sent.
+///
+/// ```
+/// use decisionnode::ItemUpdate;
+/// use serde_json::json;
+///
+/// let change = ItemUpdate::new().label("Front desk").metadata(json!({"badge": 1042}));
+/// let cleared = ItemUpdate::new().clear_label();
+/// ```
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ItemUpdate {
+    reference: Option<String>,
+    label: Option<Option<String>>,
+    metadata: Option<Value>,
+}
+
+impl ItemUpdate {
+    /// A change of nothing yet; set at least one field.
+    pub fn new() -> ItemUpdate {
+        ItemUpdate::default()
+    }
+
+    /// A new reference (1 to 64 of `A-Z`, `a-z`, `0-9`, `_`, `.`, `:` and `-`).
+    pub fn reference(mut self, reference: impl Into<String>) -> ItemUpdate {
+        self.reference = Some(reference.into());
+        self
+    }
+
+    /// A new label (1 to 128 characters).
+    pub fn label(mut self, label: impl Into<String>) -> ItemUpdate {
+        self.label = Some(Some(label.into()));
+        self
+    }
+
+    /// Clears the label: sent as `"label": null`.
+    pub fn clear_label(mut self) -> ItemUpdate {
+        self.label = Some(None);
+        self
+    }
+
+    /// New metadata, which replaces the item's whole object (`{}` clears it):
+    /// at most 20 keys of 1 to 40 of `a-z`, `0-9` and `_`, each value a text
+    /// of at most 500 characters, a number or a boolean.
+    pub fn metadata(mut self, metadata: impl Into<Value>) -> ItemUpdate {
+        self.metadata = Some(metadata.into());
+        self
+    }
+}
+
+/// Which page of a collection's faces [`Collections::list_items_with`] reads.
+/// Each part is sent only when set.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ItemQuery {
+    offset: Option<i64>,
+    limit: Option<i64>,
+    reference: Option<String>,
+    reference_prefix: Option<String>,
+}
+
+impl ItemQuery {
+    /// The first page, with the API's page size.
+    pub fn new() -> ItemQuery {
+        ItemQuery::default()
+    }
+
+    /// How many faces to skip, 0 or more.
+    pub fn offset(mut self, offset: i64) -> ItemQuery {
+        self.offset = Some(offset);
+        self
+    }
+
+    /// The page size, 1 to 100.
+    pub fn limit(mut self, limit: i64) -> ItemQuery {
+        self.limit = Some(limit);
+        self
+    }
+
+    /// Only the faces enrolled under this reference.
+    pub fn reference(mut self, reference: impl Into<String>) -> ItemQuery {
+        self.reference = Some(reference.into());
+        self
+    }
+
+    /// Only the faces whose reference starts with this prefix. Not together
+    /// with [`ItemQuery::reference`].
+    pub fn reference_prefix(mut self, prefix: impl Into<String>) -> ItemQuery {
+        self.reference_prefix = Some(prefix.into());
+        self
+    }
+}
 
 /// The collections of a client, from [`DecisionNode::collections`].
 ///
@@ -43,7 +141,7 @@ impl DecisionNode {
     /// let staff = dn.collections().create("Staff").await?;
     /// let id = staff["id"].as_str().unwrap_or_default();
     /// let badge = Image::url("badge", "https://files.example.com/badges/emp-1042.jpg");
-    /// dn.collections().enroll(id, badge, "emp-1042", Some("Reception")).await?;
+    /// dn.collections().enroll(id, badge, "emp-1042", Some("Reception"), None).await?;
     /// # Ok(())
     /// # }
     /// ```
@@ -97,6 +195,107 @@ fn string_entries(field: &str, value: &str, most: usize, pattern: bool) -> Vec<V
         return vec![entry("string_pattern_mismatch", &loc, msg, &input, Some(json!({"pattern": REFERENCE_PATTERN})))];
     }
     Vec::new()
+}
+
+/// A caller's value as an API message shows it: its first `most`
+/// characters, any but printable ASCII written as `\u{hex}`, then `...` when
+/// it was longer.
+fn printable(value: &str, most: usize) -> String {
+    let mut out: String = value
+        .chars()
+        .take(most)
+        .map(|c| if (' '..='~').contains(&c) { c.to_string() } else { format!("\\u{{{:x}}}", u32::from(c)) })
+        .collect();
+    if value.chars().count() > most {
+        out.push_str("...");
+    }
+    out
+}
+
+/// An input as a collections `422` entry echoes a value of any type: a
+/// string in part (see [`echoed`]), an object or an array never.
+fn echoed_value(value: &Value) -> Value {
+    match value {
+        Value::String(s) => echoed(s),
+        Value::Object(_) | Value::Array(_) => Value::Null,
+        other => other.clone(),
+    }
+}
+
+/// An item's metadata's `422` entries, in key order: an object of at most 20
+/// keys (that alone, before any key is read), each key 1 to 40 of `a-z`,
+/// `0-9` and `_`, each value a text of at most 500 characters, a number or a
+/// boolean. A text's control characters, a number's range and the total size
+/// are the API's to judge.
+fn metadata_entries(metadata: &Value) -> Vec<Value> {
+    let loc = [json!("body"), json!("metadata")];
+    let Some(map) = metadata.as_object() else {
+        return vec![entry(
+            "value_error",
+            &loc,
+            "Metadata is an object of keys and values.",
+            &echoed_value(metadata),
+            None,
+        )];
+    };
+    if map.len() > METADATA_KEYS {
+        return vec![entry(
+            "value_error",
+            &loc,
+            format!("Metadata holds at most {METADATA_KEYS} keys."),
+            &Value::Null,
+            None,
+        )];
+    }
+    let mut out = Vec::new();
+    for (key, value) in map {
+        let length = key.chars().count();
+        let key_ok = (1..=METADATA_KEY_CHARS).contains(&length)
+            && key.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_');
+        if !key_ok {
+            let mut shown: String =
+                key.chars().take(METADATA_KEY_CHARS).map(|c| if c.is_control() { '?' } else { c }).collect();
+            if length > METADATA_KEY_CHARS {
+                shown.push_str("...");
+            }
+            let msg = format!("A metadata key is 1 to {METADATA_KEY_CHARS} characters of a-z, 0-9 and _: \"{shown}\".");
+            out.push(entry("value_error", &loc, msg, &Value::Null, None));
+            continue;
+        }
+        let at = [json!("body"), json!("metadata"), json!(key)];
+        match value {
+            Value::String(text) if text.chars().count() > METADATA_TEXT_CHARS => out.push(entry(
+                "value_error",
+                &at,
+                format!("A metadata text is at most {METADATA_TEXT_CHARS} characters."),
+                &echoed(text),
+                None,
+            )),
+            Value::String(_) | Value::Number(_) | Value::Bool(_) => {}
+            other => out.push(entry(
+                "value_error",
+                &at,
+                "A metadata value is a text, a number or true or false.",
+                &echoed_value(other),
+                None,
+            )),
+        }
+    }
+    out
+}
+
+/// A `reference` or `reference_prefix` of the items list, as the API checks
+/// it.
+fn check_reference_query(name: &str, value: &str) -> Result<()> {
+    let allowed = |c: char| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | ':' | '-');
+    let length = value.chars().count();
+    if (1..=REFERENCE_MAX).contains(&length) && value.chars().all(allowed) {
+        return Ok(());
+    }
+    Err(usage_error(format!(
+        "Query parameter {name} must be 1 to 64 characters of A-Z, a-z, 0-9, _, ., : and -, got {}.",
+        printable(value, REFERENCE_MAX)
+    )))
 }
 
 impl Collections<'_> {
@@ -155,8 +354,9 @@ impl Collections<'_> {
     }
 
     /// `POST /v1/collections/{id}/items`: enrolls the face in an image under
-    /// a reference (1 to 64 of `A-Z`, `a-z`, `0-9`, `_`, `.`, `:` and `-`)
-    /// and an optional label (at most 128 characters). The image is sent as
+    /// a reference (1 to 64 of `A-Z`, `a-z`, `0-9`, `_`, `.`, `:` and `-`),
+    /// an optional label (1 to 128 characters) and optional metadata (see
+    /// [`ItemUpdate::metadata`]). The image is sent as
     /// a decision's is: a URL as given (after the URL rules a decision's
     /// image follows), local bytes inline or uploaded by the inline
     /// threshold. Whether the picture can be read is the API's to say.
@@ -166,12 +366,16 @@ impl Collections<'_> {
         image: Image,
         reference: impl Into<String>,
         label: Option<&str>,
+        metadata: Option<Value>,
     ) -> Result<Value> {
         let reference = reference.into();
         // Its length first (1 to 64), then its pattern.
         let mut entries = string_entries("reference", &reference, REFERENCE_MAX, true);
         if let Some(l) = label {
             entries.extend(string_entries("label", l, LABEL_MAX, false));
+        }
+        if let Some(m) = &metadata {
+            entries.extend(metadata_entries(m));
         }
         if !entries.is_empty() {
             return Err(Error::local_entries(entries));
@@ -187,6 +391,9 @@ impl Collections<'_> {
         if let Some(l) = label {
             body.insert("label".into(), Value::String(l.to_owned()));
         }
+        if let Some(m) = metadata {
+            body.insert("metadata".into(), m);
+        }
         let path = format!("/v1/collections/{}/items", segment(collection_id));
         Ok(self.client.request_json_idempotent(Method::POST, &path, &Value::Object(body)).await?.body)
     }
@@ -196,6 +403,17 @@ impl Collections<'_> {
     /// a `limit` outside 1 to 100 is refused before anything is sent, with
     /// the API's own error.
     pub async fn list_items(&self, collection_id: &str, offset: Option<i64>, limit: Option<i64>) -> Result<Value> {
+        let mut query = ItemQuery::new();
+        query.offset = offset;
+        query.limit = limit;
+        self.list_items_with(collection_id, &query).await
+    }
+
+    /// [`Collections::list_items`] with every part of the query: the page
+    /// and, as the API answers it, the faces of one reference or of a
+    /// reference prefix (not both). The page comes back as sent.
+    pub async fn list_items_with(&self, collection_id: &str, q: &ItemQuery) -> Result<Value> {
+        let (offset, limit) = (q.offset, q.limit);
         if let Some(o) = offset.filter(|o| *o < 0) {
             return Err(usage_error(format!("Query parameter offset must be an integer of 0 or more, got {o}.")));
         }
@@ -211,11 +429,59 @@ impl Collections<'_> {
         if let Some(l) = limit {
             query.push(format!("limit={l}"));
         }
+        if q.reference.is_some() && q.reference_prefix.is_some() {
+            return Err(usage_error("Send query parameter reference or reference_prefix, not both."));
+        }
+        for (name, value) in [("reference", &q.reference), ("reference_prefix", &q.reference_prefix)] {
+            if let Some(v) = value {
+                check_reference_query(name, v)?;
+                query.push(format!("{name}={}", segment(v)));
+            }
+        }
         let mut path = format!("/v1/collections/{}/items", segment(collection_id));
         if !query.is_empty() {
             path = format!("{path}?{}", query.join("&"));
         }
         self.call(Method::GET, &path, None, Policy::Default).await
+    }
+
+    /// `PATCH /v1/collections/{id}/items/{item_id}`: changes an enrolled
+    /// face, sending only the fields the [`ItemUpdate`] sets, and returns the
+    /// item as sent. Its reference and label are checked as
+    /// [`Collections::enroll`] checks them; a change of nothing is refused
+    /// before anything is sent. Like `enroll`, it sends an `Idempotency-Key`
+    /// and retries as `enroll` does.
+    pub async fn update_item(&self, collection_id: &str, item_id: &str, update: &ItemUpdate) -> Result<Value> {
+        let mut entries = Vec::new();
+        let mut body = Map::new();
+        if let Some(r) = &update.reference {
+            entries.extend(string_entries("reference", r, REFERENCE_MAX, true));
+            body.insert("reference".into(), Value::String(r.clone()));
+        }
+        if let Some(label) = &update.label {
+            if let Some(l) = label {
+                entries.extend(string_entries("label", l, LABEL_MAX, false));
+            }
+            body.insert("label".into(), label.clone().map_or(Value::Null, Value::String));
+        }
+        if let Some(m) = &update.metadata {
+            entries.extend(metadata_entries(m));
+            body.insert("metadata".into(), m.clone());
+        }
+        if body.is_empty() {
+            entries.push(entry(
+                "missing",
+                &[json!("body")],
+                "Send reference, label, metadata or any of them",
+                &Value::Null,
+                None,
+            ));
+        }
+        if !entries.is_empty() {
+            return Err(Error::local_entries(entries));
+        }
+        let path = format!("/v1/collections/{}/items/{}", segment(collection_id), segment(item_id));
+        Ok(self.client.request_json_idempotent(Method::PATCH, &path, &Value::Object(body)).await?.body)
     }
 
     /// `DELETE /v1/collections/{id}/items/{item_id}`: deletes one enrolled
@@ -266,6 +532,59 @@ mod tests {
         assert_eq!(string_entries("label", "", LABEL_MAX, false)[0]["type"], "string_too_short");
     }
 
+    #[test]
+    fn metadata_rules() {
+        assert!(metadata_entries(&json!({"badge": 1042, "desk": "front", "vip": true, "rate": 0.5})).is_empty());
+        let not_object = metadata_entries(&json!("x"));
+        assert_eq!(
+            (not_object[0]["msg"].clone(), not_object[0]["input"].clone()),
+            (json!("Metadata is an object of keys and values."), json!("x"))
+        );
+        assert_eq!(metadata_entries(&json!([1]))[0]["input"], Value::Null);
+        let many: Map<String, Value> = (0..21).map(|i| (format!("k{i}"), json!(i))).collect();
+        let many = metadata_entries(&Value::Object(many));
+        assert_eq!(many.len(), 1);
+        assert_eq!(
+            (many[0]["msg"].clone(), many[0]["input"].clone()),
+            (json!("Metadata holds at most 20 keys."), Value::Null)
+        );
+        let long_key = format!("A\u{1}{}", "b".repeat(45));
+        let got = metadata_entries(
+            &json!({"ok": 1, long_key.clone(): 1, "text": "t".repeat(501), "list": [1], "none": null}),
+        );
+        assert_eq!(got.len(), 4);
+        assert_eq!(got[0]["loc"], json!(["body", "metadata"]));
+        assert_eq!(
+            got[0]["msg"],
+            json!(format!("A metadata key is 1 to 40 characters of a-z, 0-9 and _: \"A?{}...\".", "b".repeat(38)))
+        );
+        assert_eq!(
+            (got[1]["loc"].clone(), got[1]["input"].clone()),
+            (json!(["body", "metadata", "text"]), json!(format!("{}...", "t".repeat(64))))
+        );
+        assert_eq!(
+            (got[2]["msg"].clone(), got[2]["input"].clone()),
+            (json!("A metadata value is a text, a number or true or false."), Value::Null)
+        );
+        assert_eq!(got[3]["loc"], json!(["body", "metadata", "none"]));
+        assert_eq!(
+            metadata_entries(&json!({"": 1}))[0]["msg"],
+            "A metadata key is 1 to 40 characters of a-z, 0-9 and _: \"\"."
+        );
+    }
+
+    #[test]
+    fn reference_queries() {
+        assert!(check_reference_query("reference", "emp-1042").is_ok());
+        let e = check_reference_query("reference_prefix", "emp 1é").unwrap_err();
+        assert_eq!(
+            e.message(),
+            "Query parameter reference_prefix must be 1 to 64 characters of A-Z, a-z, 0-9, _, ., : and -, got emp 1\\u{e9}."
+        );
+        assert_eq!(printable(&"a".repeat(65), 64), format!("{}...", "a".repeat(64)));
+        assert!(check_reference_query("reference", "").is_err());
+    }
+
     #[tokio::test]
     async fn local_checks_send_nothing() {
         let dn = DecisionNode::builder().api_key("k").base_url("http://127.0.0.1:9").build().unwrap();
@@ -282,7 +601,7 @@ mod tests {
         assert_eq!(kinds(&e), [("string_too_long".to_owned(), json!(["body", "name"]))]);
         let badge = || Image::url("badge", "https://files.example.com/badge.jpg");
         // An empty reference and an empty label are too short.
-        let e = c.enroll("col_1", badge(), "", Some(&"l".repeat(129))).await.unwrap_err();
+        let e = c.enroll("col_1", badge(), "", Some(&"l".repeat(129)), None).await.unwrap_err();
         assert_eq!(
             kinds(&e),
             [
@@ -290,17 +609,37 @@ mod tests {
                 ("string_too_long".to_owned(), json!(["body", "label"]))
             ]
         );
-        let e = c.enroll("col_1", badge(), " ".repeat(65), None).await.unwrap_err();
+        let e = c.enroll("col_1", badge(), " ".repeat(65), None, None).await.unwrap_err();
         assert_eq!(kinds(&e), [("string_too_long".to_owned(), json!(["body", "reference"]))]);
-        let e = c.enroll("col_1", badge(), "r".repeat(65), None).await.unwrap_err();
+        let e = c.enroll("col_1", badge(), "r".repeat(65), None, None).await.unwrap_err();
         assert_eq!(kinds(&e), [("string_too_long".to_owned(), json!(["body", "reference"]))]);
         // Only the URL rules of the picture are checked here: bytes that are
         // no image are the server's to refuse.
-        let e = c.enroll("col_1", Image::bytes("badge", &b"not an image"[..]), "emp-1", None).await.unwrap_err();
+        let e = c.enroll("col_1", Image::bytes("badge", &b"not an image"[..]), "emp-1", None, None).await.unwrap_err();
         assert!(e.is_transport(), "{e:?}");
-        let e =
-            c.enroll("col_1", Image::url("badge", "http://files.example.com/b.jpg"), "emp-1", None).await.unwrap_err();
+        let e = c
+            .enroll("col_1", Image::url("badge", "http://files.example.com/b.jpg"), "emp-1", None, None)
+            .await
+            .unwrap_err();
         assert_eq!((e.kind(), e.status()), (ErrorKind::BadRequest, None));
+        let e = c.update_item("col_1", "itm_1", &ItemUpdate::new()).await.unwrap_err();
+        assert_eq!(
+            e.entries().unwrap(),
+            [
+                json!({"type": "missing", "loc": ["body"], "msg": "Send reference, label, metadata or any of them", "input": null})
+            ]
+        );
+        let e = c.update_item("col_1", "itm_1", &ItemUpdate::new().reference("a b").label("")).await.unwrap_err();
+        assert_eq!(
+            kinds(&e),
+            [
+                ("string_pattern_mismatch".to_owned(), json!(["body", "reference"])),
+                ("string_too_short".to_owned(), json!(["body", "label"]))
+            ]
+        );
+        let both = ItemQuery::new().reference("a").reference_prefix("b");
+        let e = c.list_items_with("col_1", &both).await.unwrap_err();
+        assert_eq!(e.message(), "Send query parameter reference or reference_prefix, not both.");
         let e = c.list_items("col_1", Some(-1), None).await.unwrap_err();
         assert_eq!(e.message(), "Query parameter offset must be an integer of 0 or more, got -1.");
         let e = c.list_items("col_1", None, Some(101)).await.unwrap_err();

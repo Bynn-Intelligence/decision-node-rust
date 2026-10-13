@@ -26,6 +26,7 @@ use std::time::Duration;
 
 use crate::batch::{Batch, BatchPage, BatchRequest, BatchResult, BatchResultStream, BatchResults, BatchRun};
 use crate::client::{CallOptions, ClientBuilder, DecideRequest};
+use crate::collections::{ItemQuery, ItemUpdate};
 use crate::error::{Error, ErrorKind, Result};
 use crate::image::Image;
 use crate::question::{Choice, Number, Score, Truth};
@@ -260,8 +261,19 @@ impl Collections<'_> {
         image: Image,
         reference: impl Into<String>,
         label: Option<&str>,
+        metadata: Option<Value>,
     ) -> Result<Value> {
-        self.client.run(self.client.client.collections().enroll(collection_id, image, reference, label))
+        self.client.run(self.client.client.collections().enroll(collection_id, image, reference, label, metadata))
+    }
+
+    /// See [`crate::Collections::update_item`].
+    pub fn update_item(&self, collection_id: &str, item_id: &str, update: &ItemUpdate) -> Result<Value> {
+        self.client.run(self.client.client.collections().update_item(collection_id, item_id, update))
+    }
+
+    /// See [`crate::Collections::list_items_with`].
+    pub fn list_items_with(&self, collection_id: &str, query: &ItemQuery) -> Result<Value> {
+        self.client.run(self.client.client.collections().list_items_with(collection_id, query))
     }
 
     /// See [`crate::Collections::list_items`].

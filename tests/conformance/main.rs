@@ -31,7 +31,7 @@ use decisionnode::{
     ClientBuilder, DecideRequest, Decision, DecisionNode, DecisionResult, Error, Image, Levels, ModelInfo, Number,
     NumberAnswer, Options, Point, Question, Reading, Safety, Score, ScoreAnswer, Truth, TruthAnswer, Video, VideoFrame,
 };
-use decisionnode::{Evidence, FaceBox};
+use decisionnode::{Evidence, FaceBox, ItemQuery, ItemUpdate};
 use serde_json::{json, Map, Value};
 use sha2::Digest;
 
@@ -760,8 +760,9 @@ enum Prepared {
     CollectionList,
     CollectionGet(String),
     CollectionDelete(String),
-    CollectionEnroll(String, Image, String, Option<String>),
-    CollectionListItems(String, Option<i64>, Option<i64>),
+    CollectionEnroll(String, Image, String, Option<String>, Option<Value>),
+    CollectionListItems(String, ItemQuery),
+    CollectionUpdateItem(String, String, ItemUpdate),
     CollectionDeleteItem(String, String),
 }
 
@@ -823,12 +824,40 @@ fn prepare(root: &Path, call: &Value, refs: &Refs) -> Result<Prepared, Error> {
             image(root, &args["image"])?,
             text("reference"),
             opt(args, "label").map(text_of),
+            opt(args, "metadata").cloned(),
         ),
-        "collections.list_items" => Prepared::CollectionListItems(
-            text("collection_id"),
-            opt(args, "offset").and_then(Value::as_i64),
-            opt(args, "limit").and_then(Value::as_i64),
-        ),
+        "collections.list_items" => {
+            let mut q = ItemQuery::new();
+            if let Some(o) = opt(args, "offset").and_then(Value::as_i64) {
+                q = q.offset(o);
+            }
+            if let Some(l) = opt(args, "limit").and_then(Value::as_i64) {
+                q = q.limit(l);
+            }
+            if let Some(r) = opt(args, "reference") {
+                q = q.reference(text_of(r));
+            }
+            if let Some(p) = opt(args, "reference_prefix") {
+                q = q.reference_prefix(text_of(p));
+            }
+            Prepared::CollectionListItems(text("collection_id"), q)
+        }
+        "collections.update_item" => {
+            // A label given as null clears it; one left out is not sent.
+            let mut u = ItemUpdate::new();
+            if let Some(r) = args.get("reference") {
+                u = u.reference(text_of(r));
+            }
+            match args.get("label") {
+                Some(Value::Null) => u = u.clear_label(),
+                Some(l) => u = u.label(text_of(l)),
+                None => {}
+            }
+            if let Some(m) = args.get("metadata") {
+                u = u.metadata(m.clone());
+            }
+            Prepared::CollectionUpdateItem(text("collection_id"), text("item_id"), u)
+        }
         "collections.delete_item" => Prepared::CollectionDeleteItem(text("collection_id"), text("item_id")),
         other => panic!("unknown method {other} (is the sessions feature on?)"),
     })
@@ -941,11 +970,14 @@ async fn invoke_async(c: &DecisionNode, p: Prepared) -> Outcome {
         Prepared::CollectionList => wrap(c.collections().list().await, Outcome::CollectionList),
         Prepared::CollectionGet(id) => wrap(c.collections().get(&id).await, Outcome::Collection),
         Prepared::CollectionDelete(id) => wrap(c.collections().delete(&id).await, Outcome::Collection),
-        Prepared::CollectionEnroll(id, image, reference, label) => {
-            wrap(c.collections().enroll(&id, image, reference, label.as_deref()).await, Outcome::Collection)
+        Prepared::CollectionEnroll(id, image, reference, label, metadata) => {
+            wrap(c.collections().enroll(&id, image, reference, label.as_deref(), metadata).await, Outcome::Collection)
         }
-        Prepared::CollectionListItems(id, o, l) => {
-            wrap(c.collections().list_items(&id, o, l).await, Outcome::Collection)
+        Prepared::CollectionUpdateItem(id, item, u) => {
+            wrap(c.collections().update_item(&id, &item, &u).await, Outcome::Collection)
+        }
+        Prepared::CollectionListItems(id, q) => {
+            wrap(c.collections().list_items_with(&id, &q).await, Outcome::Collection)
         }
         Prepared::CollectionDeleteItem(id, item) => {
             wrap(c.collections().delete_item(&id, &item).await, Outcome::Collection)
@@ -998,10 +1030,13 @@ fn invoke_blocking(c: &decisionnode::blocking::DecisionNode, p: Prepared) -> Out
         Prepared::CollectionList => wrap(c.collections().list(), Outcome::CollectionList),
         Prepared::CollectionGet(id) => wrap(c.collections().get(&id), Outcome::Collection),
         Prepared::CollectionDelete(id) => wrap(c.collections().delete(&id), Outcome::Collection),
-        Prepared::CollectionEnroll(id, image, reference, label) => {
-            wrap(c.collections().enroll(&id, image, reference, label.as_deref()), Outcome::Collection)
+        Prepared::CollectionEnroll(id, image, reference, label, metadata) => {
+            wrap(c.collections().enroll(&id, image, reference, label.as_deref(), metadata), Outcome::Collection)
         }
-        Prepared::CollectionListItems(id, o, l) => wrap(c.collections().list_items(&id, o, l), Outcome::Collection),
+        Prepared::CollectionUpdateItem(id, item, u) => {
+            wrap(c.collections().update_item(&id, &item, &u), Outcome::Collection)
+        }
+        Prepared::CollectionListItems(id, q) => wrap(c.collections().list_items_with(&id, &q), Outcome::Collection),
         Prepared::CollectionDeleteItem(id, item) => wrap(c.collections().delete_item(&id, &item), Outcome::Collection),
     }
 }
@@ -1238,6 +1273,7 @@ fn norm_error(e: &Error) -> Value {
         "boosters": Value::Object(
             e.boosters().iter().map(|(k, b)| (k.clone(), json!({"status": b.status, "latency_ms": b.latency_ms}))).collect()
         ),
+        "details": e.details(),
     })
 }
 

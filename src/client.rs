@@ -1216,6 +1216,7 @@ impl DecisionNode {
                     if (200..=299).contains(&status) {
                         return Ok(Exchanged::Whole(RawReply { status, headers, body }));
                     }
+                    let error = || Error::from_response(status, &headers, &body);
                     let retryable = match policy {
                         Policy::Mutation => matches!(status, 429 | 529),
                         Policy::Default | Policy::Ocr | Policy::SessionOpen => is_retryable(status),
@@ -1223,11 +1224,14 @@ impl DecisionNode {
                         // server: try again after the wait it asks for.
                         Policy::Idempotent => {
                             is_retryable(status)
-                                || (status == 409
-                                    && Error::from_response(status, &headers, &body).error_type()
-                                        == Some("idempotency_in_progress"))
+                                || (status == 409 && error().error_type() == Some("idempotency_in_progress"))
                         }
                     };
+                    // An enrollment the API has no price for: a retry never cures it.
+                    let unpriced = status == 529
+                        && error().details().and_then(|d| d.get("reason")).and_then(Value::as_str)
+                            == Some("enrollment_unpriced");
+                    let retryable = retryable && !unpriced;
                     if !retryable || attempt >= inner.max_retries {
                         return Err(Error::from_response(status, &headers, &body));
                     }
@@ -1823,6 +1827,45 @@ mod tests {
         let (a, b) = (new_idempotency_key(), new_idempotency_key());
         assert!(re.is_match(&a), "{a}");
         assert_ne!(a, b);
+    }
+
+    #[tokio::test]
+    async fn an_unpriced_enrollment_is_not_retried() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let seen = attempts.clone();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                seen.fetch_add(1, Ordering::SeqCst);
+                let mut buf = vec![0u8; 8192];
+                let len = sock.read(&mut buf).await.unwrap_or(0);
+                let unpriced = String::from_utf8_lossy(&buf[..len]).contains("/unpriced/");
+                let reason = if unpriced { "enrollment_unpriced" } else { "face_model_unavailable" };
+                let body = format!(
+                    r#"{{"detail":{{"error_type":"overloaded_error","message":"m","details":{{"reason":"{reason}"}}}}}}"#
+                );
+                let reply = format!(
+                    "HTTP/1.1 529 Overloaded\r\nContent-Type: application/json\r\nretry-after-ms: 1\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = sock.write_all(reply.as_bytes()).await;
+            }
+        });
+        let dn = DecisionNode::builder()
+            .api_key("k")
+            .base_url(format!("http://{addr}"))
+            .sleeper(|_| Box::pin(async {}))
+            .build()
+            .unwrap();
+        let e =
+            dn.request_json_idempotent(Method::POST, "/v1/collections/unpriced/items", &json!({})).await.err().unwrap();
+        assert_eq!((e.kind(), attempts.swap(0, Ordering::SeqCst)), (ErrorKind::Overloaded, 1));
+        // Any other 529 is retried as always.
+        let e = dn.request_json_idempotent(Method::POST, "/v1/collections/c/items", &json!({})).await.err().unwrap();
+        assert_eq!((e.kind(), attempts.load(Ordering::SeqCst)), (ErrorKind::Overloaded, 3));
     }
 
     #[tokio::test]

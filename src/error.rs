@@ -10,7 +10,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use indexmap::IndexMap;
 use reqwest::header::HeaderMap;
-use serde_json::Value;
+use serde_json::{Map, Value};
 
 use crate::booster::{parse_boosters_header, BoosterStatus};
 use crate::safety::Safety;
@@ -151,6 +151,7 @@ struct Inner {
     entries: Option<Vec<Value>>,
     retry_after: Option<Duration>,
     boosters: IndexMap<String, BoosterStatus>,
+    details: Option<Map<String, Value>>,
     body: Option<Value>,
     source: Option<Box<dyn std::error::Error + Send + Sync + 'static>>,
 }
@@ -209,6 +210,7 @@ impl Error {
                 entries: None,
                 retry_after: None,
                 boosters: IndexMap::new(),
+                details: None,
                 body: None,
                 source: None,
             }),
@@ -293,8 +295,10 @@ impl Error {
         let mut message = None;
         let mut category = None;
         let mut entries = None;
+        let mut details = None;
         match detail {
             Some(Value::Object(map)) => {
+                details = map.get("details").and_then(Value::as_object).cloned();
                 error_type = map.get("error_type").and_then(Value::as_str).map(str::to_owned);
                 message = map.get("message").and_then(Value::as_str).map(str::to_owned);
                 category = map.get("category").and_then(Value::as_str).map(str::to_owned);
@@ -349,6 +353,7 @@ impl Error {
                 entries: if kind == ErrorKind::Validation { entries } else { None },
                 retry_after,
                 boosters: parse_boosters_header(headers),
+                details,
                 body: parsed,
                 source: None,
             }),
@@ -428,6 +433,12 @@ impl Error {
     /// `booster_unavailable`). Empty when the header is absent.
     pub fn boosters(&self) -> &IndexMap<String, BoosterStatus> {
         &self.inner.boosters
+    }
+
+    /// The error body's `detail.details`, when it is an object: what more the
+    /// API says about the error, for example the `reason` of a `529`.
+    pub fn details(&self) -> Option<&Map<String, Value>> {
+        self.inner.details.as_ref()
     }
 
     /// The parsed error body, when it was JSON.
@@ -872,5 +883,21 @@ mod tests {
         assert_eq!(e.retry_after(), Some(Duration::from_millis(1500)));
         // A JSON body without a message keeps the empty message.
         assert_eq!(Error::from_response(500, &HeaderMap::new(), b"{}").message(), "");
+    }
+
+    #[test]
+    fn details_are_read_from_an_object() {
+        let body =
+            br#"{"detail":{"error_type":"overloaded_error","message":"m","details":{"reason":"enrollment_unpriced"}}}"#;
+        let e = Error::from_response(529, &HeaderMap::new(), body);
+        assert_eq!(e.details().unwrap()["reason"], "enrollment_unpriced");
+        let e = Error::from_response(529, &HeaderMap::new(), br#"{"detail":{"error_type":"x","details":"no"}}"#);
+        assert!(e.details().is_none());
+        let e = Error::from_response(
+            403,
+            &HeaderMap::new(),
+            br#"{"detail":{"error_type":"key_scope_denied","message":"m"}}"#,
+        );
+        assert_eq!(e.kind(), ErrorKind::PermissionDenied);
     }
 }

@@ -77,7 +77,7 @@ pub use client::{
     DEFAULT_CONCURRENCY, DEFAULT_INLINE_THRESHOLD, DEFAULT_MAX_RETRIES, DEFAULT_MODEL, DEFAULT_OCR_TIMEOUT,
     DEFAULT_TIMEOUT, DEFAULT_UPLOAD_TIMEOUT, MAX_BODY_BYTES,
 };
-pub use collections::Collections;
+pub use collections::{Collections, ItemQuery, ItemUpdate};
 pub use error::{DecisionNodeError, Error, ErrorKind, Result};
 pub use http::HttpSettings;
 pub use image::Image;
