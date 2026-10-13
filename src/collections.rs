@@ -65,24 +65,35 @@ fn segment(id: &str) -> String {
     out
 }
 
-/// A string field's `422` entry, as the API answers it: too short, too long
-/// or, with a pattern, not matching it. Lengths are counted in characters.
-fn string_entries(field: &str, value: &str, least: usize, most: usize, pattern: bool) -> Vec<Value> {
-    let loc = [json!("body"), json!(field)];
-    let input = Value::String(value.to_owned());
-    let length = value.chars().count();
-    if length < least {
-        let plural = if least == 1 { "" } else { "s" };
-        let msg = format!("String should have at least {least} character{plural}");
-        return vec![entry("string_too_short", &loc, msg, &input, Some(json!({"min_length": least})))];
+/// How much of a string a collections `422` entry echoes, in characters.
+const ECHO_CHARS: usize = 64;
+
+/// An input as a collections `422` entry echoes it, as the API does: a string
+/// cut to its first 64 characters, with `...` added when it was longer.
+fn echoed(value: &str) -> Value {
+    if value.chars().count() > ECHO_CHARS {
+        Value::String(format!("{}...", value.chars().take(ECHO_CHARS).collect::<String>()))
+    } else {
+        Value::String(value.to_owned())
     }
-    if length > most {
+}
+
+/// A string field's `422` entry, as the API answers it: empty, too long or,
+/// with a pattern, not matching it. Lengths are counted in characters.
+fn string_entries(field: &str, value: &str, most: usize, pattern: bool) -> Vec<Value> {
+    let loc = [json!("body"), json!(field)];
+    if value.is_empty() {
+        let msg = "String should have at least 1 character";
+        return vec![entry("string_too_short", &loc, msg, &json!(""), Some(json!({"min_length": 1})))];
+    }
+    if value.chars().count() > most {
         let msg = format!("String should have at most {most} characters");
-        return vec![entry("string_too_long", &loc, msg, &input, Some(json!({"max_length": most})))];
+        return vec![entry("string_too_long", &loc, msg, &echoed(value), Some(json!({"max_length": most})))];
     }
     let allowed = |c: char| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | ':' | '-');
-    if pattern && (value.is_empty() || !value.chars().all(allowed)) {
+    if pattern && !value.chars().all(allowed) {
         let msg = format!("String should match pattern '{REFERENCE_PATTERN}'");
+        let input = Value::String(value.to_owned());
         return vec![entry("string_pattern_mismatch", &loc, msg, &input, Some(json!({"pattern": REFERENCE_PATTERN})))];
     }
     Vec::new()
@@ -109,11 +120,11 @@ impl Collections<'_> {
                 "literal_error",
                 &[json!("body"), json!("type")],
                 "Input should be 'face'",
-                &Value::String(collection_type.clone()),
+                &echoed(&collection_type),
                 Some(json!({"expected": "'face'"})),
             ));
         }
-        entries.extend(string_entries("name", &name, 1, NAME_MAX, false));
+        entries.extend(string_entries("name", &name, NAME_MAX, false));
         if !entries.is_empty() {
             return Err(Error::local_entries(entries));
         }
@@ -157,10 +168,10 @@ impl Collections<'_> {
         label: Option<&str>,
     ) -> Result<Value> {
         let reference = reference.into();
-        // Its length first, then its pattern, which an empty reference fails.
-        let mut entries = string_entries("reference", &reference, 0, REFERENCE_MAX, true);
+        // Its length first (1 to 64), then its pattern.
+        let mut entries = string_entries("reference", &reference, REFERENCE_MAX, true);
         if let Some(l) = label {
-            entries.extend(string_entries("label", l, 0, LABEL_MAX, false));
+            entries.extend(string_entries("label", l, LABEL_MAX, false));
         }
         if !entries.is_empty() {
             return Err(Error::local_entries(entries));
@@ -232,23 +243,27 @@ mod tests {
 
     #[test]
     fn string_rules() {
-        assert!(string_entries("name", "Staff", 1, NAME_MAX, false).is_empty());
-        let short = string_entries("name", "", 1, NAME_MAX, false);
+        assert!(string_entries("name", "Staff", NAME_MAX, false).is_empty());
+        let short = string_entries("name", "", NAME_MAX, false);
         assert_eq!(short[0]["msg"], "String should have at least 1 character");
         assert_eq!(short[0]["ctx"], json!({"min_length": 1}));
         // Counted in characters: 80 non-ASCII characters are taken.
-        assert!(string_entries("name", &"é".repeat(80), 1, NAME_MAX, false).is_empty());
-        let long = string_entries("name", &"é".repeat(81), 1, NAME_MAX, false);
+        assert!(string_entries("name", &"é".repeat(80), NAME_MAX, false).is_empty());
+        let long = string_entries("name", &"é".repeat(81), NAME_MAX, false);
+        // A long input is echoed as its first 64 characters and "...".
+        assert_eq!(long[0]["input"], json!(format!("{}...", "é".repeat(64))));
+        assert_eq!(echoed(&"a".repeat(64)), json!("a".repeat(64)));
         assert_eq!(
             (long[0]["type"].clone(), long[0]["ctx"].clone()),
             (json!("string_too_long"), json!({"max_length": 80}))
         );
-        assert!(string_entries("reference", "wanted:2024-12345_a.b", 0, REFERENCE_MAX, true).is_empty());
-        let bad = string_entries("reference", "emp 1042", 0, REFERENCE_MAX, true);
+        assert!(string_entries("reference", "wanted:2024-12345_a.b", REFERENCE_MAX, true).is_empty());
+        let bad = string_entries("reference", "emp 1042", REFERENCE_MAX, true);
         assert_eq!(bad[0]["msg"], "String should match pattern '^[A-Za-z0-9_.:-]{1,64}$'");
         assert_eq!(bad[0]["ctx"], json!({"pattern": "^[A-Za-z0-9_.:-]{1,64}$"}));
-        assert_eq!(string_entries("reference", "", 0, REFERENCE_MAX, true)[0]["type"], "string_pattern_mismatch");
-        assert!(string_entries("label", "", 0, LABEL_MAX, false).is_empty());
+        let empty = string_entries("reference", "", REFERENCE_MAX, true);
+        assert_eq!((empty[0]["type"].clone(), empty[0]["input"].clone()), (json!("string_too_short"), json!("")));
+        assert_eq!(string_entries("label", "", LABEL_MAX, false)[0]["type"], "string_too_short");
     }
 
     #[tokio::test]
@@ -266,12 +281,12 @@ mod tests {
         let e = c.create("x".repeat(81)).await.unwrap_err();
         assert_eq!(kinds(&e), [("string_too_long".to_owned(), json!(["body", "name"]))]);
         let badge = || Image::url("badge", "https://files.example.com/badge.jpg");
-        // An empty reference fails the pattern; its length is checked first.
+        // An empty reference and an empty label are too short.
         let e = c.enroll("col_1", badge(), "", Some(&"l".repeat(129))).await.unwrap_err();
         assert_eq!(
             kinds(&e),
             [
-                ("string_pattern_mismatch".to_owned(), json!(["body", "reference"])),
+                ("string_too_short".to_owned(), json!(["body", "reference"])),
                 ("string_too_long".to_owned(), json!(["body", "label"]))
             ]
         );
