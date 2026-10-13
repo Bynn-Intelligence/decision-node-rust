@@ -352,6 +352,8 @@ pub struct FaceRecognitionReading {
     pub image: String,
     /// How many faces were searched. It may be more than `matches` lists.
     pub faces: u64,
+    /// The name of the collection searched, as sent; `None` when absent.
+    pub collection_name: Option<String>,
     /// The faces that match an enrolled one, in the order sent.
     pub matches: Vec<FaceMatch>,
     /// The reading as received.
@@ -374,6 +376,10 @@ pub struct FaceMatch {
     pub name: Option<String>,
     /// The enrolled face's label, when it has one.
     pub label: Option<String>,
+    /// The name of the collection the enrolled face is in, as sent.
+    pub collection_name: Option<String>,
+    /// The enrolled face's metadata, the object as sent; `None` when absent.
+    pub metadata: Option<Map<String, Value>>,
 }
 
 /// A face's box: its top-left and bottom-right corners, exactly as sent (in
@@ -494,12 +500,18 @@ impl Reading {
                     reference: m.get("reference")?.as_str()?.to_owned(),
                     name: text(m, "name")?,
                     label: text(m, "label")?,
+                    collection_name: text(m, "collection_name")?,
+                    metadata: match m.get("metadata") {
+                        None | Some(Value::Null) => None,
+                        Some(v) => Some(v.as_object()?.clone()),
+                    },
                 })
             })
             .collect::<Option<Vec<_>>>()?;
         Some(Reading::FaceRecognition(FaceRecognitionReading {
             image: obj.get("image")?.as_str()?.to_owned(),
             faces: obj.get("faces")?.as_u64()?,
+            collection_name: text(obj, "collection_name")?,
             matches,
             raw: raw.clone(),
         }))
@@ -748,10 +760,44 @@ mod tests {
         );
         assert_eq!(m.bbox.y1, 20.5);
         assert_eq!((w.matches[1].name.as_deref(), w.matches[1].collection.as_str()), (None, "celebrities"));
+        assert_eq!(
+            (w.collection_name.as_deref(), m.collection_name.as_deref(), m.metadata.as_ref()),
+            (None, None, None)
+        );
         for (i, reading) in fr.iter().enumerate().skip(1) {
             assert!(matches!(reading, Reading::Unknown(u) if u.booster == "face_recognition"), "{i}");
         }
         assert_eq!(fr[0].image(), Some("door"));
+    }
+
+    #[test]
+    fn face_recognition_names_and_metadata() {
+        let b = json!({"x1": 1, "y1": 2, "x2": 3, "y2": 4});
+        let m = |extra: Value| {
+            let mut v = json!({"box": b, "score": 0.9, "collection": "col_1", "reference": "emp-1"});
+            v.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+            v
+        };
+        let body = json!({"face_recognition": {"version": "face_recognition-v1", "status": "ok", "latency_ms": 5, "results": [
+            {"image": "a", "faces": 1, "collection_name": "Staff",
+             "matches": [m(json!({"collection_name": "Staff", "metadata": {"desk": "front", "badge": 1042}}))]},
+            {"image": "b", "faces": 1, "collection_name": null, "matches": [m(json!({"metadata": null, "collection_name": null}))]},
+            {"image": "c", "faces": 1, "collection_name": 3, "matches": []},
+            {"image": "d", "faces": 1, "matches": [m(json!({"collection_name": 3}))]},
+            {"image": "e", "faces": 1, "matches": [m(json!({"metadata": "x"}))]},
+            {"image": "f", "faces": 1, "matches": [m(json!({"metadata": []}))]}
+        ]}});
+        let r = &evidence_from_body(Some(&body)).unwrap()["face_recognition"].results;
+        let a = r[0].as_face_recognition().unwrap();
+        assert_eq!(a.collection_name.as_deref(), Some("Staff"));
+        assert_eq!(a.matches[0].collection_name.as_deref(), Some("Staff"));
+        let meta = a.matches[0].metadata.as_ref().unwrap();
+        assert_eq!((meta["desk"].clone(), meta["badge"].clone()), (json!("front"), json!(1042)));
+        let b = r[1].as_face_recognition().unwrap();
+        assert_eq!((b.collection_name.as_deref(), b.matches[0].metadata.as_ref()), (None, None));
+        for (i, reading) in r.iter().enumerate().skip(2) {
+            assert!(matches!(reading, Reading::Unknown(_)), "{i}");
+        }
     }
 
     #[test]

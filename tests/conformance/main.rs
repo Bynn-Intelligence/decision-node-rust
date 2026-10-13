@@ -1216,8 +1216,10 @@ fn norm_reading(r: &Reading) -> Value {
         Reading::FaceDetection(f) => json!({"kind": "face_detection", "image": f.image, "faces": f.faces,
             "detections": f.detections.iter().map(|d| json!({"box": norm_box(&d.bbox), "confidence": num(d.confidence)})).collect::<Vec<_>>()}),
         Reading::FaceRecognition(w) => json!({"kind": "face_recognition", "image": w.image, "faces": w.faces,
+            "collection_name": w.collection_name,
             "matches": w.matches.iter().map(|m| json!({"box": norm_box(&m.bbox), "score": num(m.score), "collection": m.collection,
-                "reference": m.reference, "name": m.name, "label": m.label})).collect::<Vec<_>>()}),
+                "reference": m.reference, "name": m.name, "label": m.label, "collection_name": m.collection_name,
+                "metadata": m.metadata})).collect::<Vec<_>>()}),
         _ => json!({"kind": "unknown", "raw": r.raw()}),
     }
 }
