@@ -1,5 +1,7 @@
 # DecisionNode Rust SDK
 
+[DecisionNode](https://decisionnode.com) is a decision engine: send it text, JSON or images with a question, and it answers with calibrated probabilities.
+
 The official Rust client for the [DecisionNode](https://decisionnode.com) API: typed `truth`, `choice`, `score`, `number`, `point` and `box` decisions over any state, with up to 16 images, videos sent as frames, boosters, fine-tuned models, sessions, batches, retries and typed errors. Async on [reqwest](https://docs.rs/reqwest) and Tokio, with an optional blocking client.
 
 The client checks every request against the API's fixed rules before it sends anything, reuses its connections, and picks the fastest form for each image, so a call costs one round trip wherever one is enough.
