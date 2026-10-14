@@ -85,6 +85,7 @@ println!("{}", answer.truth); // 0.97
 | `upload(images)` | `POST /v1/uploads` and one `PUT` per image not uploaded before | One upload id per image |
 | `open_session(options)`, `supervise(options, feed, on_reply)` | Sessions, see [Sessions](#sessions) | `Session` |
 | `batches()`, `run_batch(requests)` | The Batch API, see [Batches](#batches) | `Batch`, `BatchResult` |
+| `usage()` | `GET /v1/keys/{key_id}/usage` and `GET /v1/usage`, see [Usage by key](#usage-by-key) | The API's objects as sent |
 | `check_decide(&request)`, `check_session(&options)`, `check_batch(&requests)`, `check_batch_add(&requests)`, `Session::check_frame(&frame)` | Nothing: every local check the call would run | `Ok(())`, or the error the call would return |
 | `decide_raw(body)` | The body exactly as given | The response body as `serde_json::Value`, for API fields this version does not know yet |
 
@@ -402,6 +403,32 @@ for result in run.results {
 ```
 
 `batches()` gives each call on its own: `create`, `add`, `finalize`, `get`, `list`, `results`, `stream_results` and `cancel`. `results` reads the whole file; `stream_results` reads it from the network line by line, a `Stream` of results (an `Iterator` in the blocking client) that holds one line at a time however large the file. Lines carry their `custom_id`, the model (the request's, else the client's) and the state (`""` when none); their local images follow the inline or upload rule per line. A result line's error is a value with the kind and fields the same status gives on the live API. `get`, `list`, `results` and `cancel` are retried like every call; `create`, `add` and `finalize` only on `429` and `529`, never after a timeout or a lost answer, so a batch is never created twice. A `finalize` answered `409` after an earlier one went through returns the batch.
+
+## Usage by key
+
+`usage()` reads what each API key of your workspace used and cost: requests, input tokens, booster calls and the charge in USD, as totals or by hour, day or month, and split by model or by channel. It takes a key that may read usage (full access or manage device keys); a decisions-only key gets the API's `403` `key_scope_denied`.
+
+```rust
+use decisionnode::{UsagePeriod, UsageQuery};
+
+// One key: the UTC month so far, by day.
+let month = dn.usage().key("key_00000000000000000000000000000d01", &UsagePeriod::new().granularity("day")).await?;
+println!("{}", month["totals"]["cost"]["usd"]);
+
+// Every key of a customer over September, all pages.
+let september = UsageQuery::new("2026-09-01T00:00:00Z", "2026-10-01T00:00:00Z").label("customer", "acme");
+for item in dn.usage().all(&september).await? {
+    println!("{} {}", item["key"]["id"], item["totals"]["cost"]["usd"]);
+}
+```
+
+| Call | Sends | Returns |
+|---|---|---|
+| `key(key_id, &UsagePeriod)` | `GET /v1/keys/{key_id}/usage`, with the period's `start`, `end`, `granularity` and `group_by` when set (left out, the API reads the UTC month so far) | The key's usage, as sent |
+| `list(&UsageQuery)` | `GET /v1/usage`: `start` and `end`, and the filters set: `label` (by name, as `name:value`), `device_id`, `key_id` (up to 100), `scope`, `status`, `include_empty`, `limit` (1 to 1000) and `cursor` | One page, as sent: `period`, `as_of`, `items` and `next_cursor` |
+| `all(&UsageQuery)` | `list`'s pages, following `next_cursor` until it is `null` | Every page's `items`, in order |
+
+A page can hold fewer keys than its `limit`, so read every page, or use `all`. The query rules the API checks (`granularity` is `none`, `hour`, `day` or `month`; `group_by` is `model` or `channel`; a label filter is `name:value` as labels are written; and the rules of `device_id`, the key ids, `scope`, `status` and `limit`) are refused before anything is sent, with the API's own `BadRequest` error and message. The period's rules (at most 400 days, `hour` over at most 7 days) are the API's.
 
 ## Errors
 

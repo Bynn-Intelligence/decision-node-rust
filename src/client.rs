@@ -1231,7 +1231,10 @@ impl DecisionNode {
                     let unpriced = status == 529
                         && error().details().and_then(|d| d.get("reason")).and_then(Value::as_str)
                             == Some("enrollment_unpriced");
-                    let retryable = retryable && !unpriced;
+                    // A key's daily spend cap: its wait runs to 00:00 UTC, so it is
+                    // raised at once.
+                    let capped = status == 429 && error().error_type() == Some("key_spend_cap_reached");
+                    let retryable = retryable && !unpriced && !capped;
                     if !retryable || attempt >= inner.max_retries {
                         return Err(Error::from_response(status, &headers, &body));
                     }
@@ -1827,6 +1830,44 @@ mod tests {
         let (a, b) = (new_idempotency_key(), new_idempotency_key());
         assert!(re.is_match(&a), "{a}");
         assert_ne!(a, b);
+    }
+
+    #[tokio::test]
+    async fn a_spent_daily_cap_is_not_retried() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let seen = attempts.clone();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                seen.fetch_add(1, Ordering::SeqCst);
+                let mut buf = vec![0u8; 8192];
+                let len = sock.read(&mut buf).await.unwrap_or(0);
+                let capped = String::from_utf8_lossy(&buf[..len]).contains("capped");
+                let kind = if capped { "key_spend_cap_reached" } else { "rate_limit_error" };
+                let body = format!(r#"{{"detail":{{"error_type":"{kind}","message":"m"}}}}"#);
+                let reply = format!(
+                    "HTTP/1.1 429 Too Many Requests\r\nContent-Type: application/json\r\nRetry-After: 3600\r\nretry-after-ms: 1\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = sock.write_all(reply.as_bytes()).await;
+            }
+        });
+        let dn = DecisionNode::builder()
+            .api_key("k")
+            .base_url(format!("http://{addr}"))
+            .sleeper(|_| Box::pin(async {}))
+            .build()
+            .unwrap();
+        let capped = DecideRequest::new().state("capped").question("q", truth("?"));
+        let e = dn.decide(capped).await.unwrap_err();
+        assert_eq!((e.kind(), e.error_type()), (ErrorKind::RateLimit, Some("key_spend_cap_reached")));
+        assert_eq!((e.retry_after(), attempts.swap(0, Ordering::SeqCst)), (Some(Duration::from_millis(1)), 1));
+        // Any other 429 is retried as always.
+        let e = dn.decide(DecideRequest::new().question("q", truth("?"))).await.unwrap_err();
+        assert_eq!((e.kind(), attempts.load(Ordering::SeqCst)), (ErrorKind::RateLimit, 3));
     }
 
     #[tokio::test]

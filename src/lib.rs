@@ -62,6 +62,7 @@ mod safety;
 #[cfg(feature = "sessions")]
 mod session;
 mod upload;
+mod usage;
 mod video;
 
 pub use batch::{
@@ -92,6 +93,7 @@ pub use response::{
 pub use safety::Safety;
 #[cfg(feature = "sessions")]
 pub use session::{Frame, FrameError, Reply, Session, SessionClosed, SessionEvent, SessionOptions, REOPEN_CODES};
+pub use usage::{UsagePeriod, UsageQuery, UsageReports};
 pub use video::{Video, VideoFrame};
 
 pub use indexmap;

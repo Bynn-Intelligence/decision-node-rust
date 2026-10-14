@@ -31,6 +31,7 @@ use crate::error::{Error, ErrorKind, Result};
 use crate::image::Image;
 use crate::question::{Choice, Number, Score, Truth};
 use crate::response::{ChoiceAnswer, Decision, DecisionResult, ModelInfo, NumberAnswer, ScoreAnswer, TruthAnswer};
+use crate::usage::{UsagePeriod, UsageQuery};
 
 /// The synchronous DecisionNode client.
 ///
@@ -195,6 +196,11 @@ impl DecisionNode {
         self.run(self.client.upload(images))
     }
 
+    /// The workspace's usage, key by key. See [`crate::DecisionNode::usage`].
+    pub fn usage(&self) -> UsageReports<'_> {
+        UsageReports { client: self }
+    }
+
     /// The workspace's collections of faces. See
     /// [`crate::DecisionNode::collections`].
     pub fn collections(&self) -> Collections<'_> {
@@ -219,6 +225,29 @@ impl DecisionNode {
         timeout: Duration,
     ) -> Result<BatchRun> {
         self.run(self.client.run_batch_with(requests, poll_interval, timeout))
+    }
+}
+
+/// The per-key usage of a blocking client. See [`crate::UsageReports`].
+#[derive(Clone, Copy, Debug)]
+pub struct UsageReports<'a> {
+    client: &'a DecisionNode,
+}
+
+impl UsageReports<'_> {
+    /// See [`crate::UsageReports::key`].
+    pub fn key(&self, key_id: &str, period: &UsagePeriod) -> Result<Value> {
+        self.client.run(self.client.client.usage().key(key_id, period))
+    }
+
+    /// See [`crate::UsageReports::list`].
+    pub fn list(&self, query: &UsageQuery) -> Result<Value> {
+        self.client.run(self.client.client.usage().list(query))
+    }
+
+    /// See [`crate::UsageReports::all`].
+    pub fn all(&self, query: &UsageQuery) -> Result<Vec<Value>> {
+        self.client.run(self.client.client.usage().all(query))
     }
 }
 

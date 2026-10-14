@@ -31,7 +31,7 @@ use decisionnode::{
     ClientBuilder, DecideRequest, Decision, DecisionNode, DecisionResult, Error, Image, Levels, ModelInfo, Number,
     NumberAnswer, Options, Point, Question, Reading, Safety, Score, ScoreAnswer, Truth, TruthAnswer, Video, VideoFrame,
 };
-use decisionnode::{Evidence, FaceBox, ItemQuery, ItemUpdate};
+use decisionnode::{Evidence, FaceBox, ItemQuery, ItemUpdate, UsagePeriod, UsageQuery};
 use serde_json::{json, Map, Value};
 use sha2::Digest;
 
@@ -332,6 +332,63 @@ type Refs = HashMap<String, Outcome>;
 /// as its JSON text.
 fn text_of(v: &Value) -> String {
     v.as_str().map_or_else(|| v.to_string(), str::to_owned)
+}
+
+/// The period of a case's `usage.key` call.
+fn usage_period(args: &Value) -> UsagePeriod {
+    let mut p = UsagePeriod::new();
+    if let Some(v) = opt(args, "start") {
+        p = p.start(text_of(v));
+    }
+    if let Some(v) = opt(args, "end") {
+        p = p.end(text_of(v));
+    }
+    if let Some(v) = opt(args, "granularity") {
+        p = p.granularity(text_of(v));
+    }
+    if let Some(v) = opt(args, "group_by") {
+        p = p.group_by(text_of(v));
+    }
+    p
+}
+
+/// The query of a case's `usage.list` or `usage.all` call.
+fn usage_query(args: &Value) -> UsageQuery {
+    let mut q = UsageQuery::new(
+        opt(args, "start").map(text_of).unwrap_or_default(),
+        opt(args, "end").map(text_of).unwrap_or_default(),
+    );
+    if let Some(v) = opt(args, "granularity") {
+        q = q.granularity(text_of(v));
+    }
+    if let Some(v) = opt(args, "group_by") {
+        q = q.group_by(text_of(v));
+    }
+    for (name, value) in opt(args, "labels").and_then(Value::as_object).into_iter().flatten() {
+        q = q.label(name.clone(), text_of(value));
+    }
+    if let Some(v) = opt(args, "device_id") {
+        q = q.device_id(text_of(v));
+    }
+    for id in opt(args, "key_ids").and_then(Value::as_array).into_iter().flatten() {
+        q = q.key_id(text_of(id));
+    }
+    if let Some(v) = opt(args, "scope") {
+        q = q.scope(text_of(v));
+    }
+    if let Some(v) = opt(args, "status") {
+        q = q.status(text_of(v));
+    }
+    if let Some(v) = opt(args, "include_empty").and_then(Value::as_bool) {
+        q = q.include_empty(v);
+    }
+    if let Some(v) = opt(args, "limit").and_then(Value::as_i64) {
+        q = q.limit(v);
+    }
+    if let Some(v) = opt(args, "cursor") {
+        q = q.cursor(text_of(v));
+    }
+    q
 }
 
 fn opt<'a>(args: &'a Value, key: &str) -> Option<&'a Value> {
@@ -764,6 +821,9 @@ enum Prepared {
     CollectionListItems(String, ItemQuery),
     CollectionUpdateItem(String, String, ItemUpdate),
     CollectionDeleteItem(String, String),
+    UsageKey(String, UsagePeriod),
+    UsageList(UsageQuery),
+    UsageAll(UsageQuery),
 }
 
 /// The call of a case. An argument the SDK refuses while it is being built
@@ -859,6 +919,9 @@ fn prepare(root: &Path, call: &Value, refs: &Refs) -> Result<Prepared, Error> {
             Prepared::CollectionUpdateItem(text("collection_id"), text("item_id"), u)
         }
         "collections.delete_item" => Prepared::CollectionDeleteItem(text("collection_id"), text("item_id")),
+        "usage.key" => Prepared::UsageKey(text("key_id"), usage_period(args)),
+        "usage.list" => Prepared::UsageList(usage_query(args)),
+        "usage.all" => Prepared::UsageAll(usage_query(args)),
         other => panic!("unknown method {other} (is the sessions feature on?)"),
     })
 }
@@ -982,6 +1045,9 @@ async fn invoke_async(c: &DecisionNode, p: Prepared) -> Outcome {
         Prepared::CollectionDeleteItem(id, item) => {
             wrap(c.collections().delete_item(&id, &item).await, Outcome::Collection)
         }
+        Prepared::UsageKey(id, p) => wrap(c.usage().key(&id, &p).await, Outcome::Collection),
+        Prepared::UsageList(q) => wrap(c.usage().list(&q).await, Outcome::Collection),
+        Prepared::UsageAll(q) => wrap(c.usage().all(&q).await, Outcome::CollectionList),
     }
 }
 
@@ -1038,6 +1104,9 @@ fn invoke_blocking(c: &decisionnode::blocking::DecisionNode, p: Prepared) -> Out
         }
         Prepared::CollectionListItems(id, q) => wrap(c.collections().list_items_with(&id, &q), Outcome::Collection),
         Prepared::CollectionDeleteItem(id, item) => wrap(c.collections().delete_item(&id, &item), Outcome::Collection),
+        Prepared::UsageKey(id, p) => wrap(c.usage().key(&id, &p), Outcome::Collection),
+        Prepared::UsageList(q) => wrap(c.usage().list(&q), Outcome::Collection),
+        Prepared::UsageAll(q) => wrap(c.usage().all(&q), Outcome::CollectionList),
     }
 }
 
@@ -1522,18 +1591,18 @@ fn check_outcome(spec: &Value, result: &OutcomeRef<'_>, path: &str) -> Result<()
             check_results_outcome(spec, r, path)
         }
         ("checked", Outcome::Checked) => Ok(()),
-        ("collection" | "item" | "item_page" | "deleted", Outcome::Collection(v)) => {
+        ("collection" | "item" | "item_page" | "deleted" | "key_usage" | "usage_page", Outcome::Collection(v)) => {
             matches(spec.get(kind).unwrap_or(&empty), v, &format!("{path}.{kind}"))
         }
-        ("collections", Outcome::CollectionList(list)) => {
-            let exp = spec.get("collections").and_then(Value::as_array).cloned().unwrap_or_default();
+        ("collections" | "usage_items", Outcome::CollectionList(list)) => {
+            let exp = spec.get(kind).and_then(Value::as_array).cloned().unwrap_or_default();
             if exp.len() != list.len() {
-                return Err(Fail(format!("{path}: expected {} collections, got {}", exp.len(), list.len())));
+                return Err(Fail(format!("{path}: expected {} entries, got {}", exp.len(), list.len())));
             }
             exp.iter()
                 .zip(list)
                 .enumerate()
-                .try_for_each(|(i, (e, got))| matches(e, got, &format!("{path}.collections[{i}]")))
+                .try_for_each(|(i, (e, got))| matches(e, got, &format!("{path}.{kind}[{i}]")))
         }
         #[cfg(feature = "sessions")]
         ("session", Outcome::Session(s)) => {
@@ -1696,6 +1765,19 @@ fn check_request(exp: &Value, got: &Value, at: &str, any_body: bool) -> Result<(
     }
     if let Some(q) = exp.get("query") {
         let parsed = Value::Object(parse_query(got["query"].as_str().unwrap_or_default()));
+        if !same(q, &parsed) {
+            return Err(Fail(format!("{at} query: expected {q}, got {parsed}")));
+        }
+    }
+    if let Some(q) = exp.get("query_all") {
+        // Every value of each parameter, a repeated one in its order.
+        let mut all = Map::new();
+        for pair in got["query"].as_str().unwrap_or_default().split('&').filter(|p| !p.is_empty()) {
+            let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
+            let values = all.entry(percent_decode(k)).or_insert_with(|| json!([]));
+            values.as_array_mut().unwrap().push(Value::String(percent_decode(v)));
+        }
+        let parsed = Value::Object(all);
         if !same(q, &parsed) {
             return Err(Fail(format!("{at} query: expected {q}, got {parsed}")));
         }
@@ -1974,10 +2056,22 @@ fn run_response(ctx: &Ctx, driver: Driver, case: &Value) -> Result<(), Fail> {
             Outcome::Raw(got) => Err(Fail(format!("raw: expected {}, got {}", short(r), short(got)))),
             o => Err(Fail(format!("expected a raw body, got {}", describe(o)))),
         }
-    } else if let Some(kind) =
-        ["batch", "batch_page", "batch_results", "session", "collection", "collections", "item", "item_page", "deleted"]
-            .into_iter()
-            .find(|k| exp.get(*k).is_some())
+    } else if let Some(kind) = [
+        "batch",
+        "batch_page",
+        "batch_results",
+        "session",
+        "collection",
+        "collections",
+        "item",
+        "item_page",
+        "deleted",
+        "key_usage",
+        "usage_page",
+        "usage_items",
+    ]
+    .into_iter()
+    .find(|k| exp.get(*k).is_some())
     {
         check(kind)
     } else if let Some(ids) = exp.get("upload_ids") {

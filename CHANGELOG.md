@@ -8,6 +8,9 @@ Implements DecisionNode SDK specification version 1.3 (`SPEC_VERSION`): boosters
 
 ### Added
 
+- Usage by key: `DecisionNode::usage()` (and the blocking client's) with `key(key_id, &UsagePeriod)` for `GET /v1/keys/{key_id}/usage`, `list(&UsageQuery)` for `GET /v1/usage` and `all(&UsageQuery)`, which follows `next_cursor` until it is `null`, each returning the API's objects as sent. The query rules the API checks are refused before anything is sent, with its own error and message.
+- `rustls` 0.23.46 in `Cargo.lock`.
+- A `429` `key_spend_cap_reached` (a key's daily spend cap, whose wait runs to 00:00 UTC) is raised at once as a `RateLimit` error and never retried; every other `429` is retried as before.
 - `ModelInfo::price_per_million_input`, `price_per_million_output`, `price_per_million_image`, `price_per_million_video` and `batch_price_factor`, read as sent and `None` when the entry does not state them; they stay in `limits` too.
 - `FaceRecognitionReading::collection_name`, and on each `FaceMatch` its `collection_name` and its enrolled face's `metadata` (the object as sent), each `None` when absent; one present but of the wrong type makes the reading a `Reading::Unknown`.
 - Collections items: `enroll` takes `metadata`, sent only when given; `update_item` with an `ItemUpdate` (`reference`, `label`, `clear_label`, `metadata`) changes an item, sending only the fields set, with an `Idempotency-Key` and the retries of `enroll`; `list_items_with` takes an `ItemQuery` with `offset`, `limit`, `reference` and `reference_prefix`. Metadata (an object of at most 20 keys of 1 to 40 of `a-z`, `0-9` and `_`, each value a text of at most 500 characters, a number or a boolean), an empty change and a malformed or doubled reference query are refused before anything is sent, with the API's own error. `Error::details` holds the error body's `detail.details`; a `529` whose reason is `enrollment_unpriced` is not retried.
