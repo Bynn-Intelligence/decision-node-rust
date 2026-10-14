@@ -215,19 +215,40 @@ fn key_id_ok(id: &str) -> bool {
 }
 
 /// The list's query parameters, checked as the API checks them, in its order.
-fn list_query(q: &UsageQuery) -> Result<Vec<(&'static str, String)>> {
-    let mut out = period_query(&q.period)?;
-    for (name, value) in &q.labels {
+/// The label filters, by name, each checked as the API checks it.
+pub(crate) fn label_filters(labels: &BTreeMap<String, String>, out: &mut Vec<(&'static str, String)>) -> Result<()> {
+    for (name, value) in labels {
         let length = value.chars().count();
         if !label_name_ok(name) || !(1..=64).contains(&length) || value.chars().any(char::is_control) {
             return Err(usage_error("A label filter is name:value, as labels are written."));
         }
         out.push(("label", format!("{name}:{value}")));
     }
+    Ok(())
+}
+
+/// A `device_id` filter, checked as the API checks it.
+pub(crate) fn device_filter(device_id: &str) -> Result<()> {
+    let d = device_id;
+    if !(1..=128).contains(&d.len()) || !d.bytes().all(|b| (0x20..=0x7e).contains(&b)) || d.starts_with(' ') {
+        return Err(usage_error("device_id is 1 to 128 printable ASCII characters, not starting with a space."));
+    }
+    Ok(())
+}
+
+/// A `status` filter, checked as the API checks it.
+pub(crate) fn status_filter(status: &str) -> Result<()> {
+    if !matches!(status, "active" | "expired" | "revoked" | "all") {
+        return Err(usage_error("status is active, expired, revoked or all."));
+    }
+    Ok(())
+}
+
+fn list_query(q: &UsageQuery) -> Result<Vec<(&'static str, String)>> {
+    let mut out = period_query(&q.period)?;
+    label_filters(&q.labels, &mut out)?;
     if let Some(d) = &q.device_id {
-        if !(1..=128).contains(&d.len()) || !d.bytes().all(|b| (0x20..=0x7e).contains(&b)) || d.starts_with(' ') {
-            return Err(usage_error("device_id is 1 to 128 printable ASCII characters, not starting with a space."));
-        }
+        device_filter(d)?;
         out.push(("device_id", d.clone()));
     }
     for (i, id) in q.key_ids.iter().enumerate() {
@@ -246,9 +267,7 @@ fn list_query(q: &UsageQuery) -> Result<Vec<(&'static str, String)>> {
         out.push(("scope", s.clone()));
     }
     if let Some(s) = &q.status {
-        if !matches!(s.as_str(), "active" | "expired" | "revoked" | "all") {
-            return Err(usage_error("status is active, expired, revoked or all."));
-        }
+        status_filter(s)?;
         out.push(("status", s.clone()));
     }
     if let Some(e) = q.include_empty {
@@ -267,7 +286,7 @@ fn list_query(q: &UsageQuery) -> Result<Vec<(&'static str, String)>> {
 }
 
 /// Every byte but the unreserved characters written as `%XX`.
-fn escape(text: &str) -> String {
+pub(crate) fn escape(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     for b in text.bytes() {
         if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {

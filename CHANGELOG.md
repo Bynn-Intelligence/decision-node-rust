@@ -8,6 +8,7 @@ Implements DecisionNode SDK specification version 1.3 (`SPEC_VERSION`): boosters
 
 ### Added
 
+- Device keys: `DecisionNode::keys()` (and the blocking client's) with `create(&NewKey)` (`POST /v1/keys`, with an `Idempotency-Key`, yours or a new one kept across attempts, and the retries of a collection's create), `list(&KeyQuery)`, `all(&KeyQuery)`, `update(key_id, &KeyUpdate)` (whose `clear_` forms send `null`), `revoke(key_id)` and `revoke_by_labels(&KeyRevocation)`, each returning the API's objects as sent. Malformed list filters, a `limit` outside 1 to 200, an `Idempotency-Key` that is not 1 to 255 printable ASCII characters and an empty change are refused before anything is sent.
 - Usage by key: `DecisionNode::usage()` (and the blocking client's) with `key(key_id, &UsagePeriod)` for `GET /v1/keys/{key_id}/usage`, `list(&UsageQuery)` for `GET /v1/usage` and `all(&UsageQuery)`, which follows `next_cursor` until it is `null`, each returning the API's objects as sent. The query rules the API checks are refused before anything is sent, with its own error and message.
 - `rustls` 0.23.46 in `Cargo.lock`.
 - A `429` `key_spend_cap_reached` (a key's daily spend cap, whose wait runs to 00:00 UTC) is raised at once as a `RateLimit` error and never retried; every other `429` is retried as before.

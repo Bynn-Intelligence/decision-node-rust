@@ -1077,8 +1077,26 @@ impl DecisionNode {
     /// same on every attempt, so the server applies the call once however
     /// often it is tried, and it retries as [`Policy::Idempotent`].
     pub(crate) async fn request_json_idempotent(&self, method: Method, path: &str, body: &Value) -> Result<Reply> {
+        self.request_json_with_key(method, path, body, &new_idempotency_key()).await
+    }
+
+    /// [`DecisionNode::request_json_idempotent`] with the caller's own
+    /// `Idempotency-Key`, checked first as the API checks it: 1 to 255
+    /// printable ASCII characters.
+    pub(crate) async fn request_json_with_key(
+        &self,
+        method: Method,
+        path: &str,
+        body: &Value,
+        key: &str,
+    ) -> Result<Reply> {
+        if !(1..=255).contains(&key.len()) || !key.bytes().all(|b| (b' '..=b'~').contains(&b)) {
+            return Err(crate::check::usage_error(
+                "Idempotency-Key must be sent once, as 1 to 255 printable ASCII characters.",
+            ));
+        }
         let payload = Some(Payload::json(body)?);
-        let key = HeaderValue::from_str(&new_idempotency_key()).expect("a UUID is a valid header value");
+        let key = HeaderValue::from_str(key).expect("printable ASCII is a valid header value");
         match self.exchange(method, path, payload, Policy::Idempotent, false, Some(key)).await? {
             Exchanged::Whole(raw) => Self::json_reply(raw),
             Exchanged::Open(_) => unreachable!("a whole reply was asked for"),

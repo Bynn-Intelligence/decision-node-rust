@@ -29,6 +29,7 @@ use crate::client::{CallOptions, ClientBuilder, DecideRequest};
 use crate::collections::{ItemQuery, ItemUpdate};
 use crate::error::{Error, ErrorKind, Result};
 use crate::image::Image;
+use crate::keys::{KeyQuery, KeyRevocation, KeyUpdate, NewKey};
 use crate::question::{Choice, Number, Score, Truth};
 use crate::response::{ChoiceAnswer, Decision, DecisionResult, ModelInfo, NumberAnswer, ScoreAnswer, TruthAnswer};
 use crate::usage::{UsagePeriod, UsageQuery};
@@ -196,6 +197,11 @@ impl DecisionNode {
         self.run(self.client.upload(images))
     }
 
+    /// The workspace's device keys. See [`crate::DecisionNode::keys`].
+    pub fn keys(&self) -> Keys<'_> {
+        Keys { client: self }
+    }
+
     /// The workspace's usage, key by key. See [`crate::DecisionNode::usage`].
     pub fn usage(&self) -> UsageReports<'_> {
         UsageReports { client: self }
@@ -225,6 +231,44 @@ impl DecisionNode {
         timeout: Duration,
     ) -> Result<BatchRun> {
         self.run(self.client.run_batch_with(requests, poll_interval, timeout))
+    }
+}
+
+/// The device keys of a blocking client. See [`crate::Keys`].
+#[derive(Clone, Copy, Debug)]
+pub struct Keys<'a> {
+    client: &'a DecisionNode,
+}
+
+impl Keys<'_> {
+    /// See [`crate::Keys::create`].
+    pub fn create(&self, key: &NewKey) -> Result<Value> {
+        self.client.run(self.client.client.keys().create(key))
+    }
+
+    /// See [`crate::Keys::list`].
+    pub fn list(&self, query: &KeyQuery) -> Result<Value> {
+        self.client.run(self.client.client.keys().list(query))
+    }
+
+    /// See [`crate::Keys::all`].
+    pub fn all(&self, query: &KeyQuery) -> Result<Vec<Value>> {
+        self.client.run(self.client.client.keys().all(query))
+    }
+
+    /// See [`crate::Keys::update`].
+    pub fn update(&self, key_id: &str, update: &KeyUpdate) -> Result<Value> {
+        self.client.run(self.client.client.keys().update(key_id, update))
+    }
+
+    /// See [`crate::Keys::revoke`].
+    pub fn revoke(&self, key_id: &str) -> Result<Value> {
+        self.client.run(self.client.client.keys().revoke(key_id))
+    }
+
+    /// See [`crate::Keys::revoke_by_labels`].
+    pub fn revoke_by_labels(&self, revocation: &KeyRevocation) -> Result<Value> {
+        self.client.run(self.client.client.keys().revoke_by_labels(revocation))
     }
 }
 

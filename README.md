@@ -86,6 +86,7 @@ println!("{}", answer.truth); // 0.97
 | `open_session(options)`, `supervise(options, feed, on_reply)` | Sessions, see [Sessions](#sessions) | `Session` |
 | `batches()`, `run_batch(requests)` | The Batch API, see [Batches](#batches) | `Batch`, `BatchResult` |
 | `usage()` | `GET /v1/keys/{key_id}/usage` and `GET /v1/usage`, see [Usage by key](#usage-by-key) | The API's objects as sent |
+| `keys()` | `/v1/keys`, see [Device keys](#device-keys) | The API's objects as sent |
 | `check_decide(&request)`, `check_session(&options)`, `check_batch(&requests)`, `check_batch_add(&requests)`, `Session::check_frame(&frame)` | Nothing: every local check the call would run | `Ok(())`, or the error the call would return |
 | `decide_raw(body)` | The body exactly as given | The response body as `serde_json::Value`, for API fields this version does not know yet |
 
@@ -429,6 +430,34 @@ for item in dn.usage().all(&september).await? {
 | `all(&UsageQuery)` | `list`'s pages, following `next_cursor` until it is `null` | Every page's `items`, in order |
 
 A page can hold fewer keys than its `limit`, so read every page, or use `all`. The query rules the API checks (`granularity` is `none`, `hour`, `day` or `month`; `group_by` is `model` or `channel`; a label filter is `name:value` as labels are written; and the rules of `device_id`, the key ids, `scope`, `status` and `limit`) are refused before anything is sent, with the API's own `BadRequest` error and message. The period's rules (at most 400 days, `hour` over at most 7 days) are the API's.
+
+## Device keys
+
+A "manage device keys" key, kept on your server, makes and manages decisions-only keys for your devices: one key per device, each with its own labels, limits, daily spend cap and expiry, so a lost device is revoked alone. `keys()` calls `/v1/keys`; any other key kind gets the API's `403` `key_scope_denied`.
+
+```rust
+use decisionnode::{KeyQuery, KeyRevocation, KeyUpdate, NewKey};
+
+let keys = dn.keys();
+let made = keys.create(&NewKey::new("Door 7").device_id("door-7").label("site", "berlin").daily_spend_cap(5.0)).await?;
+let secret = made["secret"].as_str().unwrap_or_default(); // shown this once: hand it to the device
+let id = made["key"]["id"].as_str().unwrap_or_default();
+
+keys.update(id, &KeyUpdate::new().name("Door 7, east").clear_daily_spend_cap()).await?;
+let berlin = keys.all(&KeyQuery::new().label("site", "berlin")).await?;
+keys.revoke(id).await?;
+keys.revoke_by_labels(&KeyRevocation::new().label("site", "berlin")).await?;
+```
+
+| Call | Sends | Returns |
+|---|---|---|
+| `create(&NewKey)` | `POST /v1/keys` with the fields set: `name`, `device_id`, `labels`, `limits`, `daily_spend_cap`, `expires_at`, `may_search_collections` | `{key, secret}` as sent; the secret is never shown again |
+| `list(&KeyQuery)`, `all(&KeyQuery)` | `GET /v1/keys` with the filters set: `label`, `device_id`, `status`, `limit` (1 to 200) and `cursor` | One page, `{items, next_cursor}`; `all` follows `next_cursor` and returns every page's `items` |
+| `update(key_id, &KeyUpdate)` | `PATCH /v1/keys/{key_id}` with the fields set; `clear_labels`, `clear_limits`, `clear_daily_spend_cap` and `clear_expires_at` send `null`, which removes the setting | The key as sent |
+| `revoke(key_id)` | `DELETE /v1/keys/{key_id}` | `{id, revoked}` |
+| `revoke_by_labels(&KeyRevocation)` | `POST /v1/keys/revoke` with `labels`, and `device_ids` and `dry_run` when set | `{revoked, more}` (or `{would_revoke, more}` for a dry run): call again while `more` is true |
+
+`create` sends an `Idempotency-Key`, yours (`NewKey::idempotency_key`) or a new one, the same on every attempt, so a retried create makes one key and answers the same secret. The client never logs a secret. A list filter the API would refuse, a `limit` outside 1 to 200, an `Idempotency-Key` that is not 1 to 255 printable ASCII characters and a change of nothing are refused before anything is sent, with the API's own error. A device's daily spend cap, once reached, answers its decisions with the `429` `key_spend_cap_reached` until 00:00 UTC; the client raises it at once instead of retrying.
 
 ## Errors
 

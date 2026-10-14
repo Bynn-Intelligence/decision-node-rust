@@ -56,6 +56,7 @@ mod collections;
 pub mod error;
 mod http;
 mod image;
+mod keys;
 pub mod question;
 mod response;
 mod safety;
@@ -82,6 +83,7 @@ pub use collections::{Collections, ItemQuery, ItemUpdate};
 pub use error::{DecisionNodeError, Error, ErrorKind, Result};
 pub use http::HttpSettings;
 pub use image::Image;
+pub use keys::{KeyQuery, KeyRevocation, KeyUpdate, Keys, NewKey};
 pub use question::{
     bounding_box, choice, number, point, score, truth, BoundingBox, Choice, Levels, Number, Options, Point, Question,
     Score, Truth,
