@@ -1,6 +1,8 @@
 # Runs only while the repository is public: nothing is analysed or published while it is private.
-# Push and branch protection events carry the visibility in their payload; a
+# Branch protection events carry the visibility in their payload; a
 # scheduled run carries no repository, so its first job reads it from the API.
+# No push trigger (decided 2026-10-14): Scorecard prints the event that
+# started it, and a push event names the pusher's email address.
 #
 # OpenSSF Scorecard: an automated, weekly audit of this repo's supply-chain
 # security posture (Signed-Releases, Token-Permissions, Pinned-Dependencies,
@@ -17,8 +19,6 @@ on:
   branch_protection_rule:
   schedule:
     - cron: '27 4 * * 1'
-  push:
-    branches: [main]
 
 permissions: read-all
 
