@@ -374,7 +374,7 @@ session.end().await?;
 
 ## Batches
 
-The Batch API answers up to 10,000 decide requests within 24 hours at half the price. `run_batch` does the whole lifecycle: it checks every request, creates a draft, adds the requests in calls of at most 10 MiB, finalizes, polls every 60 seconds (`run_batch_with` sets the interval, at least 10 seconds, and a limit; a longer `Retry-After` from the server wins) and returns the ended batch with its results.
+The Batch API answers up to 10,000 decide requests a batch for less than live calls: DecisionNode Flash at 50% off the live price and DecisionNode MoE at 30% off ([pricing](https://decisionnode.com/docs/pricing#batch-jobs)). A batch has no set finishing time, so poll it; requests still unanswered 24 hours after it is finalized expire, unbilled. `run_batch` does the whole lifecycle: it checks every request, creates a draft, adds the requests in calls of at most 10 MiB, finalizes, polls every 60 seconds (`run_batch_with` sets the interval, at least 10 seconds, and a limit; a longer `Retry-After` from the server wins) and returns the ended batch with its results.
 
 ```rust
 use decisionnode::{truth, BatchRequest, BatchStatus};

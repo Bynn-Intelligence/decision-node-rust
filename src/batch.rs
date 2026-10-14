@@ -1,5 +1,7 @@
-//! The Batch API: up to 10,000 decide requests answered within 24 hours at
-//! half the price, with results kept for 7 days.
+//! The Batch API: up to 10,000 decide requests a batch, for less than live
+//! calls (DecisionNode Flash 50% off, DecisionNode MoE 30% off), with results
+//! kept for 7 days. A batch has no set finishing time; requests unanswered 24
+//! hours after finalize expire unbilled.
 
 use std::collections::HashSet;
 use std::fmt;
@@ -29,8 +31,8 @@ pub(crate) const MAX_ADD_BYTES: usize = 10 * 1024 * 1024;
 pub const MIN_POLL_INTERVAL: Duration = Duration::from_secs(10);
 /// The poll interval of [`DecisionNode::run_batch`].
 pub const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(60);
-/// How long [`DecisionNode::run_batch`] waits for a batch to end: its 24 hours
-/// to run plus the time to queue it.
+/// How long [`DecisionNode::run_batch`] waits for a batch to end: the 24 hours
+/// after which its unanswered requests expire, plus the time to queue it.
 pub const DEFAULT_BATCH_TIMEOUT: Duration = Duration::from_secs(26 * 3600);
 
 /// One request of a batch: a decide request and the `custom_id` its result
