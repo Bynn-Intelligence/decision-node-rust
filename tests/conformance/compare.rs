@@ -34,6 +34,11 @@ fn same_order(a: &Value, b: &Value) -> bool {
     }
 }
 
+/// `{"$absent": true}` in an expectation: the key must be missing.
+fn absent(expected: &Value) -> bool {
+    expected.as_object().is_some_and(|m| m.len() == 1 && m.get("$absent") == Some(&Value::Bool(true)))
+}
+
 /// `{"$pattern": regex}` in an expectation: the regular expression it holds.
 fn pattern(expected: &Value) -> Option<&str> {
     match expected.as_object() {
@@ -62,7 +67,11 @@ pub fn same(a: &Value, b: &Value) -> bool {
             _ => x == y,
         },
         (Value::Object(x), Value::Object(y)) => {
-            x.len() == y.len() && x.iter().all(|(k, v)| y.get(k).is_some_and(|w| same(v, w)))
+            // A key expected `{"$absent": true}` must be missing, and does not count.
+            let present = x.iter().filter(|(_, v)| !absent(v)).count();
+            present == y.len()
+                && x.iter()
+                    .all(|(k, v)| if absent(v) { !y.contains_key(k) } else { y.get(k).is_some_and(|w| same(v, w)) })
         }
         (Value::Array(x), Value::Array(y)) => x.len() == y.len() && x.iter().zip(y).all(|(v, w)| same(v, w)),
         _ => a == b,
@@ -81,6 +90,12 @@ pub fn matches(expected: &Value, actual: &Value, path: &str) -> Result<(), Fail>
     }
     if let (Value::Object(e), Value::Object(a)) = (expected, actual) {
         for (k, v) in e {
+            if absent(v) {
+                if let Some(got) = a.get(k) {
+                    return Err(Fail(format!("{path}.{k}: expected no such key, got {}", short(got))));
+                }
+                continue;
+            }
             let Some(got) = a.get(k) else {
                 return Err(Fail(format!("{path}.{k}: missing (expected {})", short(v))));
             };

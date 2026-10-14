@@ -24,6 +24,7 @@ Implements DecisionNode SDK specification version 1.3 (`SPEC_VERSION`): boosters
 
 ### Changed
 
+- `Batch` no longer has `price_factor`: the batch price is each model's, the `batch_price_factor` its `models()` entry lists, and each result line's charge is in its `usage`.
 - `Usage` is `Clone` but no longer `Copy`, since it holds the answer's `Cost`.
 - The default model is `decisionnode-moe` (it was `decisionnode-latest`). The documentation and examples use the family ids `decisionnode-moe` and `decisionnode-flash`, which mean the current release of each family; an answer names the pinned id that answered (`decisionnode-<family>-<version>`), and `models()` lists the pinned ids. `model` stays free text.
 - `SPEC_VERSION` is `"1.3"`.

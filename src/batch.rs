@@ -121,8 +121,6 @@ pub struct Batch {
     pub results_url: Option<String>,
     /// When its results are deleted: 7 days after it ended.
     pub results_expire_at: Option<String>,
-    /// The price factor, `0.5`.
-    pub price_factor: Option<f64>,
     /// Input tokens of the lines answered so far.
     pub usage: Usage,
     /// When `failed`: `error_type` and `message`.
@@ -155,7 +153,6 @@ impl Batch {
             ended_at: text("ended_at"),
             results_url: text("results_url"),
             results_expire_at: text("results_expire_at"),
-            price_factor: obj.get("price_factor").and_then(Value::as_f64),
             usage: Usage::from_body(obj.get("usage")),
             error: obj.get("error").filter(|v| !v.is_null()).cloned(),
             raw,
@@ -793,7 +790,7 @@ mod tests {
             "created_at": "2026-10-08T12:00:00Z", "finalized_at": "2026-10-08T12:00:05Z",
             "expires_at": "2026-10-09T12:00:05Z", "ended_at": "2026-10-08T12:03:00Z",
             "results_url": "https://api.decisionnode.com/v1/batches/batch_01J9ZB8Q3T/results",
-            "results_expire_at": "2026-10-15T12:03:00Z", "price_factor": 0.5,
+            "results_expire_at": "2026-10-15T12:03:00Z",
             "usage": {"input_tokens": 94, "output_tokens": 0}, "error": null
         }))
         .unwrap();
