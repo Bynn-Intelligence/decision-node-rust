@@ -1905,13 +1905,26 @@ fn run_request(ctx: &Ctx, driver: Driver, case: &Value) -> Result<(), Fail> {
 
 /// The fields of a fine-tuned model's `models()` entry, compared when a case
 /// lists them.
-const FINE_TUNED: [&str; 4] = ["fine_tuned", "base", "adapter_version", "status"];
+const FINE_TUNED: [&str; 9] = [
+    "fine_tuned",
+    "base",
+    "adapter_version",
+    "status",
+    "price_per_million_input",
+    "price_per_million_output",
+    "price_per_million_image",
+    "price_per_million_video",
+    "batch_price_factor",
+];
 
 /// A `models()` entry, with the fine-tuned fields only where the expected
 /// entry lists them.
 fn norm_model(m: &ModelInfo, expected: Option<&Value>) -> Value {
     let mut out = json!({"name": m.name, "description": m.description, "release_date": m.release_date, "limits": m.limits,
-        "fine_tuned": m.fine_tuned, "base": m.base, "adapter_version": m.adapter_version, "status": m.status});
+        "fine_tuned": m.fine_tuned, "base": m.base, "adapter_version": m.adapter_version, "status": m.status,
+        "price_per_million_input": m.price_per_million_input.map(num), "price_per_million_output": m.price_per_million_output.map(num),
+        "price_per_million_image": m.price_per_million_image.map(num), "price_per_million_video": m.price_per_million_video.map(num),
+        "batch_price_factor": m.batch_price_factor.map(num)});
     for k in FINE_TUNED {
         if expected.and_then(|e| e.get(k)).is_none() {
             out.as_object_mut().unwrap().remove(k);

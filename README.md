@@ -150,7 +150,7 @@ A question id is any string and comes back as the key of its answer. Without a s
 | Type | Fields |
 |---|---|
 | `Decision` | `answers` (by question id, also `decision["id"]` and `decision.get("id")`), `model`, `usage.input_tokens`, `usage.output_tokens`, `usage.video_frames`, `usage.video_seconds`, `usage.booster_tokens`, `usage.boosters`, `usage.cost`, `warnings`, `evidence`, `request_id`, `latency_ms`, `safety`, `raw` |
-| `ModelInfo` | `name`, `description`, `release_date`, `fine_tuned`, `base`, `adapter_version`, `status` (the last four on a fine-tuned model only), `limits` (every other field of the entry), `raw` |
+| `ModelInfo` | `name`, `description`, `release_date`, `fine_tuned`, `base`, `adapter_version`, `status` (the last four on a fine-tuned model only), `price_per_million_input`, `price_per_million_output`, `price_per_million_image`, `price_per_million_video` (USD per million tokens) and `batch_price_factor` (the share of the live prices a batch line pays; none on a fine-tuned model), each `None` when the entry does not state it, `limits` (every other field of the entry, the prices included), `raw` |
 | `Answer::Truth(TruthAnswer)` | `truth` |
 | `Answer::Choice(ChoiceAnswer)` | `choice`, `confidence`, `probabilities` (by option name, exactly as sent) |
 | `Answer::Score(ScoreAnswer)` | `score`, `confidence`, `probabilities` (by level index), `legend` (level index to the level as sent) |

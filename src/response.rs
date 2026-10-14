@@ -752,8 +752,20 @@ pub struct ModelInfo {
     /// For a fine-tuned model: `deployed` (it answers decisions) or `ready`
     /// (trained, not deployed); any other value as received.
     pub status: Option<String>,
+    /// The live price of input tokens, in USD per million; `None` when the
+    /// entry does not state it.
+    pub price_per_million_input: Option<f64>,
+    /// The price of output tokens, in USD per million.
+    pub price_per_million_output: Option<f64>,
+    /// The price of image tokens, in USD per million.
+    pub price_per_million_image: Option<f64>,
+    /// The price of video tokens, in USD per million.
+    pub price_per_million_video: Option<f64>,
+    /// The share of the live prices a batch line pays, for example `0.7`;
+    /// `None` on a fine-tuned model, whose entry states none.
+    pub batch_price_factor: Option<f64>,
     /// The model's published limits: every other field of the entry, for
-    /// example `max_input_tokens`.
+    /// example `max_input_tokens`. The prices above are here too, as sent.
     pub limits: Map<String, Value>,
     /// The entry as received.
     pub raw: Value,
@@ -777,6 +789,11 @@ impl ModelInfo {
                     base: obj.get("base").and_then(Value::as_str).map(str::to_owned),
                     adapter_version: obj.get("adapter_version").and_then(Value::as_u64),
                     status: obj.get("status").and_then(Value::as_str).map(str::to_owned),
+                    price_per_million_input: obj.get("price_per_million_input").and_then(Value::as_f64),
+                    price_per_million_output: obj.get("price_per_million_output").and_then(Value::as_f64),
+                    price_per_million_image: obj.get("price_per_million_image").and_then(Value::as_f64),
+                    price_per_million_video: obj.get("price_per_million_video").and_then(Value::as_f64),
+                    batch_price_factor: obj.get("batch_price_factor").and_then(Value::as_f64),
                     limits: obj
                         .iter()
                         .filter(|(k, _)| !matches!(k.as_str(), "name" | "description" | "release_date"))
@@ -1048,6 +1065,26 @@ mod tests {
         let d = Decision::from_response(body, 200, &headers(&[("x-decisionnode-requested-model", "decisionnode-moe")]))
             .unwrap();
         assert_eq!(d.fallback, None);
+    }
+
+    #[test]
+    fn model_prices() {
+        let body = json!({"models": [
+            {"name": "decisionnode-moe", "description": "d", "release_date": "2026-10-01", "price_per_million_input": 0.042,
+             "price_per_million_output": 0, "price_per_million_image": 0.09, "price_per_million_video": 0.09, "batch_price_factor": 0.7},
+            {"name": "decisionnode-flash@acme/fraud:3", "description": "d", "release_date": "2026-10-09", "fine_tuned": true,
+             "price_per_million_input": "0.055"}
+        ]});
+        let m = ModelInfo::list_from(body, 200, &HeaderMap::new()).unwrap();
+        assert_eq!(
+            (m[0].price_per_million_input, m[0].price_per_million_output, m[0].price_per_million_image),
+            (Some(0.042), Some(0.0), Some(0.09))
+        );
+        assert_eq!((m[0].price_per_million_video, m[0].batch_price_factor), (Some(0.09), Some(0.7)));
+        assert_eq!(m[0].limits.get("batch_price_factor"), Some(&json!(0.7)));
+        // A fine-tuned entry has no batch factor; a price that is not a number is None.
+        assert_eq!((m[1].batch_price_factor, m[1].price_per_million_input), (None, None));
+        assert_eq!(m[1].limits.get("price_per_million_input"), Some(&json!("0.055")));
     }
 
     #[test]
