@@ -168,7 +168,7 @@ const ECHO_CHARS: usize = 64;
 
 /// An input as a collections `422` entry echoes it, as the API does: a string
 /// cut to its first 64 characters, with `...` added when it was longer.
-fn echoed(value: &str) -> Value {
+pub(crate) fn echoed(value: &str) -> Value {
     if value.chars().count() > ECHO_CHARS {
         Value::String(format!("{}...", value.chars().take(ECHO_CHARS).collect::<String>()))
     } else {

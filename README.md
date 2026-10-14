@@ -457,7 +457,7 @@ keys.revoke_by_labels(&KeyRevocation::new().label("site", "berlin")).await?;
 | `revoke(key_id)` | `DELETE /v1/keys/{key_id}` | `{id, revoked}` |
 | `revoke_by_labels(&KeyRevocation)` | `POST /v1/keys/revoke` with `labels`, and `device_ids` and `dry_run` when set | `{revoked, more}` (or `{would_revoke, more}` for a dry run): call again while `more` is true |
 
-`create` sends an `Idempotency-Key`, yours (`NewKey::idempotency_key`) or a new one, the same on every attempt, so a retried create makes one key and answers the same secret. The client never logs a secret. A list filter the API would refuse, a `limit` outside 1 to 200, an `Idempotency-Key` that is not 1 to 255 printable ASCII characters and a change of nothing are refused before anything is sent, with the API's own error. A device's daily spend cap, once reached, answers its decisions with the `429` `key_spend_cap_reached` until 00:00 UTC; the client raises it at once instead of retrying.
+`create` sends an `Idempotency-Key`, yours (`NewKey::idempotency_key`) or a new one, the same on every attempt, so a retried create makes one key and answers the same secret. The client never logs a secret. A name, device id, label or daily spend cap the API would refuse (the first one, as its `422` entry), a bulk revoke without a label or with more than 1,000 devices, a list filter the API would refuse, a `limit` outside 1 to 200, an `Idempotency-Key` that is not 1 to 255 printable ASCII characters and a change of nothing are refused before anything is sent, with the API's own error. A device's daily spend cap, once reached, answers its decisions with the `429` `key_spend_cap_reached` until 00:00 UTC; the client raises it at once instead of retrying.
 
 ## Errors
 

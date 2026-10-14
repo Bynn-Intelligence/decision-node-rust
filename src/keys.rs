@@ -6,13 +6,71 @@ use std::collections::BTreeMap;
 use reqwest::Method;
 use serde_json::{json, Map, Value};
 
-use crate::check::usage_error;
+use crate::check::{entry, usage_error};
 use crate::client::{new_idempotency_key, DecisionNode, Policy};
+use crate::collections::echoed;
 use crate::error::{Error, ErrorKind, Result};
 use crate::usage::{device_filter, escape, label_filters, status_filter};
 
 /// The largest page of [`Keys::list`].
 const PAGE_MAX: i64 = 200;
+/// The longest key name, in characters.
+const NAME_MAX: usize = 48;
+/// The most labels a key carries.
+const MAX_LABELS: usize = 16;
+/// The most devices one bulk revoke names.
+const MAX_REVOKE_DEVICES: usize = 1000;
+const DEVICE_RULE: &str = "device_id is 1 to 128 printable ASCII characters, not starting with a space.";
+
+/// A key field's `422` entry, as the API answers it.
+fn field_entry(loc: &[&str], msg: &str, input: Value) -> Value {
+    let loc: Vec<Value> = std::iter::once("body").chain(loc.iter().copied()).map(Value::from).collect();
+    entry("value_error", &loc, msg, &input, None)
+}
+
+/// A key's name, the bounds a client may hold: trimmed, 1 to 48
+/// characters. Its characters are the API's to judge.
+fn name_entry(name: &str) -> Option<Value> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return Some(field_entry(&["name"], "Give the key a name.", echoed(name)));
+    }
+    (trimmed.chars().count() > NAME_MAX)
+        .then(|| field_entry(&["name"], "Key names are at most 48 characters.", echoed(name)))
+}
+
+/// A device id, as the API checks it.
+fn device_ok(d: &str) -> bool {
+    device_filter(d).is_ok()
+}
+
+/// A key's labels: at most 16, each name 1 to 32 of `a-z`, `0-9`, `_`, `.`
+/// and `-`, each value 1 to 64 characters with no control character.
+fn labels_entry(labels: &BTreeMap<String, String>) -> Option<Value> {
+    if labels.len() > MAX_LABELS {
+        return Some(field_entry(&["labels"], "A key has at most 16 labels.", Value::Null));
+    }
+    for (name, value) in labels {
+        let name_ok = (1..=32).contains(&name.len())
+            && name.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'_' | b'.' | b'-'));
+        if !name_ok {
+            return Some(field_entry(&["labels"], "A label's name is 1 to 32 of a-z, 0-9, _ . and -.", Value::Null));
+        }
+        if !(1..=64).contains(&value.chars().count()) || value.chars().any(char::is_control) {
+            return Some(field_entry(&["labels", name], "A label's value is 1 to 64 characters of text.", Value::Null));
+        }
+    }
+    None
+}
+
+/// A daily spend cap: 0.01 to 1,000 USD in whole cents.
+fn cap_entry(usd: f64) -> Option<Value> {
+    let cents = (usd * 100.0).round();
+    let ok = usd.is_finite() && (usd * 100.0 - cents).abs() < 1e-6 && cents >= 1.0 && usd <= 1000.0;
+    (!ok).then(|| {
+        field_entry(&["daily_spend_cap"], "daily_spend_cap.usd is from 0.01 to 1000, in cents, or null.", Value::Null)
+    })
+}
 
 /// The device keys of a client, from [`DecisionNode::keys`].
 ///
@@ -385,8 +443,25 @@ impl Keys<'_> {
     }
 
     /// `POST /v1/keys`: creates a decisions-only key and returns `{key,
-    /// secret}` as sent. The secret is shown this once.
+    /// secret}` as sent. The secret is shown this once. A name, device id,
+    /// label or daily spend cap the API would refuse is refused before
+    /// anything is sent, the first one only, with the API's own `422`
+    /// entry; a limit's ceiling, the expiry's window and a name's characters
+    /// are the API's to judge.
     pub async fn create(&self, key: &NewKey) -> Result<Value> {
+        // The first field the API would refuse, in the body's order.
+        let fault = name_entry(&key.name)
+            .or_else(|| {
+                key.device_id
+                    .as_deref()
+                    .filter(|d| !device_ok(d))
+                    .map(|d| field_entry(&["device_id"], DEVICE_RULE, echoed(d)))
+            })
+            .or_else(|| key.labels.as_ref().and_then(labels_entry))
+            .or_else(|| key.daily_spend_cap.and_then(cap_entry));
+        if let Some(e) = fault {
+            return Err(Error::local_entries(vec![e]));
+        }
         let idempotency = key.idempotency_key.clone().unwrap_or_else(new_idempotency_key);
         Ok(self.client.request_json_with_key(Method::POST, "/v1/keys", &key.body(), &idempotency).await?.body)
     }
@@ -426,9 +501,21 @@ impl Keys<'_> {
     }
 
     /// `PATCH /v1/keys/{key_id}`: changes a key and returns it as sent.
-    /// A change of nothing is refused before anything is sent, with the
-    /// API's own error.
+    /// The fields set are checked as [`Keys::create`] checks them, and a
+    /// change of nothing is refused, before anything is sent, with the API's
+    /// own error.
     pub async fn update(&self, key_id: &str, update: &KeyUpdate) -> Result<Value> {
+        // The first field the API would refuse; a field cleared with null is
+        // not checked.
+        let fault = update
+            .name
+            .as_deref()
+            .and_then(name_entry)
+            .or_else(|| update.labels.as_ref().and_then(|l| l.as_ref().and_then(labels_entry)))
+            .or_else(|| update.daily_spend_cap.and_then(|c| c.and_then(cap_entry)));
+        if let Some(e) = fault {
+            return Err(Error::local_entries(vec![e]));
+        }
         let body = update.body();
         if body.is_empty() {
             return Err(usage_error("Nothing to change."));
@@ -446,6 +533,22 @@ impl Keys<'_> {
     /// (and device ids) pick; returns `{revoked, more}` as sent, or
     /// `{would_revoke, more}` for a dry run. Call again while `more` is true.
     pub async fn revoke_by_labels(&self, revocation: &KeyRevocation) -> Result<Value> {
+        let mut fault = labels_entry(&revocation.labels);
+        if fault.is_none() && revocation.labels.is_empty() {
+            let msg = "A bulk revoke names at least one label: every key it revokes has them all.";
+            fault = Some(field_entry(&["labels"], msg, Value::Null));
+        }
+        if let (None, Some(ids)) = (&fault, &revocation.device_ids) {
+            if ids.len() > MAX_REVOKE_DEVICES {
+                let msg = "device_ids is a list of at most 1,000 device ids.";
+                fault = Some(field_entry(&["device_ids"], msg, Value::Null));
+            } else if let Some(d) = ids.iter().find(|d| !device_ok(d)) {
+                fault = Some(field_entry(&["device_id"], DEVICE_RULE, echoed(d)));
+            }
+        }
+        if let Some(e) = fault {
+            return Err(Error::local_entries(vec![e]));
+        }
         let mut b = Map::new();
         b.insert("labels".into(), json!(revocation.labels));
         if let Some(ids) = &revocation.device_ids {
@@ -637,5 +740,57 @@ mod tests {
             "status is active, expired, revoked or all."
         );
         assert_eq!(message(k.update("key_1", &KeyUpdate::new()).await.unwrap_err()), "Nothing to change.");
+        let entry = |e: Error| {
+            assert_eq!((e.kind(), e.status()), (ErrorKind::Validation, None));
+            let list = e.entries().unwrap().to_vec();
+            assert_eq!(list.len(), 1, "only the first fault");
+            (list[0]["loc"].clone(), list[0]["msg"].as_str().unwrap().to_owned(), list[0]["input"].clone())
+        };
+        let (loc, msg, input) = entry(k.create(&NewKey::new("   ")).await.unwrap_err());
+        assert_eq!((loc, msg.as_str(), input), (json!(["body", "name"]), "Give the key a name.", json!("   ")));
+        let long = "n".repeat(49);
+        let (_, msg, _) = entry(k.create(&NewKey::new(long.as_str()).device_id(" d")).await.unwrap_err());
+        assert_eq!(msg, "Key names are at most 48 characters.");
+        let (loc, msg, _) =
+            entry(k.create(&NewKey::new("Drone 9").device_id(" d").label("Site", "x")).await.unwrap_err());
+        assert_eq!((loc, msg.as_str()), (json!(["body", "device_id"]), DEVICE_RULE));
+        let (loc, msg, input) = entry(k.create(&NewKey::new("Drone 9").label("site", "")).await.unwrap_err());
+        assert_eq!(
+            (loc, msg.as_str(), input),
+            (json!(["body", "labels", "site"]), "A label's value is 1 to 64 characters of text.", Value::Null)
+        );
+        let mut many = NewKey::new("Drone 9");
+        for i in 0..17 {
+            many = many.label(format!("l{i:02}"), "v");
+        }
+        assert_eq!(entry(k.create(&many).await.unwrap_err()).1, "A key has at most 16 labels.");
+        let cap = "daily_spend_cap.usd is from 0.01 to 1000, in cents, or null.";
+        for usd in [0.005, 1000.01, 0.0, f64::NAN] {
+            assert_eq!(
+                entry(k.create(&NewKey::new("Drone 9").daily_spend_cap(usd)).await.unwrap_err()).1,
+                cap,
+                "{usd}"
+            );
+        }
+        // The fields are checked before the Idempotency-Key.
+        let both = NewKey::new("").idempotency_key("");
+        assert_eq!(entry(k.create(&both).await.unwrap_err()).1, "Give the key a name.");
+        // An update's cleared field is not checked; a changed one is.
+        assert_eq!(entry(k.update("key_1", &KeyUpdate::new().name(" ")).await.unwrap_err()).1, "Give the key a name.");
+        assert_eq!(entry(k.update("key_1", &KeyUpdate::new().daily_spend_cap(0.001)).await.unwrap_err()).1, cap);
+        let (loc, msg, _) = entry(k.revoke_by_labels(&KeyRevocation::new()).await.unwrap_err());
+        assert_eq!(
+            (loc, msg.as_str()),
+            (json!(["body", "labels"]), "A bulk revoke names at least one label: every key it revokes has them all.")
+        );
+        let over = KeyRevocation::new().label("customer", "acme").device_ids((0..1001).map(|i| format!("d-{i}")));
+        assert_eq!(
+            entry(k.revoke_by_labels(&over).await.unwrap_err()).1,
+            "device_ids is a list of at most 1,000 device ids."
+        );
+        let (loc, _, input) = entry(
+            k.revoke_by_labels(&KeyRevocation::new().label("customer", "acme").device_ids([" x"])).await.unwrap_err(),
+        );
+        assert_eq!((loc, input), (json!(["body", "device_id"]), json!(" x")));
     }
 }

@@ -31,7 +31,9 @@ use decisionnode::{
     ClientBuilder, DecideRequest, Decision, DecisionNode, DecisionResult, Error, Image, Levels, ModelInfo, Number,
     NumberAnswer, Options, Point, Question, Reading, Safety, Score, ScoreAnswer, Truth, TruthAnswer, Video, VideoFrame,
 };
-use decisionnode::{Evidence, FaceBox, ItemQuery, ItemUpdate, UsagePeriod, UsageQuery};
+use decisionnode::{
+    Evidence, FaceBox, ItemQuery, ItemUpdate, KeyQuery, KeyRevocation, KeyUpdate, NewKey, UsagePeriod, UsageQuery,
+};
 use serde_json::{json, Map, Value};
 use sha2::Digest;
 
@@ -332,6 +334,116 @@ type Refs = HashMap<String, Outcome>;
 /// as its JSON text.
 fn text_of(v: &Value) -> String {
     v.as_str().map_or_else(|| v.to_string(), str::to_owned)
+}
+
+/// A case's labels, name to value.
+fn labels_of(args: &Value) -> Vec<(String, String)> {
+    opt(args, "labels").and_then(Value::as_object).into_iter().flatten().map(|(k, v)| (k.clone(), text_of(v))).collect()
+}
+
+/// The key of a case's `keys.create` call.
+fn new_key(args: &Value) -> NewKey {
+    let mut k = NewKey::new(opt(args, "name").map(text_of).unwrap_or_default());
+    if let Some(v) = opt(args, "device_id") {
+        k = k.device_id(text_of(v));
+    }
+    for (name, value) in labels_of(args) {
+        k = k.label(name, value);
+    }
+    if let Some(l) = opt(args, "limits") {
+        if let Some(n) = l.get("requests_per_second").and_then(Value::as_i64) {
+            k = k.requests_per_second(n);
+        }
+        if let Some(n) = l.get("tokens_per_second").and_then(Value::as_i64) {
+            k = k.tokens_per_second(n);
+        }
+    }
+    if let Some(usd) = opt(args, "daily_spend_cap").and_then(|c| c.get("usd")).and_then(Value::as_f64) {
+        k = k.daily_spend_cap(usd);
+    }
+    if let Some(v) = opt(args, "expires_at") {
+        k = k.expires_at(text_of(v));
+    }
+    if let Some(v) = opt(args, "may_search_collections").and_then(Value::as_bool) {
+        k = k.may_search_collections(v);
+    }
+    if let Some(v) = opt(args, "idempotency_key") {
+        k = k.idempotency_key(text_of(v));
+    }
+    k
+}
+
+/// The query of a case's `keys.list` or `keys.all` call.
+fn key_query(args: &Value) -> KeyQuery {
+    let mut q = KeyQuery::new();
+    for (name, value) in labels_of(args) {
+        q = q.label(name, value);
+    }
+    if let Some(v) = opt(args, "device_id") {
+        q = q.device_id(text_of(v));
+    }
+    if let Some(v) = opt(args, "status") {
+        q = q.status(text_of(v));
+    }
+    if let Some(v) = opt(args, "limit").and_then(Value::as_i64) {
+        q = q.limit(v);
+    }
+    if let Some(v) = opt(args, "cursor") {
+        q = q.cursor(text_of(v));
+    }
+    q
+}
+
+/// The change of a case's `keys.update` call: a field given as null clears.
+fn key_update(args: &Value) -> KeyUpdate {
+    let mut u = KeyUpdate::new();
+    if let Some(v) = opt(args, "name") {
+        u = u.name(text_of(v));
+    }
+    match args.get("labels") {
+        Some(Value::Null) => u = u.clear_labels(),
+        Some(_) => u = u.labels(labels_of(args)),
+        None => {}
+    }
+    match args.get("limits") {
+        Some(Value::Null) => u = u.clear_limits(),
+        Some(l) => {
+            u = u.limits(
+                l.get("requests_per_second").and_then(Value::as_i64),
+                l.get("tokens_per_second").and_then(Value::as_i64),
+            )
+        }
+        None => {}
+    }
+    match args.get("daily_spend_cap") {
+        Some(Value::Null) => u = u.clear_daily_spend_cap(),
+        Some(c) => u = u.daily_spend_cap(c.get("usd").and_then(Value::as_f64).unwrap_or(f64::NAN)),
+        None => {}
+    }
+    match args.get("expires_at") {
+        Some(Value::Null) => u = u.clear_expires_at(),
+        Some(v) => u = u.expires_at(text_of(v)),
+        None => {}
+    }
+    if let Some(v) = opt(args, "may_search_collections").and_then(Value::as_bool) {
+        u = u.may_search_collections(v);
+    }
+    u
+}
+
+/// The keys of a case's `keys.revoke_by_labels` call.
+fn key_revocation(args: &Value) -> KeyRevocation {
+    let mut r = KeyRevocation::new();
+    for (name, value) in labels_of(args) {
+        r = r.label(name, value);
+    }
+    if let Some(ids) = opt(args, "device_ids").and_then(Value::as_array) {
+        r = r.device_ids(ids.iter().map(text_of));
+    }
+    if let Some(d) = opt(args, "dry_run").and_then(Value::as_bool) {
+        r = r.dry_run(d);
+    }
+    r
 }
 
 /// The period of a case's `usage.key` call.
@@ -824,6 +936,12 @@ enum Prepared {
     UsageKey(String, UsagePeriod),
     UsageList(UsageQuery),
     UsageAll(UsageQuery),
+    KeyCreate(NewKey),
+    KeyList(KeyQuery),
+    KeyAll(KeyQuery),
+    KeyUpdate(String, KeyUpdate),
+    KeyRevoke(String),
+    KeyRevokeByLabels(KeyRevocation),
 }
 
 /// The call of a case. An argument the SDK refuses while it is being built
@@ -922,6 +1040,12 @@ fn prepare(root: &Path, call: &Value, refs: &Refs) -> Result<Prepared, Error> {
         "usage.key" => Prepared::UsageKey(text("key_id"), usage_period(args)),
         "usage.list" => Prepared::UsageList(usage_query(args)),
         "usage.all" => Prepared::UsageAll(usage_query(args)),
+        "keys.create" => Prepared::KeyCreate(new_key(args)),
+        "keys.list" => Prepared::KeyList(key_query(args)),
+        "keys.all" => Prepared::KeyAll(key_query(args)),
+        "keys.update" => Prepared::KeyUpdate(text("key_id"), key_update(args)),
+        "keys.revoke" => Prepared::KeyRevoke(text("key_id")),
+        "keys.revoke_by_labels" => Prepared::KeyRevokeByLabels(key_revocation(args)),
         other => panic!("unknown method {other} (is the sessions feature on?)"),
     })
 }
@@ -1048,6 +1172,12 @@ async fn invoke_async(c: &DecisionNode, p: Prepared) -> Outcome {
         Prepared::UsageKey(id, p) => wrap(c.usage().key(&id, &p).await, Outcome::Collection),
         Prepared::UsageList(q) => wrap(c.usage().list(&q).await, Outcome::Collection),
         Prepared::UsageAll(q) => wrap(c.usage().all(&q).await, Outcome::CollectionList),
+        Prepared::KeyCreate(k) => wrap(c.keys().create(&k).await, Outcome::Collection),
+        Prepared::KeyList(q) => wrap(c.keys().list(&q).await, Outcome::Collection),
+        Prepared::KeyAll(q) => wrap(c.keys().all(&q).await, Outcome::CollectionList),
+        Prepared::KeyUpdate(id, u) => wrap(c.keys().update(&id, &u).await, Outcome::Collection),
+        Prepared::KeyRevoke(id) => wrap(c.keys().revoke(&id).await, Outcome::Collection),
+        Prepared::KeyRevokeByLabels(r) => wrap(c.keys().revoke_by_labels(&r).await, Outcome::Collection),
     }
 }
 
@@ -1107,6 +1237,12 @@ fn invoke_blocking(c: &decisionnode::blocking::DecisionNode, p: Prepared) -> Out
         Prepared::UsageKey(id, p) => wrap(c.usage().key(&id, &p), Outcome::Collection),
         Prepared::UsageList(q) => wrap(c.usage().list(&q), Outcome::Collection),
         Prepared::UsageAll(q) => wrap(c.usage().all(&q), Outcome::CollectionList),
+        Prepared::KeyCreate(k) => wrap(c.keys().create(&k), Outcome::Collection),
+        Prepared::KeyList(q) => wrap(c.keys().list(&q), Outcome::Collection),
+        Prepared::KeyAll(q) => wrap(c.keys().all(&q), Outcome::CollectionList),
+        Prepared::KeyUpdate(id, u) => wrap(c.keys().update(&id, &u), Outcome::Collection),
+        Prepared::KeyRevoke(id) => wrap(c.keys().revoke(&id), Outcome::Collection),
+        Prepared::KeyRevokeByLabels(r) => wrap(c.keys().revoke_by_labels(&r), Outcome::Collection),
     }
 }
 
@@ -1591,10 +1727,12 @@ fn check_outcome(spec: &Value, result: &OutcomeRef<'_>, path: &str) -> Result<()
             check_results_outcome(spec, r, path)
         }
         ("checked", Outcome::Checked) => Ok(()),
-        ("collection" | "item" | "item_page" | "deleted" | "key_usage" | "usage_page", Outcome::Collection(v)) => {
-            matches(spec.get(kind).unwrap_or(&empty), v, &format!("{path}.{kind}"))
-        }
-        ("collections" | "usage_items", Outcome::CollectionList(list)) => {
+        (
+            "collection" | "item" | "item_page" | "deleted" | "key_usage" | "usage_page" | "created_key" | "api_key"
+            | "key_page" | "key_revoked" | "keys_revoked",
+            Outcome::Collection(v),
+        ) => matches(spec.get(kind).unwrap_or(&empty), v, &format!("{path}.{kind}")),
+        ("collections" | "usage_items" | "api_keys", Outcome::CollectionList(list)) => {
             let exp = spec.get(kind).and_then(Value::as_array).cloned().unwrap_or_default();
             if exp.len() != list.len() {
                 return Err(Fail(format!("{path}: expected {} entries, got {}", exp.len(), list.len())));
@@ -2069,6 +2207,12 @@ fn run_response(ctx: &Ctx, driver: Driver, case: &Value) -> Result<(), Fail> {
         "key_usage",
         "usage_page",
         "usage_items",
+        "created_key",
+        "api_key",
+        "key_page",
+        "api_keys",
+        "key_revoked",
+        "keys_revoked",
     ]
     .into_iter()
     .find(|k| exp.get(*k).is_some())
