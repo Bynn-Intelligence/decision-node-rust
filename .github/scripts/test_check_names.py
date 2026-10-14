@@ -25,7 +25,7 @@ WORDS = os.environ.get("CHECK_NAMES_TEST_WORDS", "zorvex\nquillbrand\nmarrow pli
 FIRST, SECOND, PHRASE = (WORDS.splitlines() + ["", "", ""])[:3]
 # Built from pieces so that this file matches none of the check's plain patterns.
 DOCS_PATH = "prod" + "ucts/decide.md"
-BOOSTER = "face_" + "detection"
+BOOSTER = "wanted_" + "person"
 
 
 class CheckNames(unittest.TestCase):
