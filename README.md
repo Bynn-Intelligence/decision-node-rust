@@ -8,6 +8,14 @@ The client checks every request against the API's fixed rules before it sends an
 
 ## Install
 
+Not on crates.io yet: the first release publishes it there. Until then, add it from GitHub:
+
+```sh
+cargo add bynn-decisionnode --git https://github.com/Bynn-Intelligence/decision-node-rust
+```
+
+Once it is on crates.io:
+
 ```sh
 cargo add bynn-decisionnode
 ```
