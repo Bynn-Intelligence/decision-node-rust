@@ -71,8 +71,9 @@ pub use batch::{
     Batches, DEFAULT_BATCH_TIMEOUT, DEFAULT_POLL_INTERVAL, MIN_POLL_INTERVAL,
 };
 pub use booster::{
-    AgeReading, AiGeneratedReading, Booster, BoosterStatus, Evidence, FaceBox, FaceDetection, FaceDetectionReading,
-    FaceMatch, FaceRecognitionReading, OcrReading, Reading, TopGenerator, UnknownReading,
+    AgeReading, AiGeneratedReading, Booster, BoosterStatus, DepthReading, Evidence, FaceBox, FaceDetection,
+    FaceDetectionReading, FaceMatch, FaceRecognitionReading, OcrReading, Reading, SegmentDepth, SegmentInstance,
+    SegmentOpening, SegmentOpeningSize, SegmentReading, SegmentSize, TopGenerator, UnknownReading,
 };
 pub use client::{
     gate_questions, CallOptions, ClientBuilder, DecideRequest, DecisionNode, Sleeper, DEFAULT_BASE_URL,

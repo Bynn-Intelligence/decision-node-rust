@@ -263,6 +263,10 @@ pub enum Reading {
     FaceDetection(FaceDetectionReading),
     /// A reading of the `face_recognition` booster.
     FaceRecognition(FaceRecognitionReading),
+    /// A reading of Depth Vision, the `bynn_depth` booster.
+    BynnDepth(DepthReading),
+    /// A reading of Segment Vision, the `bynn_segment` booster.
+    BynnSegment(SegmentReading),
     /// A reading of a booster this version does not know, or a malformed
     /// reading.
     Unknown(UnknownReading),
@@ -405,6 +409,223 @@ fn face_box(value: Option<&Value>) -> Option<FaceBox> {
     Some(FaceBox { x1: n("x1")?, y1: n("y1")?, x2: n("x2")?, y2: n("y2")? })
 }
 
+/// A reading of Depth Vision, the `bynn_depth` booster: how far, in meters,
+/// what a picture shows is from the camera. Every number is as sent.
+///
+/// Distances are estimates from one picture, for decisions and planning,
+/// never a safety stop.
+#[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
+pub struct DepthReading {
+    /// The id of the image read.
+    pub image: String,
+    /// Meters to the nearest obstacle straight ahead, the floor left out;
+    /// `None` when none is found.
+    pub ahead: Option<f64>,
+    /// Meters to the nearest obstacle in seven directions, left to right,
+    /// each `None` when none is found there.
+    pub directions: Vec<Option<f64>>,
+    /// Whether a floor was found and left out; when `false`, `ahead` and
+    /// `directions` include everything.
+    pub ground: bool,
+    /// The grid's rows (the `grid_size` option, 8 by default).
+    pub grid_rows: u64,
+    /// The grid's columns.
+    pub grid_cols: u64,
+    /// Meters for each cell, row by row from the top left.
+    pub grid: Vec<Vec<f64>>,
+    /// The nearest distance in the picture, in meters.
+    pub depth_min: f64,
+    /// The farthest distance in the picture, in meters.
+    pub depth_max: f64,
+    /// The median distance in the picture, in meters.
+    pub depth_median: f64,
+    /// The picture's width in pixels.
+    pub width: u64,
+    /// The picture's height in pixels.
+    pub height: u64,
+    /// The reading as received.
+    pub raw: Value,
+}
+
+/// A reading of Segment Vision, the `bynn_segment` booster: what the
+/// booster's `prompt` names, found in a picture, each match's outline, box
+/// and centre and, with depth on, its distance and size in meters.
+/// Coordinates are fractions of the picture from its top left; every number
+/// is as sent.
+///
+/// Distances and sizes are estimates from one picture, for decisions and
+/// planning, never a safety stop.
+#[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
+pub struct SegmentReading {
+    /// The id of the image read.
+    pub image: String,
+    /// The picture's width in pixels.
+    pub width: u64,
+    /// The picture's height in pixels.
+    pub height: u64,
+    /// The phrases as read.
+    pub prompts: Vec<String>,
+    /// What was found, by score, in the order sent; empty when nothing was.
+    pub instances: Vec<SegmentInstance>,
+    /// Where the distances come from (`"bynn_depth"`); `None` with depth off
+    /// or unavailable.
+    pub depth_source: Option<String>,
+    /// The horizontal field of view, in degrees, the sizes assume.
+    pub assumed_hfov_deg: Option<f64>,
+    /// The reading as received.
+    pub raw: Value,
+}
+
+/// One match of a [`SegmentReading`].
+#[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
+pub struct SegmentInstance {
+    /// The phrase it matched.
+    pub label: String,
+    /// How sure the match is, 0 to 1.
+    pub score: f64,
+    /// Its box, `[x1, y1, x2, y2]`.
+    pub bbox: [f64; 4],
+    /// Its outline, `[x, y]` points.
+    pub polygon: Vec<[f64; 2]>,
+    /// Its share of the picture.
+    pub area: f64,
+    /// Its centre, `[x, y]`.
+    pub centroid: [f64; 2],
+    /// The largest hole it encloses, when it has one.
+    pub opening: Option<SegmentOpening>,
+    /// Its distance in meters, with depth on.
+    pub depth: Option<SegmentDepth>,
+    /// Its size in meters, with depth on.
+    pub size_m: Option<SegmentSize>,
+}
+
+/// The largest hole a [`SegmentInstance`] encloses.
+#[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
+pub struct SegmentOpening {
+    /// Its outline, `[x, y]` points.
+    pub polygon: Vec<[f64; 2]>,
+    /// Its centre, `[x, y]`.
+    pub centroid: [f64; 2],
+    /// Its width, a fraction of the picture's.
+    pub width: f64,
+    /// Its height, a fraction of the picture's.
+    pub height: f64,
+    /// Its centre's offset from the box's centre, `[dx, dy]`.
+    pub offset: [f64; 2],
+    /// Its share of the picture.
+    pub area: f64,
+}
+
+/// The distances of a [`SegmentInstance`], in meters, each `None` when none
+/// was found.
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[non_exhaustive]
+pub struct SegmentDepth {
+    /// The match's median distance.
+    pub median: Option<f64>,
+    /// The median distance seen through its opening.
+    pub opening_median: Option<f64>,
+    /// The median distance of the opening's rim.
+    pub opening_rim_median: Option<f64>,
+}
+
+/// The size of a [`SegmentInstance`], in meters.
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[non_exhaustive]
+pub struct SegmentSize {
+    /// Its width.
+    pub width: f64,
+    /// Its height.
+    pub height: f64,
+    /// Its opening's size, when it has one.
+    pub opening: Option<SegmentOpeningSize>,
+}
+
+/// The size of a [`SegmentInstance`]'s opening, in meters.
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[non_exhaustive]
+pub struct SegmentOpeningSize {
+    /// Its width.
+    pub width: f64,
+    /// Its height.
+    pub height: f64,
+}
+
+/// A field that may be absent or `null`: `Some(None)` then, `None` when it is
+/// present with another shape than `read` takes.
+fn nullable<T>(value: Option<&Value>, read: impl FnOnce(&Value) -> Option<T>) -> Option<Option<T>> {
+    match value {
+        None | Some(Value::Null) => Some(None),
+        Some(v) => read(v).map(Some),
+    }
+}
+
+/// Exactly `N` numbers.
+fn numbers<const N: usize>(value: &Value) -> Option<[f64; N]> {
+    let list = value.as_array().filter(|l| l.len() == N)?;
+    let mut out = [0.0; N];
+    for (slot, v) in out.iter_mut().zip(list) {
+        *slot = v.as_f64()?;
+    }
+    Some(out)
+}
+
+/// A list of `[x, y]` points.
+fn points(value: &Value) -> Option<Vec<[f64; 2]>> {
+    value.as_array()?.iter().map(numbers::<2>).collect()
+}
+
+fn segment_instance(value: &Value) -> Option<SegmentInstance> {
+    let i = value.as_object()?;
+    let n = |k: &str| i.get(k).and_then(Value::as_f64);
+    let opening = nullable(i.get("opening"), |v| {
+        let o = v.as_object()?;
+        let n = |k: &str| o.get(k).and_then(Value::as_f64);
+        Some(SegmentOpening {
+            polygon: points(o.get("polygon")?)?,
+            centroid: numbers(o.get("centroid")?)?,
+            width: n("width")?,
+            height: n("height")?,
+            offset: numbers(o.get("offset")?)?,
+            area: n("area")?,
+        })
+    })?;
+    let depth = nullable(i.get("depth"), |v| {
+        let d = v.as_object()?;
+        let m = |k: &str| nullable(d.get(k), Value::as_f64);
+        Some(SegmentDepth {
+            median: m("median")?,
+            opening_median: m("opening_median")?,
+            opening_rim_median: m("opening_rim_median")?,
+        })
+    })?;
+    let size_m = nullable(i.get("size_m"), |v| {
+        let s = v.as_object()?;
+        Some(SegmentSize {
+            width: s.get("width")?.as_f64()?,
+            height: s.get("height")?.as_f64()?,
+            opening: nullable(s.get("opening"), |o| {
+                Some(SegmentOpeningSize { width: o.get("width")?.as_f64()?, height: o.get("height")?.as_f64()? })
+            })?,
+        })
+    })?;
+    Some(SegmentInstance {
+        label: i.get("label")?.as_str()?.to_owned(),
+        score: n("score")?,
+        bbox: numbers(i.get("box")?)?,
+        polygon: points(i.get("polygon")?)?,
+        area: n("area")?,
+        centroid: numbers(i.get("centroid")?)?,
+        opening,
+        depth,
+        size_m,
+    })
+}
+
 /// A reading of the `ocr` booster, its fields as sent.
 #[derive(Clone, Debug, PartialEq)]
 #[non_exhaustive]
@@ -456,6 +677,8 @@ impl Reading {
             "age" => Self::parse_age(obj, &raw),
             "ai_generated" => Self::parse_ai_generated(obj, &raw),
             "ocr" => Self::parse_ocr(obj, &raw),
+            "bynn_depth" => Self::parse_depth(obj, &raw),
+            "bynn_segment" => Self::parse_segment(obj, &raw),
             "face_detection" => Self::parse_face_detection(obj, &raw),
             "face_recognition" => Self::parse_face_recognition(obj, &raw),
             _ => None,
@@ -513,6 +736,59 @@ impl Reading {
             faces: obj.get("faces")?.as_u64()?,
             collection_name: text(obj, "collection_name")?,
             matches,
+            raw: raw.clone(),
+        }))
+    }
+
+    fn parse_depth(obj: &Map<String, Value>, raw: &Value) -> Option<Reading> {
+        let n = |k: &str| obj.get(k).and_then(Value::as_f64);
+        let whole = |k: &str| obj.get(k).and_then(Value::as_u64);
+        let directions = obj
+            .get("directions")?
+            .as_array()
+            .filter(|d| d.len() == 7)?
+            .iter()
+            .map(|d| nullable(Some(d), Value::as_f64))
+            .collect::<Option<Vec<_>>>()?;
+        let grid = obj
+            .get("grid")?
+            .as_array()?
+            .iter()
+            .map(|row| row.as_array()?.iter().map(Value::as_f64).collect::<Option<Vec<_>>>())
+            .collect::<Option<Vec<_>>>()?;
+        Some(Reading::BynnDepth(DepthReading {
+            image: obj.get("image")?.as_str()?.to_owned(),
+            ahead: nullable(obj.get("ahead"), Value::as_f64)?,
+            directions,
+            ground: obj.get("ground")?.as_bool()?,
+            grid_rows: whole("grid_rows")?,
+            grid_cols: whole("grid_cols")?,
+            grid,
+            depth_min: n("depth_min")?,
+            depth_max: n("depth_max")?,
+            depth_median: n("depth_median")?,
+            width: whole("width")?,
+            height: whole("height")?,
+            raw: raw.clone(),
+        }))
+    }
+
+    fn parse_segment(obj: &Map<String, Value>, raw: &Value) -> Option<Reading> {
+        let prompts = obj
+            .get("prompts")?
+            .as_array()?
+            .iter()
+            .map(|p| p.as_str().map(str::to_owned))
+            .collect::<Option<Vec<_>>>()?;
+        let instances = obj.get("instances")?.as_array()?.iter().map(segment_instance).collect::<Option<Vec<_>>>()?;
+        Some(Reading::BynnSegment(SegmentReading {
+            image: obj.get("image")?.as_str()?.to_owned(),
+            width: obj.get("width")?.as_u64()?,
+            height: obj.get("height")?.as_u64()?,
+            prompts,
+            instances,
+            depth_source: nullable(obj.get("depth_source"), |v| v.as_str().map(str::to_owned))?,
+            assumed_hfov_deg: nullable(obj.get("assumed_hfov_deg"), Value::as_f64)?,
             raw: raw.clone(),
         }))
     }
@@ -602,6 +878,22 @@ impl Reading {
         }
     }
 
+    /// The Depth Vision reading, if this is one.
+    pub fn as_depth(&self) -> Option<&DepthReading> {
+        match self {
+            Reading::BynnDepth(r) => Some(r),
+            _ => None,
+        }
+    }
+
+    /// The Segment Vision reading, if this is one.
+    pub fn as_segment(&self) -> Option<&SegmentReading> {
+        match self {
+            Reading::BynnSegment(r) => Some(r),
+            _ => None,
+        }
+    }
+
     /// The OCR reading, if this is one.
     pub fn as_ocr(&self) -> Option<&OcrReading> {
         match self {
@@ -616,6 +908,8 @@ impl Reading {
             Reading::Age(r) => Some(&r.image),
             Reading::AiGenerated(r) => Some(&r.image),
             Reading::Ocr(r) => Some(&r.image),
+            Reading::BynnDepth(r) => Some(&r.image),
+            Reading::BynnSegment(r) => Some(&r.image),
             Reading::FaceDetection(r) => Some(&r.image),
             Reading::FaceRecognition(r) => Some(&r.image),
             Reading::Unknown(r) => r.raw.get("image").and_then(Value::as_str),
@@ -628,6 +922,8 @@ impl Reading {
             Reading::Age(r) => &r.raw,
             Reading::AiGenerated(r) => &r.raw,
             Reading::Ocr(r) => &r.raw,
+            Reading::BynnDepth(r) => &r.raw,
+            Reading::BynnSegment(r) => &r.raw,
             Reading::FaceDetection(r) => &r.raw,
             Reading::FaceRecognition(r) => &r.raw,
             Reading::Unknown(r) => &r.raw,
@@ -797,6 +1093,95 @@ mod tests {
         assert_eq!((b.collection_name.as_deref(), b.matches[0].metadata.as_ref()), (None, None));
         for (i, reading) in r.iter().enumerate().skip(2) {
             assert!(matches!(reading, Reading::Unknown(_)), "{i}");
+        }
+    }
+
+    #[test]
+    fn depth_readings() {
+        let grid = json!([[1.5, 2.0], [3.25, 4.0]]);
+        let ok = json!({"image": "hall", "ahead": 2.4, "directions": [1.2, null, 3.0, 2.4, null, 5.5, 8.0], "ground": true,
+            "grid_rows": 2, "grid_cols": 2, "grid": grid, "depth_min": 0.8, "depth_max": 12.5, "depth_median": 3.1,
+            "width": 1280, "height": 720, "extra": "ignored"});
+        let mut none_ahead = ok.clone();
+        none_ahead["ahead"] = Value::Null;
+        let mut no_ahead = ok.clone();
+        no_ahead.as_object_mut().unwrap().remove("ahead");
+        let mut six = ok.clone();
+        six["directions"] = json!([1, 2, 3, 4, 5, 6]);
+        let mut bad_cell = ok.clone();
+        bad_cell["grid"] = json!([[1, "2"]]);
+        let mut float_rows = ok.clone();
+        float_rows["grid_rows"] = json!(2.5);
+        let mut no_ground = ok.clone();
+        no_ground.as_object_mut().unwrap().remove("ground");
+        let body = json!({"bynn_depth": {"version": "bynn_depth-v1", "status": "ok", "latency_ms": 90, "billed_calls": 1, "results": [
+            ok, none_ahead, no_ahead, six, bad_cell, float_rows, no_ground, {"image": "x", "readable": false}
+        ]}});
+        let r = &evidence_from_body(Some(&body)).unwrap()["bynn_depth"].results;
+        let d = r[0].as_depth().unwrap();
+        assert_eq!((d.image.as_str(), d.ahead, d.ground, d.grid_rows, d.grid_cols), ("hall", Some(2.4), true, 2, 2));
+        assert_eq!(d.directions, [Some(1.2), None, Some(3.0), Some(2.4), None, Some(5.5), Some(8.0)]);
+        assert_eq!(d.grid, [vec![1.5, 2.0], vec![3.25, 4.0]]);
+        assert_eq!((d.depth_min, d.depth_max, d.depth_median, d.width, d.height), (0.8, 12.5, 3.1, 1280, 720));
+        assert_eq!(r[1].as_depth().unwrap().ahead, None);
+        assert_eq!(r[2].as_depth().unwrap().ahead, None);
+        for (i, reading) in r.iter().enumerate().skip(3) {
+            assert!(matches!(reading, Reading::Unknown(u) if u.booster == "bynn_depth"), "{i}");
+        }
+    }
+
+    #[test]
+    fn segment_readings() {
+        let door = json!({"label": "door", "score": 0.91, "box": [0.1, 0.2, 0.4, 0.9], "polygon": [[0.1, 0.2], [0.4, 0.2], [0.4, 0.9]],
+            "area": 0.21, "centroid": [0.25, 0.55],
+            "opening": {"polygon": [[0.15, 0.3], [0.35, 0.3], [0.35, 0.85]], "centroid": [0.25, 0.57], "width": 0.2, "height": 0.55,
+                        "offset": [0.0, 0.02], "area": 0.11},
+            "depth": {"median": 3.2, "opening_median": 6.5, "opening_rim_median": null},
+            "size_m": {"width": 0.9, "height": 2.05, "opening": {"width": 0.8, "height": 1.95}}});
+        let plain = json!({"label": "window", "score": 0.4, "box": [0, 0, 1, 1], "polygon": [], "area": 1.0, "centroid": [0.5, 0.5],
+            "opening": null, "depth": null, "size_m": null});
+        let ok = json!({"image": "hall", "width": 1280, "height": 720, "prompts": ["door", "window"], "instances": [door, plain],
+            "depth_source": "bynn_depth", "assumed_hfov_deg": 70.0});
+        let empty = json!({"image": "wall", "width": 640, "height": 480, "prompts": ["door"], "instances": [], "depth_source": null});
+        let three_corners = json!({"image": "a", "width": 1, "height": 1, "prompts": ["d"], "instances": [
+            {"label": "d", "score": 0.5, "box": [0, 0, 1], "polygon": [], "area": 0.1, "centroid": [0.5, 0.5]}]});
+        let short_opening = json!({"image": "a", "width": 1, "height": 1, "prompts": ["d"], "instances": [
+            {"label": "d", "score": 0.5, "box": [0, 0, 1, 1], "polygon": [], "area": 0.1, "centroid": [0.5, 0.5],
+             "opening": {"polygon": [], "centroid": [0.5, 0.5], "width": 0.1, "height": 0.1, "area": 0.01}}]});
+        let text_depth = json!({"image": "a", "width": 1, "height": 1, "prompts": ["d"], "instances": [
+            {"label": "d", "score": 0.5, "box": [0, 0, 1, 1], "polygon": [], "area": 0.1, "centroid": [0.5, 0.5],
+             "depth": {"median": "3"}}]});
+        let no_prompts = json!({"image": "a", "width": 1, "height": 1, "instances": []});
+        let body = json!({"bynn_segment": {"version": "bynn_segment-v1", "status": "ok", "latency_ms": 300, "billed_calls": 2, "results": [
+            ok, empty, three_corners, short_opening, text_depth, no_prompts
+        ]}});
+        let r = &evidence_from_body(Some(&body)).unwrap()["bynn_segment"].results;
+        let s = r[0].as_segment().unwrap();
+        assert_eq!(
+            (s.width, s.height, s.prompts.len(), s.depth_source.as_deref(), s.assumed_hfov_deg),
+            (1280, 720, 2, Some("bynn_depth"), Some(70.0))
+        );
+        let door = &s.instances[0];
+        assert_eq!(
+            (door.label.as_str(), door.score, door.bbox, door.centroid),
+            ("door", 0.91, [0.1, 0.2, 0.4, 0.9], [0.25, 0.55])
+        );
+        assert_eq!(door.polygon[2], [0.4, 0.9]);
+        let opening = door.opening.as_ref().unwrap();
+        assert_eq!((opening.offset, opening.area), ([0.0, 0.02], 0.11));
+        assert_eq!(
+            door.depth.unwrap(),
+            SegmentDepth { median: Some(3.2), opening_median: Some(6.5), opening_rim_median: None }
+        );
+        let size = door.size_m.unwrap();
+        assert_eq!((size.width, size.height, size.opening.map(|o| o.height)), (0.9, 2.05, Some(1.95)));
+        let window = &s.instances[1];
+        assert_eq!((window.opening.is_none(), window.depth.is_none(), window.size_m.is_none()), (true, true, true));
+        let empty = r[1].as_segment().unwrap();
+        assert_eq!((empty.instances.len(), empty.depth_source.as_deref(), empty.assumed_hfov_deg), (0, None, None));
+        // A wrongly shaped instance makes the whole reading generic.
+        for (i, reading) in r.iter().enumerate().skip(2) {
+            assert!(matches!(reading, Reading::Unknown(u) if u.booster == "bynn_segment"), "{i}");
         }
     }
 
