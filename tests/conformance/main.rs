@@ -1409,6 +1409,33 @@ fn norm_box(b: &FaceBox) -> Value {
     json!({"x1": num(b.x1), "y1": num(b.y1), "x2": num(b.x2), "y2": num(b.y2)})
 }
 
+fn nums(list: &[f64]) -> Value {
+    Value::Array(list.iter().copied().map(num).collect())
+}
+
+fn norm_points(points: &[[f64; 2]]) -> Value {
+    Value::Array(points.iter().map(|p| nums(p)).collect())
+}
+
+/// A Segment Vision match as the cases write it: the wire's fields and
+/// shapes, an empty opening, depth or size (and the size's opening) as null.
+fn norm_instance(i: &decisionnode::SegmentInstance) -> Value {
+    json!({
+        "label": i.label,
+        "score": num(i.score),
+        "box": nums(&i.bbox),
+        "polygon": norm_points(&i.polygon),
+        "area": num(i.area),
+        "centroid": nums(&i.centroid),
+        "opening": i.opening.as_ref().map(|o| json!({"polygon": norm_points(&o.polygon), "centroid": nums(&o.centroid),
+            "width": num(o.width), "height": num(o.height), "offset": nums(&o.offset), "area": num(o.area)})),
+        "depth": i.depth.map(|d| json!({"median": d.median.map(num), "opening_median": d.opening_median.map(num),
+            "opening_rim_median": d.opening_rim_median.map(num)})),
+        "size_m": i.size_m.map(|s| json!({"width": num(s.width), "height": num(s.height),
+            "opening": s.opening.map(|o| json!({"width": num(o.width), "height": num(o.height)}))})),
+    })
+}
+
 fn norm_reading(r: &Reading) -> Value {
     match r {
         Reading::Age(a) => json!({"kind": "age", "image": a.image, "faces": a.faces, "age_years": a.age_years.map(num),
@@ -1418,6 +1445,17 @@ fn norm_reading(r: &Reading) -> Value {
             "top_generator": g.top_generator.as_ref().map(|t| json!({"name": t.name, "probability": num(t.probability)})),
             "c2pa_signer": g.c2pa_signer, "c2pa": g.c2pa}),
         Reading::Ocr(o) => json!({"kind": "ocr", "image": o.image, "text": o.text, "truncated": o.truncated}),
+        Reading::BynnDepth(d) => json!({"kind": "bynn_depth", "image": d.image, "ahead": d.ahead.map(num),
+            "directions": d.directions.iter().map(|x| x.map(num)).collect::<Vec<_>>(), "ground": d.ground,
+            "grid_rows": d.grid_rows, "grid_cols": d.grid_cols,
+            "grid": d.grid.iter().map(|row| row.iter().copied().map(num).collect::<Vec<_>>()).collect::<Vec<_>>(),
+            "depth_min": num(d.depth_min), "depth_max": num(d.depth_max), "depth_median": num(d.depth_median),
+            "width": d.width, "height": d.height}),
+        Reading::BynnSegment(s) => {
+            json!({"kind": "bynn_segment", "image": s.image, "width": s.width, "height": s.height,
+            "prompts": s.prompts, "depth_source": s.depth_source, "assumed_hfov_deg": s.assumed_hfov_deg.map(num),
+            "instances": s.instances.iter().map(norm_instance).collect::<Vec<_>>()})
+        }
         Reading::FaceDetection(f) => json!({"kind": "face_detection", "image": f.image, "faces": f.faces,
             "detections": f.detections.iter().map(|d| json!({"box": norm_box(&d.bbox), "confidence": num(d.confidence)})).collect::<Vec<_>>()}),
         Reading::FaceRecognition(w) => json!({"kind": "face_recognition", "image": w.image, "faces": w.faces,
