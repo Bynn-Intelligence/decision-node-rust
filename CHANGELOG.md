@@ -4,7 +4,7 @@ All notable changes to this crate are listed here. The format follows [Keep a Ch
 
 ## [0.3.0] - Unreleased
 
-Implements DecisionNode SDK specification version 1.3 (`SPEC_VERSION`): boosters and fine-tuned model names, checked against conformance suite 1.11 with the async and the blocking client.
+Implements DecisionNode SDK specification version 1.3 (`SPEC_VERSION`): boosters and fine-tuned model names, checked against conformance suite 1.22 with the async and the blocking client.
 
 ### Added
 
