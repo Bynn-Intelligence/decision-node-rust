@@ -1075,7 +1075,7 @@ enum Prepared {
     ListChunks(String, String, Option<i64>, Option<i64>),
     Search(String, Search),
     WaitUntilReady(String, Option<String>, Option<Duration>, Option<Duration>),
-    DeleteFailedItems(String),
+    DeleteFailed(String),
     UploadDocuments(Vec<Document>),
     CollectionList,
     CollectionGet(String),
@@ -1179,7 +1179,7 @@ fn prepare(root: &Path, call: &Value, refs: &Refs, driver: Driver) -> Result<Pre
             seconds(opt(args, "timeout")),
             seconds(opt(args, "poll_interval")),
         ),
-        "collections.delete_failed_items" => Prepared::DeleteFailedItems(text("collection_id")),
+        "collections.delete_failed" => Prepared::DeleteFailed(text("collection_id")),
         "upload_documents" => Prepared::UploadDocuments(
             args["documents"].as_array().into_iter().flatten().map(|d| document(root, d, driver)).collect(),
         ),
@@ -1206,6 +1206,12 @@ fn prepare(root: &Path, call: &Value, refs: &Refs, driver: Driver) -> Result<Pre
             }
             if let Some(p) = opt(args, "reference_prefix") {
                 q = q.reference_prefix(text_of(p));
+            }
+            if let Some(t) = opt(args, "q") {
+                q = q.q(text_of(t));
+            }
+            if let Some(t) = opt(args, "sort") {
+                q = q.sort(text_of(t));
             }
             Prepared::CollectionListItems(text("collection_id"), q)
         }
@@ -1378,7 +1384,7 @@ async fn invoke_async(c: &DecisionNode, p: Prepared) -> Outcome {
                 .await,
             Outcome::Collection,
         ),
-        Prepared::DeleteFailedItems(id) => wrap(c.collections().delete_failed_items(&id).await, Outcome::Collection),
+        Prepared::DeleteFailed(id) => wrap(c.collections().delete_failed(&id).await, Outcome::Collection),
         Prepared::UploadDocuments(docs) => wrap(c.upload_documents(docs).await, Outcome::UploadIds),
         Prepared::CollectionList => wrap(c.collections().list().await, Outcome::CollectionList),
         Prepared::CollectionGet(id) => wrap(c.collections().get(&id).await, Outcome::Collection),
@@ -1468,7 +1474,7 @@ fn invoke_blocking(c: &decisionnode::blocking::DecisionNode, p: Prepared) -> Out
             ),
             Outcome::Collection,
         ),
-        Prepared::DeleteFailedItems(id) => wrap(c.collections().delete_failed_items(&id), Outcome::Collection),
+        Prepared::DeleteFailed(id) => wrap(c.collections().delete_failed(&id), Outcome::Collection),
         Prepared::UploadDocuments(docs) => wrap(c.upload_documents(docs), Outcome::UploadIds),
         Prepared::CollectionList => wrap(c.collections().list(), Outcome::CollectionList),
         Prepared::CollectionGet(id) => wrap(c.collections().get(&id), Outcome::Collection),
@@ -2676,6 +2682,27 @@ fn check_sequence(expected: &[Value], log: &[Value]) -> Result<(), Fail> {
     Ok(())
 }
 
+/// The logged requests the spec selects (by `path_suffix` and `method`) are
+/// exactly `count`, each with its own value of the header: a resend whose
+/// body changed carries a new `Idempotency-Key`.
+fn check_distinct_header(spec: &Value, log: &[Value]) -> Result<(), Fail> {
+    let name = spec["name"].as_str().unwrap().to_lowercase();
+    let suffix = spec.get("path_suffix").and_then(Value::as_str);
+    let method = spec.get("method").and_then(Value::as_str);
+    let values: Vec<Option<&str>> = log
+        .iter()
+        .filter(|r| suffix.is_none_or(|s| r["path"].as_str().unwrap_or_default().ends_with(s)))
+        .filter(|r| method.is_none_or(|m| r["method"].as_str() == Some(m)))
+        .map(|r| r["headers"][name.as_str()].as_str())
+        .collect();
+    let unique: std::collections::HashSet<_> = values.iter().collect();
+    let count = spec["count"].as_u64().unwrap_or(0) as usize;
+    if values.len() != count || values.contains(&None) || unique.len() != values.len() {
+        return Err(Fail(format!("distinct_header {name}: expected {count} distinct values, got {values:?}")));
+    }
+    Ok(())
+}
+
 /// Every logged attempt the spec selects (by `path_suffix` and `method`, at
 /// least `min`, 2 by default) carries the header, all with one value, which
 /// matches `pattern` when one is given.
@@ -2822,6 +2849,9 @@ fn run_behaviour(ctx: &Ctx, driver: Driver, case: &Value) -> Result<(), Fail> {
     }
     if let Some(spec) = exp.get("same_header") {
         check_same_header(spec, &log)?;
+    }
+    if let Some(spec) = exp.get("distinct_header") {
+        check_distinct_header(spec, &log)?;
     }
     if let Some(exp_events) = exp.get("session_events").and_then(Value::as_array) {
         check_events(exp_events, &events)?;

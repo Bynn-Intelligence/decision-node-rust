@@ -1183,8 +1183,8 @@ impl Collections<'_> {
 
     /// `DELETE /v1/collections/{id}/items?status=failed`: deletes every
     /// failed document of a knowledge base and returns the answer as sent,
-    /// which says how many were deleted.
-    pub async fn delete_failed_items(&self, collection_id: &str) -> Result<Value> {
+    /// `{"deleted": n}`. It is idempotent, so it is retried as any call.
+    pub async fn delete_failed(&self, collection_id: &str) -> Result<Value> {
         let path = format!("/v1/collections/{}/items?status=failed", segment(collection_id));
         Ok(self.client.request_json(Method::DELETE, &path, None, Policy::Default).await?.body)
     }
@@ -1223,7 +1223,8 @@ impl Collections<'_> {
     /// one before, up to 10 seconds, and never past `timeout`; each read is
     /// retried as any call, after the `Retry-After` of a `429` or `529`. A
     /// failed document is returned, not raised: its `error` says why. A
-    /// status this version does not know is waited through. Past `timeout`
+    /// status this version does not know is waited through. Past `timeout`,
+    /// a deadline on the wall clock from the call,
     /// the call fails with [`ErrorKind::Timeout`]. A `poll_interval` below
     /// 100 ms or a zero `timeout` is an argument error, before anything is
     /// sent.
@@ -1247,8 +1248,7 @@ impl Collections<'_> {
             Some(item) => format!("/v1/collections/{}/items/{}", segment(collection_id), segment(item)),
             None => format!("/v1/collections/{}", segment(collection_id)),
         };
-        let started = Instant::now();
-        let mut waited = Duration::ZERO;
+        let deadline = Instant::now() + timeout;
         let mut interval = poll_interval;
         loop {
             let reply = self.client.request_json(Method::GET, &path, None, Policy::Default).await?;
@@ -1263,17 +1263,15 @@ impl Collections<'_> {
             if done {
                 return Ok(reply.body);
             }
-            let spent = waited.max(started.elapsed());
-            if spent >= timeout {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
                 let what = item_id.map_or_else(|| format!("collection {collection_id}"), |i| format!("item {i}"));
                 return Err(Error::new(
                     ErrorKind::Timeout,
                     format!("the {what} was not ready within {:.1} s", timeout.as_secs_f64()),
                 ));
             }
-            let wait = interval.min(timeout - spent);
-            self.client.wait(wait).await;
-            waited += wait;
+            self.client.wait(interval.min(left)).await;
             interval = interval.mul_f64(1.5).min(MAX_READY_POLL_INTERVAL);
         }
     }

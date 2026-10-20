@@ -17,6 +17,10 @@ const NAME_MAX: usize = 80;
 pub(crate) const REFERENCE_MAX: usize = 64;
 /// The longest item label, in characters.
 pub(crate) const LABEL_MAX: usize = 128;
+/// The longest `q` of the items list, in characters.
+const ITEMS_Q_MAX: usize = 200;
+/// The orders of a knowledge base's items list.
+const ITEMS_SORTS: [&str; 3] = ["newest", "oldest", "title"];
 /// The longest scope key, in characters.
 const SCOPE_KEY_MAX: usize = 40;
 /// An item reference: 1 to 64 of these characters.
@@ -155,6 +159,8 @@ pub struct ItemQuery {
     limit: Option<i64>,
     reference: Option<String>,
     reference_prefix: Option<String>,
+    q: Option<String>,
+    sort: Option<String>,
 }
 
 impl ItemQuery {
@@ -185,6 +191,20 @@ impl ItemQuery {
     /// with [`ItemQuery::reference`].
     pub fn reference_prefix(mut self, prefix: impl Into<String>) -> ItemQuery {
         self.reference_prefix = Some(prefix.into());
+        self
+    }
+
+    /// A knowledge base's documents whose title, file name or reference
+    /// holds this text, case-insensitively (1 to 200 characters).
+    pub fn q(mut self, q: impl Into<String>) -> ItemQuery {
+        self.q = Some(q.into());
+        self
+    }
+
+    /// The order of a knowledge base's documents: `newest`, `oldest` or
+    /// `title`.
+    pub fn sort(mut self, sort: impl Into<String>) -> ItemQuery {
+        self.sort = Some(sort.into());
         self
     }
 }
@@ -529,8 +549,11 @@ impl Collections<'_> {
     }
 
     /// [`Collections::list_items`] with every part of the query: the page
-    /// and, as the API answers it, the faces of one reference or of a
-    /// reference prefix (not both). The page comes back as sent.
+    /// and, as the API answers it, the items of one reference or of a
+    /// reference prefix (not both), and for a knowledge base a text to look
+    /// for (`q`) and an order (`sort`). The page comes back as sent; a
+    /// query the API would refuse is refused before anything is sent, with
+    /// its own error.
     pub async fn list_items_with(&self, collection_id: &str, q: &ItemQuery) -> Result<Value> {
         let mut query = page_query(q.offset, q.limit)?;
         if q.reference.is_some() && q.reference_prefix.is_some() {
@@ -541,6 +564,21 @@ impl Collections<'_> {
                 check_reference_query(name, v)?;
                 query.push(format!("{name}={}", segment(v)));
             }
+        }
+        if let Some(text) = &q.q {
+            if !(1..=ITEMS_Q_MAX).contains(&text.chars().count()) {
+                return Err(usage_error(format!("Query parameter q must be 1 to {ITEMS_Q_MAX} characters.")));
+            }
+            query.push(format!("q={}", segment(text)));
+        }
+        if let Some(sort) = &q.sort {
+            if !ITEMS_SORTS.contains(&sort.as_str()) {
+                return Err(usage_error(format!(
+                    "Query parameter sort must be newest, oldest or title, got {}.",
+                    printable(sort, 16)
+                )));
+            }
+            query.push(format!("sort={}", segment(sort)));
         }
         let mut path = format!("/v1/collections/{}/items", segment(collection_id));
         if !query.is_empty() {

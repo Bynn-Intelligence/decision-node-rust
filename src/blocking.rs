@@ -402,9 +402,9 @@ impl Collections<'_> {
         self.client.run(self.client.client.collections().list_chunks(collection_id, item_id, offset, limit))
     }
 
-    /// See [`crate::Collections::delete_failed_items`].
-    pub fn delete_failed_items(&self, collection_id: &str) -> Result<Value> {
-        self.client.run(self.client.client.collections().delete_failed_items(collection_id))
+    /// See [`crate::Collections::delete_failed`].
+    pub fn delete_failed(&self, collection_id: &str) -> Result<Value> {
+        self.client.run(self.client.client.collections().delete_failed(collection_id))
     }
 
     /// See [`crate::Collections::search`].
