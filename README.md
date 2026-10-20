@@ -2,7 +2,7 @@
 
 [DecisionNode](https://decisionnode.com) is a decision engine: send it text, JSON or images with a question, and it answers with calibrated probabilities.
 
-The official Rust client for the [DecisionNode](https://decisionnode.com) API: typed `truth`, `choice`, `score`, `number`, `point` and `box` decisions over any state, with up to 16 images, videos sent as frames, boosters, fine-tuned models, sessions, batches, retries and typed errors. Async on [reqwest](https://docs.rs/reqwest) and Tokio, with an optional blocking client.
+The official Rust client for the [DecisionNode](https://decisionnode.com) API: typed `truth`, `choice`, `score`, `number`, `point` and `box` decisions over any state, with up to 16 images, videos sent as frames, boosters, knowledge bases of your own documents, fine-tuned models, sessions, batches, retries and typed errors. Async on [reqwest](https://docs.rs/reqwest) and Tokio, with an optional blocking client.
 
 The client checks every request against the API's fixed rules before it sends anything, reuses its connections, and picks the fastest form for each image, so a call costs one round trip wherever one is enough.
 
@@ -83,6 +83,7 @@ println!("{}", answer.truth); // 0.97
 | `gate(action, context)` | Three fixed questions, below | `Decision` |
 | `models()` | `GET /v1/models` | `Vec<ModelInfo>` with each model's published `limits` (number grid, upload, `sessions` and `batch` limits included) |
 | `upload(images)` | `POST /v1/uploads` and one `PUT` per image not uploaded before | One upload id per image |
+| `collections()`, `upload_documents(documents)` | Collections of faces and knowledge bases, see [Knowledge](#knowledge) | The API's objects as sent; a search's `KnowledgeReading` |
 | `open_session(options)`, `supervise(options, feed, on_reply)` | Sessions, see [Sessions](#sessions) | `Session` |
 | `batches()`, `run_batch(requests)` | The Batch API, see [Batches](#batches) | `Batch`, `BatchResult` |
 | `usage()` | `GET /v1/keys/{key_id}/usage` and `GET /v1/usage`, see [Usage by key](#usage-by-key) | The API's objects as sent |
@@ -273,6 +274,7 @@ A booster is a specialist model that reads a request's images before the decisio
 | `face_recognition` | Whether a face matches one enrolled in a collection: per face a box, a score and the matched item's reference, with its name or label | `collection` (required): the id of one of your own collections, or `celebrities`; `threshold` (0 to 1, default 0.5): matches below it are not sent |
 | `ocr` | The text a picture shows, all of it by default, or what a prompt asks for | `prompt` (at most 2,000 characters): `"Text Recognition:"` (the default), `"Formula Recognition:"`, `"Table Recognition:"`, or your own instruction or JSON schema |
 | `bynn_depth` | Depth Vision: how far, in meters, what a picture shows is from the camera, straight ahead, in seven directions and on a grid | `grid_size` (2 to 16, default 8) |
+| `knowledge` | Knowledge: no picture, but the request's state and questions; the passages of your own documents that apply, pinned rules first, cited by document, chunk and byte offsets. See [Knowledge](#knowledge) | `collection` (required): a knowledge base's id; `scope`, `query`, `match`, `filter`, `top_k`, `max_tokens`, `pinned`, `min_score`, `include_text` |
 | `bynn_segment` | Segment Vision: what you name in words, found in a picture, each match's outline, box and centre and, with depth on, its distance and size in meters | `prompt` (required): one phrase or a list of 1 to 4, each at most 120 characters; `max_instances` (1 to 16, default 8), `min_score` (0 to 1, default 0.25), `polygon_points` (3 to 64, default 24), `depth` (default `true`) |
 
 Depth Vision's and Segment Vision's distances and sizes are estimates from one picture, for decisions and planning, never a safety stop.
@@ -337,7 +339,7 @@ let request = DecideRequest::new()
 
 `DecideRequest::booster` and `boosters` take up to 4 boosters, each at most once, kept in your order; without any the body has no `boosters` key. The helpers' `CallOptions`, `decide_many` and batch requests take boosters as `decide` does; sessions do not. Names are plain strings, so a booster added later works with this version. The client checks nothing about boosters itself: the API answers a malformed list, an unknown name or a booster turned off for your workspace before any booster runs and before any charge.
 
-`d.evidence` holds one `Evidence` per booster the request named, in its order (`None` when it named none): `version`, `status` (`ok`, `timeout` when it did not answer within its time budget, `error`, or `skipped` when none of the request's images is one it reads), `latency_ms`, `billed_calls` (the calls of that booster billed on this request), and `results`, one entry per picture; a picture the booster did not read (it timed out or failed, or could not decode the picture) is a `Reading::Unknown` holding only its `image` (and `readable: false`), `status` saying why. A reading is `Reading::Age(AgeReading)` (`image`, `faces`, and `age_years`, `low`, `high`, `confidence`, each `None` when `faces` is 0), `Reading::AiGenerated(AiGeneratedReading)` (`image`, `generated`, `confidence`, `method`: `inference` from the pixels or `c2pa` from the file's Content Credentials, `top_generator` with `name` and `probability`, `None` unless the picture is likely generated, `c2pa_signer`, and `c2pa`: `"untrusted"` when the file's Content Credentials validate but their signer is not trusted), `Reading::FaceDetection(FaceDetectionReading)` (`image`, `faces`, `detections`, each a `bbox` and a `confidence`), `Reading::FaceRecognition(FaceRecognitionReading)` (`image`, `faces`, `collection_name`, `matches`, each a `FaceMatch` with `bbox`, `score`, `collection`, `collection_name`, `reference`, `name`, `label` and `metadata`), `Reading::Ocr(OcrReading)` (`image`, `text`, `truncated`), `Reading::BynnDepth(DepthReading)` (`image`, `ahead`: meters to the nearest obstacle straight ahead with the floor left out, `None` when none is found; `directions`: 7 distances from left to right, each `Option`; `ground`: whether a floor was found and left out; `grid_rows`, `grid_cols` and `grid`, meters row by row from the top left; `depth_min`, `depth_max`, `depth_median`; `width` and `height` in pixels), `Reading::BynnSegment(SegmentReading)` (`image`, `width`, `height`, `prompts` as read, `instances` by score, each a `SegmentInstance` with `label`, `score`, `bbox` `[x1, y1, x2, y2]`, `polygon`, `area`, `centroid`, and `opening`, `depth` and `size_m` when sent; `depth_source` and `assumed_hfov_deg`; coordinates are fractions of the picture from its top left), or `Reading::Unknown(UnknownReading)` with its raw fields for a booster this version does not know or a reading with a field missing or of the wrong type, so the decision never fails on one. `usage.booster_tokens` is the readings' share of `input_tokens` and `usage.boosters` the booster calls billed; both are `None` for a request without boosters.
+`d.evidence` holds one `Evidence` per booster the request named, in its order (`None` when it named none): `version`, `status` (`ok`, `timeout` when it did not answer within its time budget, `error`, or `skipped` when none of the request's images is one it reads), `latency_ms`, `billed_calls` (the calls of that booster billed on this request), and `results`, one entry per picture; a picture the booster did not read (it timed out or failed, or could not decode the picture) is a `Reading::Unknown` holding only its `image` (and `readable: false`), `status` saying why. A reading is `Reading::Age(AgeReading)` (`image`, `faces`, and `age_years`, `low`, `high`, `confidence`, each `None` when `faces` is 0), `Reading::AiGenerated(AiGeneratedReading)` (`image`, `generated`, `confidence`, `method`: `inference` from the pixels or `c2pa` from the file's Content Credentials, `top_generator` with `name` and `probability`, `None` unless the picture is likely generated, `c2pa_signer`, and `c2pa`: `"untrusted"` when the file's Content Credentials validate but their signer is not trusted), `Reading::FaceDetection(FaceDetectionReading)` (`image`, `faces`, `detections`, each a `bbox` and a `confidence`), `Reading::FaceRecognition(FaceRecognitionReading)` (`image`, `faces`, `collection_name`, `matches`, each a `FaceMatch` with `bbox`, `score`, `collection`, `collection_name`, `reference`, `name`, `label` and `metadata`), `Reading::Ocr(OcrReading)` (`image`, `text`, `truncated`), `Reading::BynnDepth(DepthReading)` (`image`, `ahead`: meters to the nearest obstacle straight ahead with the floor left out, `None` when none is found; `directions`: 7 distances from left to right, each `Option`; `ground`: whether a floor was found and left out; `grid_rows`, `grid_cols` and `grid`, meters row by row from the top left; `depth_min`, `depth_max`, `depth_median`; `width` and `height` in pixels), `Reading::BynnSegment(SegmentReading)` (`image`, `width`, `height`, `prompts` as read, `instances` by score, each a `SegmentInstance` with `label`, `score`, `bbox` `[x1, y1, x2, y2]`, `polygon`, `area`, `centroid`, and `opening`, `depth` and `size_m` when sent; `depth_source` and `assumed_hfov_deg`; coordinates are fractions of the picture from its top left), `Reading::Knowledge(KnowledgeReading)` (one result, not per picture, see [Knowledge](#knowledge)), or `Reading::Unknown(UnknownReading)` with its raw fields for a booster this version does not know or a reading with a field missing or of the wrong type, so the decision never fails on one. `usage.booster_tokens` is the readings' share of `input_tokens` and `usage.boosters` the booster calls billed; both are `None` for a request without boosters.
 
 A booster call is one booster reading one picture with status `ok`, billed from your prepaid balance with the request's tokens; each booster's price is on [the pricing page](https://decisionnode.com/docs/pricing#boosters). Each entry's `billed_calls` times its booster's price is what the request's boosters cost. A booster that timed out or failed is free, and a refused request pays nothing for its boosters. Without `require`, a booster that fails leaves the decision to run without its reading; with `require: true` it fails the request with a `529` `booster_unavailable`, retried like any `529` (see [Errors](#errors)).
 
@@ -372,6 +374,91 @@ let dn = DecisionNode::builder().header("x-decisionnode-safety-body", "true").bu
 let d = dn.decide(request).await?;
 println!("{}", d.raw["safety"]);
 ```
+
+## Knowledge
+
+A knowledge base holds your own documents (a claims policy, house rules, a mission's special instructions). The `knowledge` booster gives a decision the passages of them that apply, as facts and rules to apply, and cites each one. A knowledge base is a collection of type `text`, under `collections()` like a collection of faces.
+
+**1. Create a knowledge base.** A scope key is optional: it names the one metadata key whose value scopes a document to, say, one mission, and is fixed for the knowledge base's life.
+
+```rust
+use decisionnode::{knowledge, Document, DocumentOptions, NewCollection, Search};
+
+let kb = dn.collections().create_with(&NewCollection::text("Claims policy").scope_key("mission")).await?;
+let kb_id = kb["id"].as_str().unwrap_or_default();
+```
+
+**2. Add documents.** Text and Markdown go inline. A file is read from a path, bytes (`Document::bytes`) or a reader (`Document::reader`, `Document::async_reader`): PDF, DOCX, PPTX, XLSX, HTML and pictures are uploaded and converted to text by the API; only the text is kept once the document is ready, and the original file is deleted. Ingestion is asynchronous: a document is `queued`, then `processing`, then `ready` or `failed`. `wait(true)` has the API hold the call up to 10 seconds and answer once the document is ready; `wait_until_ready` polls until a document, or the whole knowledge base, is done.
+
+```rust
+let rules = dn
+    .collections()
+    .add_document(
+        kb_id,
+        Document::text("# Receipts\n\nReject any claim over 500 SEK without a receipt."),
+        &DocumentOptions::new().title("Receipts rule").reference("rule-receipts").wait(true),
+    )
+    .await?;
+
+let policy = dn
+    .collections()
+    .add_document(kb_id, Document::path("claims-policy-2026.pdf"), &DocumentOptions::new().reference("policy-2026"))
+    .await?;
+let item = dn.collections().wait_until_ready(kb_id, policy["id"].as_str()).await?;
+println!("{} {:?}", item["status"], item["error"]); // a failed document is returned, its `error` saying why
+```
+
+A text or Markdown file under the inline threshold (512 KiB) that is UTF-8 goes inline, titled by its file name without the extension unless you give a title; every other file is uploaded first. A file's type is the one you give (`.content_type(...)`), else its file name's extension, else its first bytes (PDF, PNG, JPEG, TIFF, WebP); DOCX, PPTX, XLSX and text need a type or a file name. `replace_document` replaces a document whole (a new version, the old one serving until it is ready), `update_item` changes its reference, label, metadata, pin and pin rank at once and without charge, or its title as a new version. `get_item(kb_id, item_id, true)` returns a document with its stored text, `list_items` and `list_chunks` page through documents and their chunks, `delete_item` deletes one and `delete_failed_items` every failed one. `upload_documents` uploads up to 16 files ahead of time and returns their upload ids, for `Document::upload_id` within the hour.
+
+**3. Pin and scope.** A pinned document is given to every decision that names the knowledge base, before any retrieved passage: pin a rule that must always apply. On a knowledge base with a scope key, a document whose metadata holds the key's value belongs to that scope; one without it is global.
+
+```rust
+let pin = DocumentOptions::new().title("Fraud rule").pinned(true).pin_rank(0);
+dn.collections().add_document(kb_id, Document::text("Escalate any claim that names a previous claim number."), &pin).await?;
+
+let brief = DocumentOptions::new().title("Mission M-42 brief").metadata(json!({"mission": "M-42"}));
+dn.collections().add_document(kb_id, Document::path("m42-brief.md"), &brief).await?;
+```
+
+**4. Decide with knowledge.** `knowledge(collection)` is the booster, with its options: `scope` (the scope key's value; without it only global documents are read), `query` (in place of the one built from the questions and the state), `matching` (sent as `match`), `filter`, `top_k`, `max_tokens`, `pinned`, `min_score`, `include_text` and `require`. Every option is sent as given and checked by the API.
+
+```rust
+use decisionnode::Reading;
+
+let d = dn
+    .decide(
+        DecideRequest::new()
+            .state(json!({"claim": {"amount": "740.00", "receipt": false}, "mission": "M-42"}))
+            .booster(knowledge(kb_id).scope("M-42").require(true))
+            .question("approve", truth("Should the claim be approved under our policy?")),
+    )
+    .await?;
+
+let evidence = d.evidence.as_ref().and_then(|e| e.get("knowledge"));
+if let Some(Reading::Knowledge(k)) = evidence.and_then(|e| e.results.first()) {
+    for p in &k.passages {
+        println!("{} pinned={} {:?} > {:?} score={:?}", p.n, p.pinned, p.title, p.heading, p.score);
+        let doc = dn.collections().get_item(kb_id, &p.item, true).await?;
+        let text = doc["text"].as_str().unwrap_or_default();
+        println!("  {}", &text[p.byte_start as usize..p.byte_end as usize]);
+    }
+}
+```
+
+The reading is a `KnowledgeReading`: `collection`, `collection_name`, `corpus`, `query`, `budget`, `scope`, `warnings` (`scope_not_named`, `over_budget`, `budget_floor`, `pinned_filtered`), `passages`, `omitted` (the passages left out, by cause), `pending_items`, `search` and `truncated`. Each `KnowledgePassage` cites its document: `item`, `reference`, `title`, `heading`, `chunk`, and `byte_start` and `byte_end`, UTF-8 byte offsets into the document's stored text (`get_item` with `include_text`), the end exclusive, so a Rust `&str` slices by them directly. `score` is `None` for a pin. A knowledge call is USD 0.001, one a decision whatever it retrieves, billed only when the reading is `ok`; the passages' tokens are input tokens at the model's price ([pricing](https://decisionnode.com/docs/pricing#boosters)).
+
+**5. Search.** `search` returns the passages a decision would be given for a query, each with its text, without a decision. It is billed as one knowledge call and needs a full-scope key.
+
+```rust
+let found = dn.collections().search(kb_id, &Search::new("receipts for claims over 500 SEK").scope("M-42")).await?;
+for p in &found.passages {
+    println!("{} {:?}", p.n, p.text);
+}
+```
+
+**6. The errors you may meet.** With `require`, a knowledge base with no document ready and none on its way is the `409` `knowledge_collection_empty` (an `Other` error with `details()`), and one whose documents are still being ingested is the `529` `booster_unavailable`, retried after its `Retry-After`; when ingestion has been held up for 15 minutes its `details()` say `ingestion_delayed` and it is returned at once, without retrying, so you decide what to do. Adding text faster than the workspace's ingestion rate is the `429` with `details()` `reason` `ingest_queue_full` or `ingest_tokens_per_hour`, retried after its `Retry-After`. A text over 512 KiB once normalised is the `413` `item_too_large` (`RequestTooLarge`). A title, reference, label, pin rank, metadata or format the API would refuse, an empty text, a file over 50 MB, an empty file and a file of another type are refused before anything is sent, with the API's own error.
+
+**7. Files and limits.** Text (`text/plain`), Markdown (`text/markdown`), PDF, DOCX, PPTX, XLSX, HTML, PNG, JPEG, TIFF and WebP. A file is at most 50 MB, a PDF at most 100 pages, and a document's text at most 512 KiB after extraction. A title is 1 to 200 characters; a pin rank 0 to 1,000. Each document's `PUT` to storage waits up to 120 seconds (`ClientBuilder::upload_timeout` sets another), and a call with `wait` 20 seconds per attempt unless you set a timeout.
 
 ## Sessions
 
@@ -495,7 +582,7 @@ Every failure is a `decisionnode::Error`, also exported under the name used acro
 | 413 | `RequestTooLarge`, never retried: the body is over 25 MiB | |
 | 422 | `Validation` | `entries()` |
 | 429 | `RateLimit`; `SessionLimit` when `error_type` is `session_limit_exceeded` | `retry_after()` |
-| 529 | `Overloaded`, also with `error_type` `booster_unavailable` when a booster the request requires failed | `retry_after()`, `boosters()` |
+| 529 | `Overloaded`, also with `error_type` `booster_unavailable` when a booster the request requires failed | `retry_after()`, `boosters()`, `details()` |
 | 403 otherwise (`booster_not_enabled`, a suspended workspace) | `PermissionDenied` | |
 | other 5xx | `Server` | |
 | an error status whose body is not JSON (a proxy's or the network edge's own page, or no body) | the kind of its status alone: a 400 is `BadRequest`, a 403 `PermissionDenied`, a 422 `Validation` with empty `entries()`, a 413 `RequestTooLarge`, a 408 `Other`; `error_type()` is `None` and the message is `HTTP <status> <status text>` | `status()`, `request_id()`, `reason()`, `retry_after()` |
@@ -571,7 +658,7 @@ The SDK sends no telemetry and logs no state or questions. Its only added header
 cargo test --all-features
 ```
 
-The integration tests run the DecisionNode SDK conformance suite (every request, response, error, behaviour and constant case, with both clients) against its mock server, from the suite `DECISIONNODE_CONFORMANCE_DIR` points at; they need `python3` for the mock. Without the variable the conformance test fails rather than skipping. CI checks the suite out at one pinned commit, set in a single place at the top of `.github/workflows/ci.yml`, and pins every action to a commit SHA. This crate implements DecisionNode SDK specification version 1.3, exported as `decisionnode::SPEC_VERSION`, and passes conformance suite 1.13.
+The integration tests run the DecisionNode SDK conformance suite (every request, response, error, behaviour and constant case, with both clients) against its mock server, from the suite `DECISIONNODE_CONFORMANCE_DIR` points at; they need `python3` for the mock. Without the variable the conformance test fails rather than skipping. CI checks the suite out at one pinned commit, set in a single place at the top of `.github/workflows/ci.yml`, and pins every action to a commit SHA. This crate implements DecisionNode SDK specification version 1.4, exported as `decisionnode::SPEC_VERSION`, and passes conformance suite 1.23.
 
 ## License
 

@@ -2,6 +2,26 @@
 
 All notable changes to this crate are listed here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the crate follows [Semantic Versioning](https://semver.org/).
 
+## [0.4.0] - Unreleased
+
+Implements DecisionNode SDK specification version 1.4 (`SPEC_VERSION`): knowledge, checked against conformance suite 1.23 with the async and the blocking client.
+
+### Added
+
+- Knowledge bases, collections of type `text`: `NewCollection` (`face(name)`, `text(name)`, `collection_type`, `scope_key`) and `Collections::create_with`, sending `scope_key` only when given. A text collection's object (`scope_key`, `chunks`, `tokens`, `version`, `status_counts`, `pinned`) and a purge answered `202` `{"id", "status": "purging"}` come back as sent.
+- Documents: `Document` (`text`, with `format`; `path`, `bytes`, `reader` and `async_reader`, with `content_type` and `filename`; `upload_id`) and `DocumentOptions` (`title`, `reference`, `pinned`, `pin_rank`, `label`, `metadata`, `wait`), for `Collections::add_document` (`POST .../items`) and `Collections::replace_document` (`PUT .../items/{item_id}`), each with an `Idempotency-Key`, the same on every attempt. Text goes inline; a text or Markdown file under the inline threshold that is UTF-8 without NUL goes inline too, titled by its file name's stem; every other file is uploaded with the knowledge purpose (`POST /v1/uploads` with `purpose` and `filename`, then the storage `PUT`, 120 seconds an attempt by default, `DEFAULT_DOCUMENT_UPLOAD_TIMEOUT`) and named by its `upload_id`. A file's type is the one given, else its name's extension, else its first bytes. A stale upload the call placed is uploaded again and the call sent once more with a new key. `wait(true)` sends `?wait=true`, and such a call waits `DEFAULT_WAIT_TIMEOUT` (20 seconds) per attempt unless a timeout was set.
+- `Collections::get_item` (with `include_text`), `list_chunks`, `delete_failed_items` (`DELETE .../items?status=failed`), `search` with `Search` (`query`, `scope`, `matching` sent as `match`, `filter`, `top_k`, `pinned`, `max_tokens`) returning a `KnowledgeReading`, and `wait_until_ready` / `wait_until_ready_with`, which poll an item until it is `ready` or `failed` (a failed item is returned, not raised) or a collection until nothing is queued or processing, waiting 1 second, then 1.5 times longer each read up to 10 seconds, at most 5 minutes by default, then failing with `Timeout`. `ItemUpdate` gains `pinned`, `pin_rank` and `title`.
+- `DecisionNode::upload_documents`: 1 to 16 documents uploaded with the knowledge purpose in one presign, one upload id each.
+- The `knowledge` booster: `knowledge(collection)` with `query`, `scope`, `matching`, `filter`, `top_k`, `max_tokens`, `pinned`, `min_score`, `include_text`, `option` and `require`, always sent as the object `{"name": "knowledge", "options": {...}}`, each option only when set; and its reading, `Reading::Knowledge(KnowledgeReading)` with `KnowledgePassage`, `KnowledgeCorpus`, `KnowledgeQuery`, `KnowledgeBudget`, `KnowledgeScope` and `KnowledgeSearch`, every value as sent. A reading or passage with a required field missing or of the wrong type is a `Reading::Unknown`.
+- The API's limits checked before anything is sent, with its own errors: a collection type other than `face` or `text`, a scope key, a title, a `pin_rank`, a format, an empty text, a missing title, a text collection's reference and label, a file over 50 MB, an empty file and a file of a type the API does not take.
+
+### Changed
+
+- `SPEC_VERSION` is `"1.4"`.
+- A `529` whose `details.reason` is `ingestion_delayed` is returned at once, never retried.
+- A `422` whose detail names an `error_type` (`invalid_text`) has empty `entries()`.
+- `create_with_type` takes `text` as well as `face`.
+
 ## [0.3.0] - Unreleased
 
 Implements DecisionNode SDK specification version 1.3 (`SPEC_VERSION`): boosters and fine-tuned model names, checked against conformance suite 1.22 with the async and the blocking client.

@@ -26,6 +26,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use base64::Engine;
+use decisionnode::{knowledge, Document, DocumentOptions, Knowledge, KnowledgeReading, NewCollection, Search};
 use decisionnode::{
     Batch, BatchPage, BatchRequest, BatchResult, BatchStatus, Booster, BoundingBox, CallOptions, Choice, ChoiceAnswer,
     ClientBuilder, DecideRequest, Decision, DecisionNode, DecisionResult, Error, Image, Levels, ModelInfo, Number,
@@ -318,6 +319,8 @@ enum Outcome {
     Collection(Value),
     /// `collections.list`: the collections, in order.
     CollectionList(Vec<Value>),
+    /// `collections.search`: the knowledge reading.
+    Knowledge(Box<KnowledgeReading>),
     #[cfg_attr(not(feature = "sessions"), allow(dead_code))]
     Session(SessionHandle),
     #[cfg(feature = "sessions")]
@@ -790,6 +793,7 @@ fn videos(root: &Path, args: &Value) -> Vec<Video> {
 /// wire-form object, passed as is.
 fn booster(value: &Value) -> Booster {
     match single(value) {
+        Some(("$knowledge", args)) => knowledge_booster(args).into(),
         Some(("$booster", args)) => {
             let name = args.get("name").or_else(|| args.get("booster")).and_then(Value::as_str).unwrap_or_default();
             let mut b = Booster::new(name);
@@ -809,6 +813,144 @@ fn booster(value: &Value) -> Booster {
             other => Booster::from(other.clone()),
         },
     }
+}
+
+/// `$knowledge`: `knowledge(collection, ...)`, each option passed only when
+/// present. A value the typed builder does not take goes as given through
+/// `option`, which sends it the same.
+fn knowledge_booster(args: &Value) -> Knowledge {
+    let mut k = knowledge(args.get("collection").map(text_of).unwrap_or_default());
+    for (key, v) in args.as_object().into_iter().flatten() {
+        k = match (key.as_str(), v) {
+            ("collection", _) => k,
+            ("require", v) => k.require(v.as_bool().unwrap_or(false)),
+            ("query", Value::String(q)) => k.query(q),
+            ("scope", Value::String(sc)) => k.scope(sc),
+            ("match", m) => k.matching(m),
+            ("filter", f) => k.filter(f),
+            ("top_k", n) if n.is_i64() => k.top_k(n.as_i64().unwrap()),
+            ("max_tokens", m) => k.max_tokens(m.clone()),
+            ("pinned", Value::Bool(b)) => k.pinned(*b),
+            ("min_score", n) if n.is_number() => k.min_score(n.as_f64().unwrap()),
+            ("include_text", Value::Bool(b)) => k.include_text(*b),
+            (other, v) => k.option(other, v),
+        };
+    }
+    k
+}
+
+/// `$document`: text with its format; a file by path, by bytes
+/// (`data_base64`, `data_text`, `repeat_text`, or a path with `pad_to`) or as
+/// a stream (`stream_base64`, a reader for the blocking client and an async
+/// reader for the async one), with `content_type` and `filename`; or an
+/// upload id.
+fn document(root: &Path, value: &Value, driver: Driver) -> Document {
+    let args = single(value).filter(|(k, _)| *k == "$document").map(|(_, a)| a).unwrap_or(value);
+    let text = |k: &str| args.get(k).and_then(Value::as_str);
+    let dressed = |mut d: Document| {
+        if let Some(c) = text("content_type") {
+            d = d.content_type(c);
+        }
+        if let Some(f) = text("filename") {
+            d = d.filename(f);
+        }
+        d
+    };
+    if let Some(t) = args.get("text") {
+        let mut d = Document::text(text_of(t));
+        if let Some(f) = args.get("format") {
+            d = d.format(text_of(f));
+        }
+        return d;
+    }
+    if let Some(id) = text("upload_id") {
+        return Document::upload_id(id);
+    }
+    if let (Some(p), None) = (text("path"), args.get("pad_to")) {
+        return dressed(Document::path(root.join(p)));
+    }
+    let mut filename = None;
+    let mut data = if let Some(t) = text("data_text") {
+        t.as_bytes().to_vec()
+    } else if let Some(r) = args.get("repeat_text") {
+        r["repeat"].as_str().unwrap_or_default().repeat(r["times"].as_u64().unwrap_or(0) as usize).into_bytes()
+    } else if let Some(p) = text("path") {
+        filename = Path::new(p).file_name().map(|n| n.to_string_lossy().into_owned());
+        std::fs::read(root.join(p)).unwrap()
+    } else {
+        let b64 = text("data_base64").or_else(|| text("stream_base64")).unwrap_or_default();
+        base64::engine::general_purpose::STANDARD.decode(b64).unwrap()
+    };
+    if let Some(n) = args.get("pad_to").and_then(Value::as_u64) {
+        data.resize((n as usize).max(data.len()), 0);
+    }
+    let mut d = if args.get("stream_base64").is_some() {
+        match driver {
+            Driver::Async => Document::async_reader(std::io::Cursor::new(data)),
+            #[cfg(feature = "blocking")]
+            Driver::Blocking => Document::reader(std::io::Cursor::new(data)),
+        }
+    } else {
+        Document::bytes(data)
+    };
+    if let (Some(f), None) = (filename, text("filename")) {
+        d = d.filename(f);
+    }
+    dressed(d)
+}
+
+/// The fields of `add_document` and `replace_document`.
+fn document_options(args: &Value) -> DocumentOptions {
+    let mut o = DocumentOptions::new();
+    if let Some(t) = opt(args, "title") {
+        o = o.title(text_of(t));
+    }
+    if let Some(r) = opt(args, "reference") {
+        o = o.reference(text_of(r));
+    }
+    if let Some(p) = opt(args, "pinned").and_then(Value::as_bool) {
+        o = o.pinned(p);
+    }
+    if let Some(r) = opt(args, "pin_rank").and_then(Value::as_i64) {
+        o = o.pin_rank(r);
+    }
+    if let Some(l) = opt(args, "label") {
+        o = o.label(text_of(l));
+    }
+    if let Some(m) = opt(args, "metadata") {
+        o = o.metadata(m.clone());
+    }
+    if let Some(w) = opt(args, "wait").and_then(Value::as_bool) {
+        o = o.wait(w);
+    }
+    o
+}
+
+fn search(args: &Value) -> Search {
+    let mut q = Search::new(args.get("query").map(text_of).unwrap_or_default());
+    if let Some(sc) = opt(args, "scope") {
+        q = q.scope(text_of(sc));
+    }
+    if let Some(m) = opt(args, "match") {
+        q = q.matching(m);
+    }
+    if let Some(f) = opt(args, "filter") {
+        q = q.filter(f);
+    }
+    if let Some(n) = opt(args, "top_k").and_then(Value::as_i64) {
+        q = q.top_k(n);
+    }
+    if let Some(p) = opt(args, "pinned").and_then(Value::as_bool) {
+        q = q.pinned(p);
+    }
+    if let Some(m) = opt(args, "max_tokens") {
+        q = q.max_tokens(m.clone());
+    }
+    q
+}
+
+fn seconds(v: Option<&Value>) -> Option<Duration> {
+    v.and_then(Value::as_f64).map(|s| Duration::try_from_secs_f64(s).unwrap_or(Duration::ZERO))
 }
 
 fn boosters(args: &Value) -> Vec<Booster> {
@@ -926,6 +1068,15 @@ enum Prepared {
     BatchCancel(String),
     RunBatch(Vec<BatchRequest>, Duration),
     CollectionCreate(String, Option<String>),
+    CollectionCreateWith(NewCollection),
+    AddDocument(String, Document, DocumentOptions),
+    ReplaceDocument(String, String, Document, DocumentOptions),
+    GetItem(String, String, bool),
+    ListChunks(String, String, Option<i64>, Option<i64>),
+    Search(String, Search),
+    WaitUntilReady(String, Option<String>, Option<Duration>, Option<Duration>),
+    DeleteFailedItems(String),
+    UploadDocuments(Vec<Document>),
     CollectionList,
     CollectionGet(String),
     CollectionDelete(String),
@@ -946,7 +1097,7 @@ enum Prepared {
 
 /// The call of a case. An argument the SDK refuses while it is being built
 /// (an image file that cannot be read) is the call's error.
-fn prepare(root: &Path, call: &Value, refs: &Refs) -> Result<Prepared, Error> {
+fn prepare(root: &Path, call: &Value, refs: &Refs, driver: Driver) -> Result<Prepared, Error> {
     let method = call["method"].as_str().unwrap();
     if method == "decide_raw" {
         return Ok(Prepared::Raw(call["args"]["body"].clone()));
@@ -993,7 +1144,45 @@ fn prepare(root: &Path, call: &Value, refs: &Refs) -> Result<Prepared, Error> {
             Duration::try_from_secs_f64(args.get("poll_interval").and_then(Value::as_f64).unwrap_or(60.0))
                 .unwrap_or(Duration::ZERO),
         ),
+        "collections.create" if opt(args, "scope_key").is_some() => {
+            let t = opt(args, "type").map(text_of).unwrap_or_else(|| "face".into());
+            let c = NewCollection::face(text("name")).collection_type(t);
+            Prepared::CollectionCreateWith(c.scope_key(text("scope_key")))
+        }
         "collections.create" => Prepared::CollectionCreate(text("name"), opt(args, "type").map(text_of)),
+        "collections.add_document" => Prepared::AddDocument(
+            text("collection_id"),
+            document(root, &args["document"], driver),
+            document_options(args),
+        ),
+        "collections.replace_document" => Prepared::ReplaceDocument(
+            text("collection_id"),
+            text("item_id"),
+            document(root, &args["document"], driver),
+            document_options(args),
+        ),
+        "collections.get_item" => Prepared::GetItem(
+            text("collection_id"),
+            text("item_id"),
+            opt(args, "include_text").and_then(Value::as_bool).unwrap_or(false),
+        ),
+        "collections.list_chunks" => Prepared::ListChunks(
+            text("collection_id"),
+            text("item_id"),
+            opt(args, "offset").and_then(Value::as_i64),
+            opt(args, "limit").and_then(Value::as_i64),
+        ),
+        "collections.search" => Prepared::Search(text("collection_id"), search(args)),
+        "collections.wait_until_ready" => Prepared::WaitUntilReady(
+            text("collection_id"),
+            opt(args, "item_id").map(text_of),
+            seconds(opt(args, "timeout")),
+            seconds(opt(args, "poll_interval")),
+        ),
+        "collections.delete_failed_items" => Prepared::DeleteFailedItems(text("collection_id")),
+        "upload_documents" => Prepared::UploadDocuments(
+            args["documents"].as_array().into_iter().flatten().map(|d| document(root, d, driver)).collect(),
+        ),
         "collections.list" => Prepared::CollectionList,
         "collections.get" => Prepared::CollectionGet(text("collection_id")),
         "collections.delete" => Prepared::CollectionDelete(text("collection_id")),
@@ -1033,6 +1222,15 @@ fn prepare(root: &Path, call: &Value, refs: &Refs) -> Result<Prepared, Error> {
             }
             if let Some(m) = args.get("metadata") {
                 u = u.metadata(m.clone());
+            }
+            if let Some(p) = opt(args, "pinned").and_then(Value::as_bool) {
+                u = u.pinned(p);
+            }
+            if let Some(r) = opt(args, "pin_rank").and_then(Value::as_i64) {
+                u = u.pin_rank(r);
+            }
+            if let Some(t) = opt(args, "title") {
+                u = u.title(text_of(t));
             }
             Prepared::CollectionUpdateItem(text("collection_id"), text("item_id"), u)
         }
@@ -1095,7 +1293,12 @@ fn batch_run(r: Result<decisionnode::BatchRun, Error>) -> Outcome {
 }
 
 fn invoke(ctx: &Ctx, client: &Client, call: &Value, refs: &Refs) -> Outcome {
-    let prepared = match prepare(&ctx.root, call, refs) {
+    let driver = match client {
+        Client::Async(_) => Driver::Async,
+        #[cfg(feature = "blocking")]
+        Client::Blocking(_) => Driver::Blocking,
+    };
+    let prepared = match prepare(&ctx.root, call, refs, driver) {
         Ok(p) => p,
         Err(e) => return Outcome::Error(e),
     };
@@ -1154,6 +1357,29 @@ async fn invoke_async(c: &DecisionNode, p: Prepared) -> Outcome {
         Prepared::CollectionCreate(name, Some(t)) => {
             wrap(c.collections().create_with_type(name, t).await, Outcome::Collection)
         }
+        Prepared::CollectionCreateWith(n) => wrap(c.collections().create_with(&n).await, Outcome::Collection),
+        Prepared::AddDocument(id, d, o) => wrap(c.collections().add_document(&id, d, &o).await, Outcome::Collection),
+        Prepared::ReplaceDocument(id, item, d, o) => {
+            wrap(c.collections().replace_document(&id, &item, d, &o).await, Outcome::Collection)
+        }
+        Prepared::GetItem(id, item, t) => wrap(c.collections().get_item(&id, &item, t).await, Outcome::Collection),
+        Prepared::ListChunks(id, item, o, l) => {
+            wrap(c.collections().list_chunks(&id, &item, o, l).await, Outcome::Collection)
+        }
+        Prepared::Search(id, q) => wrap(c.collections().search(&id, &q).await, |k| Outcome::Knowledge(Box::new(k))),
+        Prepared::WaitUntilReady(id, item, t, p) => wrap(
+            c.collections()
+                .wait_until_ready_with(
+                    &id,
+                    item.as_deref(),
+                    t.unwrap_or(decisionnode::DEFAULT_READY_TIMEOUT),
+                    p.unwrap_or(decisionnode::DEFAULT_READY_POLL_INTERVAL),
+                )
+                .await,
+            Outcome::Collection,
+        ),
+        Prepared::DeleteFailedItems(id) => wrap(c.collections().delete_failed_items(&id).await, Outcome::Collection),
+        Prepared::UploadDocuments(docs) => wrap(c.upload_documents(docs).await, Outcome::UploadIds),
         Prepared::CollectionList => wrap(c.collections().list().await, Outcome::CollectionList),
         Prepared::CollectionGet(id) => wrap(c.collections().get(&id).await, Outcome::Collection),
         Prepared::CollectionDelete(id) => wrap(c.collections().delete(&id).await, Outcome::Collection),
@@ -1223,6 +1449,27 @@ fn invoke_blocking(c: &decisionnode::blocking::DecisionNode, p: Prepared) -> Out
         Prepared::CollectionCreate(name, Some(t)) => {
             wrap(c.collections().create_with_type(name, t), Outcome::Collection)
         }
+        Prepared::CollectionCreateWith(n) => wrap(c.collections().create_with(&n), Outcome::Collection),
+        Prepared::AddDocument(id, d, o) => wrap(c.collections().add_document(&id, d, &o), Outcome::Collection),
+        Prepared::ReplaceDocument(id, item, d, o) => {
+            wrap(c.collections().replace_document(&id, &item, d, &o), Outcome::Collection)
+        }
+        Prepared::GetItem(id, item, t) => wrap(c.collections().get_item(&id, &item, t), Outcome::Collection),
+        Prepared::ListChunks(id, item, o, l) => {
+            wrap(c.collections().list_chunks(&id, &item, o, l), Outcome::Collection)
+        }
+        Prepared::Search(id, q) => wrap(c.collections().search(&id, &q), |k| Outcome::Knowledge(Box::new(k))),
+        Prepared::WaitUntilReady(id, item, t, p) => wrap(
+            c.collections().wait_until_ready_with(
+                &id,
+                item.as_deref(),
+                t.unwrap_or(decisionnode::DEFAULT_READY_TIMEOUT),
+                p.unwrap_or(decisionnode::DEFAULT_READY_POLL_INTERVAL),
+            ),
+            Outcome::Collection,
+        ),
+        Prepared::DeleteFailedItems(id) => wrap(c.collections().delete_failed_items(&id), Outcome::Collection),
+        Prepared::UploadDocuments(docs) => wrap(c.upload_documents(docs), Outcome::UploadIds),
         Prepared::CollectionList => wrap(c.collections().list(), Outcome::CollectionList),
         Prepared::CollectionGet(id) => wrap(c.collections().get(&id), Outcome::Collection),
         Prepared::CollectionDelete(id) => wrap(c.collections().delete(&id), Outcome::Collection),
@@ -1463,8 +1710,39 @@ fn norm_reading(r: &Reading) -> Value {
             "matches": w.matches.iter().map(|m| json!({"box": norm_box(&m.bbox), "score": num(m.score), "collection": m.collection,
                 "reference": m.reference, "name": m.name, "label": m.label, "collection_name": m.collection_name,
                 "metadata": m.metadata})).collect::<Vec<_>>()}),
+        Reading::Knowledge(k) => norm_knowledge(k),
         _ => json!({"kind": "unknown", "raw": r.raw()}),
     }
+}
+
+/// A knowledge reading as the cases write it: its fields as sent, an absent
+/// one as null, `warnings` an empty list.
+fn norm_knowledge(k: &KnowledgeReading) -> Value {
+    let field = |key: &str| k.raw.get(key).cloned().unwrap_or(Value::Null);
+    let passages: Vec<Value> = k
+        .passages
+        .iter()
+        .map(|p| {
+            json!({"n": p.n, "pinned": p.pinned, "item": p.item, "reference": p.reference, "title": p.title,
+                "heading": p.heading, "chunk": p.chunk, "byte_start": p.byte_start, "byte_end": p.byte_end,
+                "tokens": p.tokens, "score": p.score.map(num), "lexical": p.lexical, "rendered": p.rendered, "text": p.text})
+        })
+        .collect();
+    json!({
+        "kind": "knowledge",
+        "collection": k.collection,
+        "collection_name": k.collection_name,
+        "corpus": field("corpus"),
+        "query": field("query"),
+        "budget": field("budget"),
+        "scope": field("scope"),
+        "warnings": k.warnings,
+        "passages": passages,
+        "omitted": k.omitted,
+        "pending_items": field("pending_items"),
+        "search": field("search"),
+        "truncated": k.truncated,
+    })
 }
 
 fn norm_evidence(e: &Evidence) -> Value {
@@ -1765,9 +2043,12 @@ fn check_outcome(spec: &Value, result: &OutcomeRef<'_>, path: &str) -> Result<()
             check_results_outcome(spec, r, path)
         }
         ("checked", Outcome::Checked) => Ok(()),
+        ("knowledge", Outcome::Knowledge(k)) => {
+            matches(spec.get("knowledge").unwrap_or(&empty), &norm_knowledge(k), &format!("{path}.knowledge"))
+        }
         (
-            "collection" | "item" | "item_page" | "deleted" | "key_usage" | "usage_page" | "created_key" | "api_key"
-            | "key_page" | "key_revoked" | "keys_revoked",
+            "collection" | "item" | "item_page" | "chunk_page" | "deleted" | "key_usage" | "usage_page" | "created_key"
+            | "api_key" | "key_page" | "key_revoked" | "keys_revoked",
             Outcome::Collection(v),
         ) => matches(spec.get(kind).unwrap_or(&empty), v, &format!("{path}.{kind}")),
         ("collections" | "usage_items" | "api_keys", Outcome::CollectionList(list)) => {
@@ -2241,6 +2522,8 @@ fn run_response(ctx: &Ctx, driver: Driver, case: &Value) -> Result<(), Fail> {
         "collections",
         "item",
         "item_page",
+        "chunk_page",
+        "knowledge",
         "deleted",
         "key_usage",
         "usage_page",

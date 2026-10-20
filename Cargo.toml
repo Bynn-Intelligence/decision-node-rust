@@ -39,7 +39,7 @@ reqwest = { version = "0.12", default-features = false, features = ["charset", "
 serde = "1"
 serde_json = { version = "1", features = ["preserve_order", "float_roundtrip"] }
 sha2 = "0.11.0"
-tokio = { version = "1", features = ["time", "sync", "rt"] }
+tokio = { version = "1", features = ["time", "sync", "rt", "fs", "io-util"] }
 tokio-tungstenite = { version = "0.30.0", default-features = false, features = ["handshake"], optional = true }
 
 [dev-dependencies]

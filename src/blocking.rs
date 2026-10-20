@@ -26,10 +26,11 @@ use std::time::Duration;
 
 use crate::batch::{Batch, BatchPage, BatchRequest, BatchResult, BatchResultStream, BatchResults, BatchRun};
 use crate::client::{CallOptions, ClientBuilder, DecideRequest};
-use crate::collections::{ItemQuery, ItemUpdate};
+use crate::collections::{ItemQuery, ItemUpdate, NewCollection};
 use crate::error::{Error, ErrorKind, Result};
 use crate::image::Image;
 use crate::keys::{KeyQuery, KeyRevocation, KeyUpdate, NewKey};
+use crate::knowledge::{Document, DocumentOptions, KnowledgeReading, Search};
 use crate::question::{Choice, Number, Score, Truth};
 use crate::response::{ChoiceAnswer, Decision, DecisionResult, ModelInfo, NumberAnswer, ScoreAnswer, TruthAnswer};
 use crate::usage::{UsagePeriod, UsageQuery};
@@ -197,6 +198,11 @@ impl DecisionNode {
         self.run(self.client.upload(images))
     }
 
+    /// See [`crate::DecisionNode::upload_documents`].
+    pub fn upload_documents(&self, documents: impl IntoIterator<Item = Document>) -> Result<Vec<String>> {
+        self.run(self.client.upload_documents(documents))
+    }
+
     /// The workspace's device keys. See [`crate::DecisionNode::keys`].
     pub fn keys(&self) -> Keys<'_> {
         Keys { client: self }
@@ -312,6 +318,11 @@ impl Collections<'_> {
         self.client.run(self.client.client.collections().create_with_type(name, collection_type))
     }
 
+    /// See [`crate::Collections::create_with`].
+    pub fn create_with(&self, collection: &NewCollection) -> Result<Value> {
+        self.client.run(self.client.client.collections().create_with(collection))
+    }
+
     /// See [`crate::Collections::list`].
     pub fn list(&self) -> Result<Vec<Value>> {
         self.client.run(self.client.client.collections().list())
@@ -357,6 +368,69 @@ impl Collections<'_> {
     /// See [`crate::Collections::delete_item`].
     pub fn delete_item(&self, collection_id: &str, item_id: &str) -> Result<Value> {
         self.client.run(self.client.client.collections().delete_item(collection_id, item_id))
+    }
+
+    /// See [`crate::Collections::add_document`].
+    pub fn add_document(&self, collection_id: &str, document: Document, options: &DocumentOptions) -> Result<Value> {
+        self.client.run(self.client.client.collections().add_document(collection_id, document, options))
+    }
+
+    /// See [`crate::Collections::replace_document`].
+    pub fn replace_document(
+        &self,
+        collection_id: &str,
+        item_id: &str,
+        document: Document,
+        options: &DocumentOptions,
+    ) -> Result<Value> {
+        self.client.run(self.client.client.collections().replace_document(collection_id, item_id, document, options))
+    }
+
+    /// See [`crate::Collections::get_item`].
+    pub fn get_item(&self, collection_id: &str, item_id: &str, include_text: bool) -> Result<Value> {
+        self.client.run(self.client.client.collections().get_item(collection_id, item_id, include_text))
+    }
+
+    /// See [`crate::Collections::list_chunks`].
+    pub fn list_chunks(
+        &self,
+        collection_id: &str,
+        item_id: &str,
+        offset: Option<i64>,
+        limit: Option<i64>,
+    ) -> Result<Value> {
+        self.client.run(self.client.client.collections().list_chunks(collection_id, item_id, offset, limit))
+    }
+
+    /// See [`crate::Collections::delete_failed_items`].
+    pub fn delete_failed_items(&self, collection_id: &str) -> Result<Value> {
+        self.client.run(self.client.client.collections().delete_failed_items(collection_id))
+    }
+
+    /// See [`crate::Collections::search`].
+    pub fn search(&self, collection_id: &str, search: &Search) -> Result<KnowledgeReading> {
+        self.client.run(self.client.client.collections().search(collection_id, search))
+    }
+
+    /// See [`crate::Collections::wait_until_ready`].
+    pub fn wait_until_ready(&self, collection_id: &str, item_id: Option<&str>) -> Result<Value> {
+        self.client.run(self.client.client.collections().wait_until_ready(collection_id, item_id))
+    }
+
+    /// See [`crate::Collections::wait_until_ready_with`].
+    pub fn wait_until_ready_with(
+        &self,
+        collection_id: &str,
+        item_id: Option<&str>,
+        timeout: Duration,
+        poll_interval: Duration,
+    ) -> Result<Value> {
+        self.client.run(self.client.client.collections().wait_until_ready_with(
+            collection_id,
+            item_id,
+            timeout,
+            poll_interval,
+        ))
     }
 }
 

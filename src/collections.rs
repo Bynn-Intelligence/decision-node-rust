@@ -1,5 +1,7 @@
 //! Collections: a workspace's collections of enrolled faces, which the
-//! `face_recognition` booster searches, and the public ones it may use.
+//! `face_recognition` booster searches, and the public ones it may use; and
+//! its knowledge bases, collections of type `text` whose documents the
+//! `knowledge` booster reads (see [`crate::Document`] and [`crate::knowledge`]).
 
 use reqwest::Method;
 use serde_json::{json, Map, Value};
@@ -12,9 +14,11 @@ use crate::image::{check_image_url, Image};
 /// The longest collection name, in characters.
 const NAME_MAX: usize = 80;
 /// The longest item reference, in characters.
-const REFERENCE_MAX: usize = 64;
+pub(crate) const REFERENCE_MAX: usize = 64;
 /// The longest item label, in characters.
-const LABEL_MAX: usize = 128;
+pub(crate) const LABEL_MAX: usize = 128;
+/// The longest scope key, in characters.
+const SCOPE_KEY_MAX: usize = 40;
 /// An item reference: 1 to 64 of these characters.
 const REFERENCE_PATTERN: &str = "^[A-Za-z0-9_.:-]{1,64}$";
 /// The largest page of `list_items`.
@@ -41,6 +45,9 @@ pub struct ItemUpdate {
     reference: Option<String>,
     label: Option<Option<String>>,
     metadata: Option<Value>,
+    pinned: Option<bool>,
+    pin_rank: Option<i64>,
+    title: Option<String>,
 }
 
 impl ItemUpdate {
@@ -72,6 +79,70 @@ impl ItemUpdate {
     /// of at most 500 characters, a number or a boolean.
     pub fn metadata(mut self, metadata: impl Into<Value>) -> ItemUpdate {
         self.metadata = Some(metadata.into());
+        self
+    }
+
+    /// A document's pin: `true` always gives it to a decision that names
+    /// its knowledge base. Applied at once, never billed.
+    pub fn pinned(mut self, pinned: bool) -> ItemUpdate {
+        self.pinned = Some(pinned);
+        self
+    }
+
+    /// A pinned document's order, 0 to 1,000, lowest first.
+    pub fn pin_rank(mut self, pin_rank: i64) -> ItemUpdate {
+        self.pin_rank = Some(pin_rank);
+        self
+    }
+
+    /// A document's new title, 1 to 200 characters: a new version of the
+    /// document (`202`), embedded again.
+    pub fn title(mut self, title: impl Into<String>) -> ItemUpdate {
+        self.title = Some(title.into());
+        self
+    }
+}
+
+/// A new collection, for [`Collections::create_with`]: a collection of
+/// faces, or a knowledge base of documents with an optional scope key.
+///
+/// ```
+/// use decisionnode::NewCollection;
+///
+/// let staff = NewCollection::face("Staff");
+/// let missions = NewCollection::text("Mission briefs").scope_key("mission");
+/// ```
+#[derive(Clone, Debug, PartialEq)]
+#[must_use]
+pub struct NewCollection {
+    name: String,
+    collection_type: String,
+    scope_key: Option<String>,
+}
+
+impl NewCollection {
+    /// A collection of faces (type `face`).
+    pub fn face(name: impl Into<String>) -> NewCollection {
+        NewCollection { name: name.into(), collection_type: "face".into(), scope_key: None }
+    }
+
+    /// A knowledge base (type `text`).
+    pub fn text(name: impl Into<String>) -> NewCollection {
+        NewCollection { name: name.into(), collection_type: "text".into(), scope_key: None }
+    }
+
+    /// The collection's type, `face` or `text`.
+    pub fn collection_type(mut self, collection_type: impl Into<String>) -> NewCollection {
+        self.collection_type = collection_type.into();
+        self
+    }
+
+    /// A knowledge base's scope key (1 to 40 of `a-z`, `0-9` and `_`): the
+    /// metadata key whose value scopes a document to, say, one mission. A
+    /// decision names the value in the booster's `scope`. Fixed for the
+    /// collection's life.
+    pub fn scope_key(mut self, scope_key: impl Into<String>) -> NewCollection {
+        self.scope_key = Some(scope_key.into());
         self
     }
 }
@@ -128,7 +199,7 @@ impl ItemQuery {
 /// for. A `409` `idempotency_key_reused` is returned as the base error.
 #[derive(Clone, Copy, Debug)]
 pub struct Collections<'a> {
-    client: &'a DecisionNode,
+    pub(crate) client: &'a DecisionNode,
 }
 
 impl DecisionNode {
@@ -151,7 +222,7 @@ impl DecisionNode {
 }
 
 /// A path segment: every byte but the unreserved characters written as `%XX`.
-fn segment(id: &str) -> String {
+pub(crate) fn segment(id: &str) -> String {
     let mut out = String::with_capacity(id.len());
     for b in id.bytes() {
         if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
@@ -178,7 +249,7 @@ pub(crate) fn echoed(value: &str) -> Value {
 
 /// A string field's `422` entry, as the API answers it: empty, too long or,
 /// with a pattern, not matching it. Lengths are counted in characters.
-fn string_entries(field: &str, value: &str, most: usize, pattern: bool) -> Vec<Value> {
+pub(crate) fn string_entries(field: &str, value: &str, most: usize, pattern: bool) -> Vec<Value> {
     let loc = [json!("body"), json!(field)];
     if value.is_empty() {
         let msg = "String should have at least 1 character";
@@ -227,7 +298,7 @@ fn echoed_value(value: &Value) -> Value {
 /// `0-9` and `_`, each value a text of at most 500 characters, a number or a
 /// boolean. A text's control characters, a number's range and the total size
 /// are the API's to judge.
-fn metadata_entries(metadata: &Value) -> Vec<Value> {
+pub(crate) fn metadata_entries(metadata: &Value) -> Vec<Value> {
     let loc = [json!("body"), json!("metadata")];
     let Some(map) = metadata.as_object() else {
         return vec![entry(
@@ -284,6 +355,26 @@ fn metadata_entries(metadata: &Value) -> Vec<Value> {
     out
 }
 
+/// The `offset` and `limit` of a page, checked as the API checks them.
+pub(crate) fn page_query(offset: Option<i64>, limit: Option<i64>) -> Result<Vec<String>> {
+    if let Some(o) = offset.filter(|o| *o < 0) {
+        return Err(usage_error(format!("Query parameter offset must be an integer of 0 or more, got {o}.")));
+    }
+    if let Some(l) = limit.filter(|l| !(1..=MAX_LIST_LIMIT).contains(l)) {
+        return Err(usage_error(format!(
+            "Query parameter limit must be an integer from 1 to {MAX_LIST_LIMIT}, got {l}."
+        )));
+    }
+    let mut query = Vec::new();
+    if let Some(o) = offset {
+        query.push(format!("offset={o}"));
+    }
+    if let Some(l) = limit {
+        query.push(format!("limit={l}"));
+    }
+    Ok(query)
+}
+
 /// A `reference` or `reference_prefix` of the items list, as the API checks
 /// it.
 fn check_reference_query(name: &str, value: &str) -> Result<()> {
@@ -306,29 +397,54 @@ impl Collections<'_> {
     /// `POST /v1/collections`: creates a collection of faces with this name
     /// (1 to 80 characters) and returns it.
     pub async fn create(&self, name: impl Into<String>) -> Result<Value> {
-        self.create_with_type(name, "face").await
+        self.create_with(&NewCollection::face(name)).await
     }
 
-    /// [`Collections::create`] with the collection's type. `face` is the only
-    /// type; another is refused before anything is sent, as the API would.
+    /// [`Collections::create`] with the collection's type, `face` or `text`.
     pub async fn create_with_type(&self, name: impl Into<String>, collection_type: impl Into<String>) -> Result<Value> {
-        let (name, collection_type) = (name.into(), collection_type.into());
+        self.create_with(&NewCollection::face(name).collection_type(collection_type)).await
+    }
+
+    /// `POST /v1/collections`: creates a collection of faces or a knowledge
+    /// base and returns it as sent. A type other than `face` or `text`, a
+    /// name not 1 to 80 characters and a scope key not 1 to 40 of `a-z`,
+    /// `0-9` and `_` are refused before anything is sent, as the API would.
+    pub async fn create_with(&self, collection: &NewCollection) -> Result<Value> {
+        let NewCollection { name, collection_type, scope_key } = collection;
         let mut entries = Vec::new();
-        if collection_type != "face" {
+        if !matches!(collection_type.as_str(), "face" | "text") {
             entries.push(entry(
                 "literal_error",
                 &[json!("body"), json!("type")],
-                "Input should be 'face'",
-                &echoed(&collection_type),
-                Some(json!({"expected": "'face'"})),
+                "Input should be 'face' or 'text'",
+                &echoed(collection_type),
+                Some(json!({"expected": "'face' or 'text'"})),
             ));
         }
-        entries.extend(string_entries("name", &name, NAME_MAX, false));
+        entries.extend(string_entries("name", name, NAME_MAX, false));
+        if let Some(key) = scope_key {
+            let length = key.chars().count();
+            let allowed = |c: char| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_';
+            if !(1..=SCOPE_KEY_MAX).contains(&length) || !key.chars().all(allowed) {
+                entries.push(entry(
+                    "string_pattern_mismatch",
+                    &[json!("body"), json!("scope_key")],
+                    "String should match pattern '^[a-z0-9_]{1,40}$'",
+                    &echoed(key),
+                    None,
+                ));
+            }
+        }
         if !entries.is_empty() {
             return Err(Error::local_entries(entries));
         }
-        let body = json!({"type": collection_type, "name": name});
-        Ok(self.client.request_json_idempotent(Method::POST, "/v1/collections", &body).await?.body)
+        let mut body = Map::new();
+        body.insert("type".into(), Value::String(collection_type.clone()));
+        body.insert("name".into(), Value::String(name.clone()));
+        if let Some(key) = scope_key {
+            body.insert("scope_key".into(), Value::String(key.clone()));
+        }
+        Ok(self.client.request_json_idempotent(Method::POST, "/v1/collections", &Value::Object(body)).await?.body)
     }
 
     /// `GET /v1/collections`: the workspace's collections, then the public
@@ -348,7 +464,10 @@ impl Collections<'_> {
         self.call(Method::GET, &format!("/v1/collections/{}", segment(collection_id)), None, Policy::Default).await
     }
 
-    /// `DELETE /v1/collections/{id}`: deletes a collection and its faces.
+    /// `DELETE /v1/collections/{id}`: deletes a collection and all it holds,
+    /// and returns the answer as sent: `{"id", "deleted": true}`, or for a
+    /// knowledge base not purged within 10 seconds `202` `{"id", "status":
+    /// "purging"}`, the purge finishing on the server.
     pub async fn delete(&self, collection_id: &str) -> Result<Value> {
         self.call(Method::DELETE, &format!("/v1/collections/{}", segment(collection_id)), None, Policy::Default).await
     }
@@ -413,22 +532,7 @@ impl Collections<'_> {
     /// and, as the API answers it, the faces of one reference or of a
     /// reference prefix (not both). The page comes back as sent.
     pub async fn list_items_with(&self, collection_id: &str, q: &ItemQuery) -> Result<Value> {
-        let (offset, limit) = (q.offset, q.limit);
-        if let Some(o) = offset.filter(|o| *o < 0) {
-            return Err(usage_error(format!("Query parameter offset must be an integer of 0 or more, got {o}.")));
-        }
-        if let Some(l) = limit.filter(|l| !(1..=MAX_LIST_LIMIT).contains(l)) {
-            return Err(usage_error(format!(
-                "Query parameter limit must be an integer from 1 to {MAX_LIST_LIMIT}, got {l}."
-            )));
-        }
-        let mut query = Vec::new();
-        if let Some(o) = offset {
-            query.push(format!("offset={o}"));
-        }
-        if let Some(l) = limit {
-            query.push(format!("limit={l}"));
-        }
+        let mut query = page_query(q.offset, q.limit)?;
         if q.reference.is_some() && q.reference_prefix.is_some() {
             return Err(usage_error("Send query parameter reference or reference_prefix, not both."));
         }
@@ -446,11 +550,14 @@ impl Collections<'_> {
     }
 
     /// `PATCH /v1/collections/{id}/items/{item_id}`: changes an enrolled
-    /// face, sending only the fields the [`ItemUpdate`] sets, and returns the
-    /// item as sent. Its reference and label are checked as
-    /// [`Collections::enroll`] checks them; a change of nothing is refused
+    /// face or a document, sending only the fields the [`ItemUpdate`] sets,
+    /// and returns the item as sent. Its reference and label are checked as
+    /// [`Collections::enroll`] checks them, a title and `pin_rank` as
+    /// [`Collections::add_document`] does; a change of nothing is refused
     /// before anything is sent. Like `enroll`, it sends an `Idempotency-Key`
-    /// and retries as `enroll` does.
+    /// and retries as `enroll` does. A document's `reference`, `label`,
+    /// `metadata`, `pinned` and `pin_rank` apply at once and are never
+    /// billed (`200`); a new title is a new version (`202`).
     pub async fn update_item(&self, collection_id: &str, item_id: &str, update: &ItemUpdate) -> Result<Value> {
         let mut entries = Vec::new();
         let mut body = Map::new();
@@ -467,6 +574,17 @@ impl Collections<'_> {
         if let Some(m) = &update.metadata {
             entries.extend(metadata_entries(m));
             body.insert("metadata".into(), m.clone());
+        }
+        if let Some(p) = update.pinned {
+            body.insert("pinned".into(), Value::Bool(p));
+        }
+        if let Some(rank) = update.pin_rank {
+            entries.extend(crate::knowledge::pin_rank_entries(rank));
+            body.insert("pin_rank".into(), json!(rank));
+        }
+        if let Some(t) = &update.title {
+            entries.extend(crate::knowledge::title_entries(t));
+            body.insert("title".into(), Value::String(t.clone()));
         }
         if body.is_empty() {
             entries.push(entry(

@@ -350,7 +350,9 @@ impl Error {
                 reason: header(headers, "x-decisionnode-error"),
                 category: if kind == ErrorKind::Refusal { category } else { None },
                 safety,
-                entries: if kind == ErrorKind::Validation { entries } else { None },
+                // A 422 whose detail is an object (`invalid_text`) has no
+                // entries: an empty list.
+                entries: if kind == ErrorKind::Validation { entries.or_else(|| Some(Vec::new())) } else { None },
                 retry_after,
                 boosters: parse_boosters_header(headers),
                 details,
@@ -413,7 +415,8 @@ impl Error {
     }
 
     /// For a [`ErrorKind::Validation`]: the server's list of validation entries,
-    /// empty for a `422` whose body is not JSON.
+    /// empty for a `422` whose body is not JSON or names an `error_type`
+    /// instead (`invalid_text`).
     pub fn entries(&self) -> Option<&[Value]> {
         self.inner.entries.as_deref()
     }

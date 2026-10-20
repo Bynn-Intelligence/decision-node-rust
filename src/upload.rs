@@ -6,12 +6,13 @@ use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant, SystemTime};
 
 use base64::Engine;
+use bytes::Bytes;
 use futures_util::future::try_join_all;
 use indexmap::IndexMap;
 use md5::Digest;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use reqwest::Method;
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 
 use crate::client::{backoff, encoded_len, is_loopback, transport_error, DecisionNode, Policy};
 use crate::error::{parse_rfc3339, Error, ErrorKind, Result};
@@ -22,7 +23,7 @@ const CACHE_ENTRIES: usize = 256;
 /// An entry is used until this long before the upload's `expires_at`.
 const CACHE_MARGIN: Duration = Duration::from_secs(300);
 /// The most files one `POST /v1/uploads` takes.
-const MAX_UPLOAD_FILES: usize = 16;
+pub(crate) const MAX_UPLOAD_FILES: usize = 16;
 /// Stands for an upload id not issued yet, at the length of a real one, when
 /// the size of a body is worked out before anything is uploaded.
 const UPLOAD_ID_PLACEHOLDER: &str = "upl_00000000000000000000000000000000";
@@ -111,6 +112,28 @@ fn key_of(local: &Local) -> Key {
 pub(crate) struct Placed {
     pub(crate) wires: Vec<Value>,
     pub(crate) uploaded: Vec<String>,
+}
+
+/// One file of a presign: its bytes, media type and SHA-256, and for a
+/// knowledge upload its purpose and file name.
+pub(crate) struct UploadFile<'a> {
+    pub(crate) data: &'a Bytes,
+    pub(crate) content_type: &'a str,
+    pub(crate) sha256: [u8; 32],
+    pub(crate) purpose: Option<&'static str>,
+    pub(crate) filename: Option<&'a str>,
+}
+
+impl<'a> UploadFile<'a> {
+    fn image(local: &'a Local) -> UploadFile<'a> {
+        UploadFile {
+            data: &local.data,
+            content_type: local.media_type(),
+            sha256: *local.sha256(),
+            purpose: None,
+            filename: None,
+        }
+    }
 }
 
 /// One entry of the presign answer.
@@ -230,10 +253,11 @@ impl DecisionNode {
             }
         }
         if !todo.is_empty() {
-            let group: Vec<&Local> = todo.iter().map(|&i| &**locals[i]).collect();
+            let group: Vec<UploadFile<'_>> = todo.iter().map(|&i| UploadFile::image(locals[i])).collect();
+            let timeout = self.inner.upload_timeout;
             let (presigned, urls_expire) = self.presign(&group).await?;
             let presigned = try_join_all(
-                todo.iter().zip(presigned).map(|(&i, p)| self.put_or_presign_again(p, locals[i], urls_expire)),
+                group.iter().zip(presigned).map(|(file, p)| self.put_or_presign_again(p, file, urls_expire, timeout)),
             )
             .await?;
             for (&i, p) in todo.iter().zip(presigned) {
@@ -255,38 +279,62 @@ impl DecisionNode {
     async fn put_or_presign_again(
         &self,
         presigned: Presigned,
-        local: &Local,
+        file: &UploadFile<'_>,
         urls_expire: SystemTime,
+        timeout: Duration,
     ) -> Result<Presigned> {
-        match self.put(&presigned, local).await {
+        match self.put(&presigned, file.data, timeout).await {
             Ok(()) => Ok(presigned),
             Err(e) if e.status() == Some(403) && self.now() >= urls_expire => {
                 log::debug!("storage URL expired before its PUT; presigning again");
-                let (again, _) = self.presign(&[local]).await?;
+                let (again, _) = self.presign(std::slice::from_ref(file)).await?;
                 let again = again
                     .into_iter()
                     .next()
                     .ok_or_else(|| Error::new(ErrorKind::Server, "the upload answer holds no upload for the file"))?;
-                self.put(&again, local).await?;
+                self.put(&again, file.data, timeout).await?;
                 Ok(again)
             }
             Err(e) => Err(e),
         }
     }
 
+    /// Uploads files with a purpose (the knowledge files of documents): one
+    /// `POST /v1/uploads` for all of them, then one `PUT` each, in parallel,
+    /// each attempt within `timeout`. Returns one upload id per file, in
+    /// order. Nothing is cached: such an upload is consumed by the item it
+    /// makes.
+    pub(crate) async fn upload_files(&self, files: &[UploadFile<'_>], timeout: Duration) -> Result<Vec<String>> {
+        let (presigned, urls_expire) = self.presign(files).await?;
+        let placed = try_join_all(
+            files.iter().zip(presigned).map(|(f, p)| self.put_or_presign_again(p, f, urls_expire, timeout)),
+        )
+        .await?;
+        Ok(placed.into_iter().map(|p| p.upload_id).collect())
+    }
+
     /// One `POST /v1/uploads` for these files. Returns the uploads, in order,
     /// and when their URLs stop taking a `PUT` by the client's clock
     /// (`expires_in`, 300 seconds, from the answer).
-    async fn presign(&self, group: &[&Local]) -> Result<(Vec<Presigned>, SystemTime)> {
+    async fn presign(&self, group: &[UploadFile<'_>]) -> Result<(Vec<Presigned>, SystemTime)> {
         let files: Vec<Value> = group
             .iter()
-            .map(|l| {
-                json!({
-                    "content_type": l.media_type(),
-                    "byte_size": l.data.len(),
-                    "checksum": base64::engine::general_purpose::STANDARD.encode(md5::Md5::digest(&l.data)),
-                    "sha256": base64::engine::general_purpose::STANDARD.encode(l.sha256()),
-                })
+            .map(|f| {
+                let mut file = Map::new();
+                if let Some(purpose) = f.purpose {
+                    file.insert("purpose".into(), json!(purpose));
+                }
+                file.insert("content_type".into(), json!(f.content_type));
+                file.insert("byte_size".into(), json!(f.data.len()));
+                file.insert(
+                    "checksum".into(),
+                    json!(base64::engine::general_purpose::STANDARD.encode(md5::Md5::digest(f.data))),
+                );
+                file.insert("sha256".into(), json!(base64::engine::general_purpose::STANDARD.encode(f.sha256)));
+                if let Some(name) = f.filename {
+                    file.insert("filename".into(), json!(name));
+                }
+                Value::Object(file)
             })
             .collect();
         let body = json!({ "files": files });
@@ -336,7 +384,7 @@ impl DecisionNode {
     /// never a redirect followed. Retried on 5xx and connection errors; a
     /// `412` on a retry means an earlier attempt stored the object, which is
     /// written once: success.
-    async fn put(&self, presigned: &Presigned, local: &Local) -> Result<()> {
+    async fn put(&self, presigned: &Presigned, data: &Bytes, timeout: Duration) -> Result<()> {
         let inner = &*self.inner;
         let url = reqwest::Url::parse(&presigned.url)
             .map_err(|e| Error::invalid(format!("the storage URL is not valid: {e}")).with_source(e))?;
@@ -352,23 +400,15 @@ impl DecisionNode {
         let mut attempt: u32 = 0;
         loop {
             let started = Instant::now();
-            let rb = inner
-                .http
-                .put(url.clone())
-                .timeout(inner.upload_timeout)
-                .headers(presigned.headers.clone())
-                .body(local.data.clone());
+            let rb = inner.http.put(url.clone()).timeout(timeout).headers(presigned.headers.clone()).body(data.clone());
             let attempt_future = async {
-                let resp = rb.send().await.map_err(|e| transport_error(e, inner.upload_timeout))?;
+                let resp = rb.send().await.map_err(|e| transport_error(e, timeout))?;
                 let status = resp.status().as_u16();
-                let body = resp.bytes().await.map_err(|e| transport_error(e, inner.upload_timeout))?;
+                let body = resp.bytes().await.map_err(|e| transport_error(e, timeout))?;
                 Ok::<_, Error>((status, body))
             };
-            let result = tokio::time::timeout(inner.upload_timeout, attempt_future).await.unwrap_or_else(|_| {
-                Err(Error::new(
-                    ErrorKind::Timeout,
-                    format!("no response within {:.1} s", inner.upload_timeout.as_secs_f64()),
-                ))
+            let result = tokio::time::timeout(timeout, attempt_future).await.unwrap_or_else(|_| {
+                Err(Error::new(ErrorKind::Timeout, format!("no response within {:.1} s", timeout.as_secs_f64())))
             });
             log::debug!(
                 "PUT storage {} in {} ms (attempt {})",

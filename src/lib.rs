@@ -14,8 +14,10 @@
 //! frames ([`Video`]), boosters whose readings come back as evidence
 //! ([`Booster`], [`Decision::evidence`]), sessions
 //! ([`DecisionNode::open_session`], [`DecisionNode::supervise`], behind the
-//! default `sessions` feature) and the Batch API ([`DecisionNode::batches`],
-//! [`DecisionNode::run_batch`]).
+//! default `sessions` feature), the Batch API ([`DecisionNode::batches`],
+//! [`DecisionNode::run_batch`]), collections of faces and knowledge bases of
+//! the workspace's own documents ([`DecisionNode::collections`],
+//! [`Document`], [`knowledge`]).
 //!
 //! ```no_run
 //! use decisionnode::{choice, score, truth, DecideRequest, DecisionNode};
@@ -57,6 +59,7 @@ pub mod error;
 mod http;
 mod image;
 mod keys;
+mod knowledge;
 pub mod question;
 mod response;
 mod safety;
@@ -77,14 +80,19 @@ pub use booster::{
 };
 pub use client::{
     gate_questions, CallOptions, ClientBuilder, DecideRequest, DecisionNode, Sleeper, DEFAULT_BASE_URL,
-    DEFAULT_CONCURRENCY, DEFAULT_INLINE_THRESHOLD, DEFAULT_MAX_RETRIES, DEFAULT_MODEL, DEFAULT_OCR_TIMEOUT,
-    DEFAULT_TIMEOUT, DEFAULT_UPLOAD_TIMEOUT, MAX_BODY_BYTES,
+    DEFAULT_CONCURRENCY, DEFAULT_DOCUMENT_UPLOAD_TIMEOUT, DEFAULT_INLINE_THRESHOLD, DEFAULT_MAX_RETRIES, DEFAULT_MODEL,
+    DEFAULT_OCR_TIMEOUT, DEFAULT_TIMEOUT, DEFAULT_UPLOAD_TIMEOUT, DEFAULT_WAIT_TIMEOUT, MAX_BODY_BYTES,
 };
-pub use collections::{Collections, ItemQuery, ItemUpdate};
+pub use collections::{Collections, ItemQuery, ItemUpdate, NewCollection};
 pub use error::{DecisionNodeError, Error, ErrorKind, Result};
 pub use http::HttpSettings;
 pub use image::Image;
 pub use keys::{KeyQuery, KeyRevocation, KeyUpdate, Keys, NewKey};
+pub use knowledge::{
+    knowledge, Document, DocumentOptions, Knowledge, KnowledgeBudget, KnowledgeCorpus, KnowledgePassage,
+    KnowledgeQuery, KnowledgeReading, KnowledgeScope, KnowledgeSearch, Search, DEFAULT_READY_POLL_INTERVAL,
+    DEFAULT_READY_TIMEOUT, DOCUMENT_TYPES, MAX_DOCUMENT_BYTES, MIN_READY_POLL_INTERVAL,
+};
 pub use question::{
     bounding_box, choice, number, point, score, truth, BoundingBox, Choice, Levels, Number, Options, Point, Question,
     Score, Truth,
@@ -107,4 +115,4 @@ pub use serde_json;
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// The version of the DecisionNode SDK specification this crate implements.
-pub const SPEC_VERSION: &str = "1.3";
+pub const SPEC_VERSION: &str = "1.4";

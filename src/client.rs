@@ -42,6 +42,14 @@ pub const DEFAULT_CONCURRENCY: usize = 8;
 /// call's [`DEFAULT_TIMEOUT`]: a 10 MB image on a slow uplink needs more than
 /// 10 seconds. Set another with [`ClientBuilder::upload_timeout`].
 pub const DEFAULT_UPLOAD_TIMEOUT: Duration = Duration::from_secs(60);
+/// The timeout of one storage `PUT` attempt of a document's file: a file is up
+/// to 50 MB. A timeout set with [`ClientBuilder::upload_timeout`] is used as
+/// given instead.
+pub const DEFAULT_DOCUMENT_UPLOAD_TIMEOUT: Duration = Duration::from_secs(120);
+/// The timeout of each attempt of a document call with `wait`, which the
+/// server holds up to 10 seconds, when no timeout was set. A timeout set with
+/// [`ClientBuilder::timeout`] is used as given.
+pub const DEFAULT_WAIT_TIMEOUT: Duration = Duration::from_secs(20);
 /// Local images of one request (or session frame, or batch line) that total
 /// fewer bytes than this go inline as base64; at or above it they are
 /// uploaded and sent by upload id. Below about half a megabyte the base64
@@ -77,7 +85,8 @@ fn given(value: String) -> Option<String> {
 /// The `error_type`s of a reference to an upload that is no longer usable.
 /// One the client placed itself is uploaded again and the request resent
 /// once.
-const STALE_UPLOAD: [&str; 4] = ["upload_expired", "upload_consumed", "upload_not_found", "upload_incomplete"];
+pub(crate) const STALE_UPLOAD: [&str; 4] =
+    ["upload_expired", "upload_consumed", "upload_not_found", "upload_incomplete"];
 
 // --------------------------------------------------------------------------- request
 
@@ -482,9 +491,11 @@ impl ClientBuilder {
         self
     }
 
-    /// The timeout of one storage `PUT` attempt of an image upload, from
-    /// sending to the storage's answer, apart from [`ClientBuilder::timeout`].
-    /// Default: 60 seconds. Zero fails [`ClientBuilder::build`].
+    /// The timeout of one storage `PUT` attempt of an upload, from sending to
+    /// the storage's answer, apart from [`ClientBuilder::timeout`]. Default:
+    /// 60 seconds for an image, [`DEFAULT_DOCUMENT_UPLOAD_TIMEOUT`] (120
+    /// seconds) for a document's file; a timeout set here holds for both.
+    /// Zero fails [`ClientBuilder::build`].
     pub fn upload_timeout(mut self, timeout: Duration) -> ClientBuilder {
         self.upload_timeout = Some(Ok(timeout));
         self
@@ -633,6 +644,7 @@ impl ClientBuilder {
         }
         let max_retries = self.max_retries.unwrap_or(Ok(DEFAULT_MAX_RETRIES)).map_err(Error::invalid)?;
         let inline_threshold = self.inline_threshold.unwrap_or(Ok(DEFAULT_INLINE_THRESHOLD)).map_err(Error::invalid)?;
+        let upload_timeout_set = self.upload_timeout.is_some();
         let upload_timeout = self.upload_timeout.unwrap_or(Ok(DEFAULT_UPLOAD_TIMEOUT)).map_err(Error::invalid)?;
         if upload_timeout.is_zero() {
             return Err(Error::invalid("upload_timeout must be above 0"));
@@ -651,6 +663,7 @@ impl ClientBuilder {
                 max_retries,
                 inline_threshold,
                 upload_timeout,
+                upload_timeout_set,
                 headers,
                 http,
                 #[cfg(feature = "sessions")]
@@ -719,6 +732,10 @@ pub(crate) struct Inner {
     pub(crate) max_retries: u32,
     pub(crate) inline_threshold: usize,
     pub(crate) upload_timeout: Duration,
+    /// True when the caller set the upload timeout: it then also holds for
+    /// a document's file, which otherwise waits
+    /// [`DEFAULT_DOCUMENT_UPLOAD_TIMEOUT`].
+    pub(crate) upload_timeout_set: bool,
     pub(crate) headers: HeaderMap,
     pub(crate) http: reqwest::Client,
     /// True for an `https` base URL: nothing is then sent over plain HTTP.
@@ -1080,6 +1097,24 @@ impl DecisionNode {
         self.request_json_with_key(method, path, body, &new_idempotency_key()).await
     }
 
+    /// [`DecisionNode::request_json_idempotent`] with this key and policy
+    /// ([`Policy::Idempotent`] or [`Policy::IdempotentWait`]).
+    pub(crate) async fn request_json_keyed(
+        &self,
+        method: Method,
+        path: &str,
+        body: &Value,
+        key: &str,
+        policy: Policy,
+    ) -> Result<Reply> {
+        let payload = Some(Payload::json(body)?);
+        let key = HeaderValue::from_str(key).expect("an idempotency key is printable ASCII");
+        match self.exchange(method, path, payload, policy, false, Some(key)).await? {
+            Exchanged::Whole(raw) => Self::json_reply(raw),
+            Exchanged::Open(_) => unreachable!("a whole reply was asked for"),
+        }
+    }
+
     /// [`DecisionNode::request_json_idempotent`] with the caller's own
     /// `Idempotency-Key`, checked first as the API checks it: 1 to 255
     /// printable ASCII characters.
@@ -1095,12 +1130,7 @@ impl DecisionNode {
                 "Idempotency-Key must be sent once, as 1 to 255 printable ASCII characters.",
             ));
         }
-        let payload = Some(Payload::json(body)?);
-        let key = HeaderValue::from_str(key).expect("printable ASCII is a valid header value");
-        match self.exchange(method, path, payload, Policy::Idempotent, false, Some(key)).await? {
-            Exchanged::Whole(raw) => Self::json_reply(raw),
-            Exchanged::Open(_) => unreachable!("a whole reply was asked for"),
-        }
+        self.request_json_keyed(method, path, body, key, Policy::Idempotent).await
     }
 
     /// A 2xx response parsed as JSON.
@@ -1240,15 +1270,19 @@ impl DecisionNode {
                         Policy::Default | Policy::Ocr | Policy::SessionOpen => is_retryable(status),
                         // A first attempt with the same key still running on the
                         // server: try again after the wait it asks for.
-                        Policy::Idempotent => {
+                        Policy::Idempotent | Policy::IdempotentWait => {
                             is_retryable(status)
                                 || (status == 409 && error().error_type() == Some("idempotency_in_progress"))
                         }
                     };
                     // An enrollment the API has no price for: a retry never cures it.
+                    // Ingestion held up past 15 minutes: an outage the caller
+                    // decides about, so it is raised at once too.
                     let unpriced = status == 529
-                        && error().details().and_then(|d| d.get("reason")).and_then(Value::as_str)
-                            == Some("enrollment_unpriced");
+                        && matches!(
+                            error().details().and_then(|d| d.get("reason")).and_then(Value::as_str),
+                            Some("enrollment_unpriced" | "ingestion_delayed")
+                        );
                     // A key's daily spend cap: its wait runs to 00:00 UTC, so it is
                     // raised at once.
                     let capped = status == 429 && error().error_type() == Some("key_spend_cap_reached");
@@ -1273,10 +1307,20 @@ impl DecisionNode {
     /// [`DEFAULT_OCR_TIMEOUT`] unless the caller set a timeout, which is then
     /// used as given, even a shorter one.
     fn attempt_timeout(&self, policy: Policy) -> Duration {
-        if policy == Policy::Ocr && !self.inner.timeout_set {
-            DEFAULT_OCR_TIMEOUT
+        match policy {
+            _ if self.inner.timeout_set => self.inner.timeout,
+            Policy::Ocr => DEFAULT_OCR_TIMEOUT,
+            Policy::IdempotentWait => DEFAULT_WAIT_TIMEOUT,
+            _ => self.inner.timeout,
+        }
+    }
+
+    /// The timeout of one storage `PUT` attempt of a document's file.
+    pub(crate) fn document_upload_timeout(&self) -> Duration {
+        if self.inner.upload_timeout_set {
+            self.inner.upload_timeout
         } else {
-            self.inner.timeout
+            DEFAULT_DOCUMENT_UPLOAD_TIMEOUT
         }
     }
 
@@ -1303,6 +1347,10 @@ pub(crate) enum Policy {
     /// A call that carries its own `Idempotency-Key`, the same on every
     /// attempt: as `Default`, and also a `409` `idempotency_in_progress`.
     Idempotent,
+    /// [`Policy::Idempotent`] for a document call with `wait`, which the
+    /// server holds up to 10 seconds: the attempt waits
+    /// [`DEFAULT_WAIT_TIMEOUT`] unless the caller set a timeout.
+    IdempotentWait,
     /// A decision whose boosters name `ocr`: as `Default`, except that a
     /// timeout is never retried, and the attempt waits
     /// [`DEFAULT_OCR_TIMEOUT`] unless the caller set a timeout.
@@ -1728,6 +1776,7 @@ mod tests {
             max_retries: dn.inner.max_retries,
             inline_threshold: dn.inner.inline_threshold,
             upload_timeout: dn.inner.upload_timeout,
+            upload_timeout_set: dn.inner.upload_timeout_set,
             headers: dn.inner.headers.clone(),
             http: dn.inner.http.clone(),
             #[cfg(feature = "sessions")]

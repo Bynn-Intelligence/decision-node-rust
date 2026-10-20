@@ -26,6 +26,7 @@ use serde::Serialize;
 use serde_json::{Map, Value};
 
 use crate::error::{header, Error, Result};
+use crate::knowledge::KnowledgeReading;
 
 // --------------------------------------------------------------------------- request
 
@@ -71,6 +72,15 @@ impl Booster {
     /// with one it is sent as the object `{"name": name, ...}`.
     pub fn new(name: impl Into<String>) -> Booster {
         Booster { form: Form::Object { name: name.into(), images: None, require: None, options: None } }
+    }
+
+    /// The object form with these parts, for a typed booster builder.
+    pub(crate) fn with_parts(
+        name: &str,
+        require: Option<bool>,
+        options: std::result::Result<Value, String>,
+    ) -> Booster {
+        Booster { form: Form::Object { name: name.to_owned(), images: None, require, options: Some(options) } }
     }
 
     /// The object form of this booster, keeping what it already holds.
@@ -267,6 +277,9 @@ pub enum Reading {
     BynnDepth(DepthReading),
     /// A reading of Segment Vision, the `bynn_segment` booster.
     BynnSegment(SegmentReading),
+    /// A reading of the `knowledge` booster: the passages of the
+    /// workspace's own documents given to the decision.
+    Knowledge(Box<KnowledgeReading>),
     /// A reading of a booster this version does not know, or a malformed
     /// reading.
     Unknown(UnknownReading),
@@ -681,6 +694,7 @@ impl Reading {
             "bynn_segment" => Self::parse_segment(obj, &raw),
             "face_detection" => Self::parse_face_detection(obj, &raw),
             "face_recognition" => Self::parse_face_recognition(obj, &raw),
+            "knowledge" => KnowledgeReading::parse(obj, &raw).map(|r| Reading::Knowledge(Box::new(r))),
             _ => None,
         });
         known.unwrap_or_else(|| Reading::Unknown(UnknownReading { booster: booster.to_owned(), raw }))
@@ -902,7 +916,16 @@ impl Reading {
         }
     }
 
-    /// The id of the image read, when the reading names one.
+    /// The reading of the `knowledge` booster, if this is one.
+    pub fn as_knowledge(&self) -> Option<&KnowledgeReading> {
+        match self {
+            Reading::Knowledge(r) => Some(r),
+            _ => None,
+        }
+    }
+
+    /// The id of the image read, when the reading names one (a knowledge
+    /// reading reads no image).
     pub fn image(&self) -> Option<&str> {
         match self {
             Reading::Age(r) => Some(&r.image),
@@ -912,6 +935,7 @@ impl Reading {
             Reading::BynnSegment(r) => Some(&r.image),
             Reading::FaceDetection(r) => Some(&r.image),
             Reading::FaceRecognition(r) => Some(&r.image),
+            Reading::Knowledge(_) => None,
             Reading::Unknown(r) => r.raw.get("image").and_then(Value::as_str),
         }
     }
@@ -926,6 +950,7 @@ impl Reading {
             Reading::BynnSegment(r) => &r.raw,
             Reading::FaceDetection(r) => &r.raw,
             Reading::FaceRecognition(r) => &r.raw,
+            Reading::Knowledge(r) => &r.raw,
             Reading::Unknown(r) => &r.raw,
         }
     }
