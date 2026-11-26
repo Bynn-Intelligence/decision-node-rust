@@ -541,6 +541,16 @@ impl Answer {
 pub struct Usage {
     /// The tokens of the state, the questions, the images and the videos.
     pub input_tokens: Option<u64>,
+    /// The share of `input_tokens` that came from images, from the
+    /// `x-decisionnode-image-tokens` header, as sent: never added to or taken
+    /// from another count. `None` for a request without images (the server
+    /// sends the header only when the share is above 0), and when the header
+    /// is not a whole number from 0 to 2^31 - 1.
+    pub image_tokens: Option<u64>,
+    /// The share of `input_tokens` that came from videos, from the
+    /// `x-decisionnode-video-tokens` header, read as `image_tokens` is. `None`
+    /// for a request without videos.
+    pub video_tokens: Option<u64>,
     /// The output tokens.
     pub output_tokens: Option<u64>,
     /// The frames read over all the videos. `None` for a request without
@@ -603,6 +613,8 @@ impl Usage {
         let field = |k: &str| usage.and_then(|u| u.get(k));
         Usage {
             input_tokens: field("input_tokens").and_then(Value::as_u64),
+            image_tokens: None,
+            video_tokens: None,
             output_tokens: field("output_tokens").and_then(Value::as_u64),
             video_frames: field("video_frames").and_then(Value::as_u64),
             video_seconds: field("video_seconds").and_then(Value::as_f64),
@@ -611,6 +623,29 @@ impl Usage {
             cost: field("cost").and_then(Cost::from_value),
         }
     }
+
+    /// Reads the image and video shares of `input_tokens` from a response's
+    /// headers, `None` for each header that is absent or not a whole number
+    /// from 0 to 2^31 - 1.
+    fn with_token_headers(mut self, headers: &HeaderMap) -> Usage {
+        self.image_tokens = token_header(headers, "x-decisionnode-image-tokens");
+        self.video_tokens = token_header(headers, "x-decisionnode-video-tokens");
+        self
+    }
+}
+
+/// The largest token count a header may carry, 2^31 - 1.
+const MAX_HEADER_TOKENS: u64 = (1 << 31) - 1;
+
+/// A token count from a header: digits only after trimming spaces, from 0 to
+/// 2^31 - 1. Anything else (empty, a sign, a fraction, too large) is `None`.
+fn token_header(headers: &HeaderMap, name: &str) -> Option<u64> {
+    let value = header(headers, name)?;
+    let digits = value.trim();
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    digits.parse::<u64>().ok().filter(|&n| n <= MAX_HEADER_TOKENS)
 }
 
 /// The result of one `POST /v1/decide`.
@@ -688,7 +723,7 @@ impl Decision {
         };
         Ok(Decision {
             model: obj.get("model").and_then(Value::as_str).map(str::to_owned),
-            usage: Usage::from_body(obj.get("usage")),
+            usage: Usage::from_body(obj.get("usage")).with_token_headers(headers),
             answers,
             latency_ms: header(headers, "x-decisionnode-latency-ms").and_then(|v| v.trim().parse::<f64>().ok()),
             safety: header(headers, "x-decisionnode-safety").map(|v| Safety::parse(&v)),
@@ -847,6 +882,54 @@ mod tests {
         assert_eq!(d.latency_ms, Some(23.0));
         assert_eq!(d.safety.as_ref().unwrap().harm, Some(0.031));
         assert_eq!(d.model.as_deref(), Some("decisionnode-moe-0.9.0-rc1"));
+    }
+
+    #[test]
+    fn image_and_video_tokens_from_their_headers() {
+        let body = json!({"answers": {}, "usage": {"input_tokens": 1300, "output_tokens": 0}});
+        let read = |pairs: &[(&str, &str)]| {
+            let d = Decision::from_response(body.clone(), 200, &headers(pairs)).unwrap();
+            assert_eq!(d.usage.input_tokens, Some(1300), "never changed by the shares");
+            assert_eq!(d.raw, body, "raw is the body as sent");
+            (d.usage.image_tokens, d.usage.video_tokens)
+        };
+        assert_eq!(
+            read(&[("x-decisionnode-image-tokens", "1024"), ("x-decisionnode-video-tokens", "256")]),
+            (Some(1024), Some(256))
+        );
+        assert_eq!(read(&[]), (None, None));
+        for name in ["x-decisionnode-image-tokens", "x-decisionnode-video-tokens"] {
+            let one = |value: &str| {
+                let (image, video) = read(&[(name, value)]);
+                if name.contains("image") {
+                    assert_eq!(video, None, "{name}={value:?}");
+                    image
+                } else {
+                    assert_eq!(image, None, "{name}={value:?}");
+                    video
+                }
+            };
+            assert_eq!(one("512"), Some(512), "{name}");
+            assert_eq!(one("0"), Some(0), "{name}");
+            assert_eq!(one("  77 "), Some(77), "{name}");
+            assert_eq!(one("2147483647"), Some(2_147_483_647), "{name}");
+            for bad in [
+                "",
+                "   ",
+                "-1",
+                "-0",
+                "+5",
+                "12.0",
+                "1e3",
+                "abc",
+                "12 3",
+                "0x10",
+                "2147483648",
+                "99999999999999999999999",
+            ] {
+                assert_eq!(one(bad), None, "{name}={bad:?}");
+            }
+        }
     }
 
     #[test]

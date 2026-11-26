@@ -821,6 +821,8 @@ mod tests {
         let d = results[0].decision.as_ref().unwrap();
         assert_eq!(d["t"].truth(), Some(0.88));
         assert_eq!(d.request_id.as_deref(), Some("req_1"));
+        // A result line carries no image or video token headers, so both read empty.
+        assert_eq!((d.usage.image_tokens, d.usage.video_tokens), (None, None));
         let e = results[1].error.as_ref().unwrap();
         assert_eq!(e.kind(), ErrorKind::Refusal);
         assert_eq!(e.category(), Some("harm"));

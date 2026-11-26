@@ -115,4 +115,4 @@ pub use serde_json;
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// The version of the DecisionNode SDK specification this crate implements.
-pub const SPEC_VERSION: &str = "1.4";
+pub const SPEC_VERSION: &str = "1.5";

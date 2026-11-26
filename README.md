@@ -160,7 +160,7 @@ A question id is any string and comes back as the key of its answer. Without a s
 
 | Type | Fields |
 |---|---|
-| `Decision` | `answers` (by question id, also `decision["id"]` and `decision.get("id")`), `model`, `usage.input_tokens`, `usage.output_tokens`, `usage.video_frames`, `usage.video_seconds`, `usage.booster_tokens`, `usage.boosters`, `usage.cost`, `warnings`, `evidence`, `request_id`, `latency_ms`, `safety`, `raw` |
+| `Decision` | `answers` (by question id, also `decision["id"]` and `decision.get("id")`), `model`, `usage.input_tokens`, `usage.image_tokens`, `usage.video_tokens`, `usage.output_tokens`, `usage.video_frames`, `usage.video_seconds`, `usage.booster_tokens`, `usage.boosters`, `usage.cost`, `warnings`, `evidence`, `request_id`, `latency_ms`, `safety`, `raw` |
 | `ModelInfo` | `name`, `description`, `release_date`, `fine_tuned`, `base`, `adapter_version`, `status` (the last four on a fine-tuned model only), `price_per_million_input`, `price_per_million_output`, `price_per_million_image`, `price_per_million_video` (USD per million tokens) and `batch_price_factor` (the share of the live prices a batch line pays; none on a fine-tuned model), each `None` when the entry does not state it, `limits` (every other field of the entry, the prices included), `raw` |
 | `Answer::Truth(TruthAnswer)` | `truth` |
 | `Answer::Choice(ChoiceAnswer)` | `choice`, `confidence`, `probabilities` (by option name, exactly as sent) |
@@ -171,6 +171,8 @@ A question id is any string and comes back as the key of its answer. Without a s
 | `Answer::Unknown(UnknownAnswer)` | `answer_type` and `raw`, for a question type this version does not know, or a known type whose fields are missing or of the wrong type. Such an answer never fails the decision. |
 
 `model` is read from the body; `request_id`, `latency_ms` and `safety` from the `x-request-id`, `x-decisionnode-latency-ms` and `x-decisionnode-safety` headers. A value the response does not carry is `None`: the token counts are `Option<u64>` and `latency_ms` is `Option<f64>`, never 0 in place of a missing value. For a request with videos, `usage.video_frames` is the number of frames read and `usage.video_seconds` the seconds of the windows read (`None` without videos), and `warnings` holds the server's notes exactly as sent when it read a video at a lower rate or resolution than asked (empty when there are none).
+
+`usage.image_tokens` and `usage.video_tokens` are the shares of `usage.input_tokens` that came from images and from videos, read from the `x-decisionnode-image-tokens` and `x-decisionnode-video-tokens` headers, so you can bill or budget vision tokens at your own price. Both are `Option<u64>`: `image_tokens` is `None` for a request without images and `video_tokens` is `None` for a request without videos (the server sends each header only when its share is above 0), and either is `None` when its header is not a whole number from 0 to 2^31 - 1. They are read as sent: the client never adds them to, or takes them from, another count, and never prices them. A batch result's decision reads `None` for both.
 
 `usage.cost` is what the answer cost in USD, as the API booked it: `usd` (the amount booked), `model_usd` (the model's part), `boosters_usd` (the boosters' part) and `free_tier` (`true` when the free tier covered the model's part). Every amount is read as sent and never computed by the client, so `usd` is the API's own figure, not `model_usd` plus `boosters_usd`. A batch result's decision and a session's open and frame replies carry it too; it is `None` from a server that does not send it, never zeros.
 
@@ -658,7 +660,7 @@ The SDK sends no telemetry and logs no state or questions. Its only added header
 cargo test --all-features
 ```
 
-The integration tests run the DecisionNode SDK conformance suite (every request, response, error, behaviour and constant case, with both clients) against its mock server, from the suite `DECISIONNODE_CONFORMANCE_DIR` points at; they need `python3` for the mock. Without the variable the conformance test fails rather than skipping. CI checks the suite out at one pinned commit, set in a single place at the top of `.github/workflows/ci.yml`, and pins every action to a commit SHA. This crate implements DecisionNode SDK specification version 1.4, exported as `decisionnode::SPEC_VERSION`, and passes conformance suite 1.27.
+The integration tests run the DecisionNode SDK conformance suite (every request, response, error, behaviour and constant case, with both clients) against its mock server, from the suite `DECISIONNODE_CONFORMANCE_DIR` points at; they need `python3` for the mock. Without the variable the conformance test fails rather than skipping. CI checks the suite out at one pinned commit, set in a single place at the top of `.github/workflows/ci.yml`, and pins every action to a commit SHA. This crate implements DecisionNode SDK specification version 1.5, exported as `decisionnode::SPEC_VERSION`, and passes conformance suite 1.27.
 
 ## License
 

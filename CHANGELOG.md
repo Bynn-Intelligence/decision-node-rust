@@ -2,6 +2,18 @@
 
 All notable changes to this crate are listed here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the crate follows [Semantic Versioning](https://semver.org/).
 
+## [0.5.0] - Unreleased
+
+Implements DecisionNode SDK specification version 1.5 (`SPEC_VERSION`): the image and video shares of the input tokens, so callers can bill or budget vision tokens at their own price.
+
+### Added
+
+- `Usage::image_tokens` and `Usage::video_tokens` (`Option<u64>`): the share of `usage.input_tokens` that came from images and from videos, read from the `x-decisionnode-image-tokens` and `x-decisionnode-video-tokens` response headers on every call that returns a `Decision`. Each is `None` when its header is absent (the server sends it only for a request with images or videos), empty, or not a whole number from 0 to 2^31 - 1 after trimming spaces; such a header never fails the decision. Both are read as sent, never added to or taken from another count and never priced. A batch result's decision reads `None`, since its line carries no such headers. `raw` is unchanged.
+
+### Changed
+
+- `SPEC_VERSION` is `"1.5"`.
+
 ## [0.4.0] - Unreleased
 
 Implements DecisionNode SDK specification version 1.4 (`SPEC_VERSION`): knowledge, checked against conformance suite 1.27 with the async and the blocking client.

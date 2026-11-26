@@ -1891,6 +1891,32 @@ mod tests {
         assert_eq!(err.reason(), Some("upstream returned html"));
     }
 
+    #[tokio::test]
+    async fn a_decide_reads_the_image_and_video_token_headers() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = [0u8; 4096];
+                let _ = sock.read(&mut buf).await;
+                let body = r#"{"model":"decisionnode-flash","answers":{"q":{"type":"truth","truth":0.9}},"usage":{"input_tokens":1400,"output_tokens":0}}"#;
+                let reply = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nx-request-id: req_9\r\nx-decisionnode-image-tokens: 1024\r\nx-decisionnode-video-tokens: 300\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = sock.write_all(reply.as_bytes()).await;
+            }
+        });
+        let dn =
+            DecisionNode::builder().api_key("k").base_url(format!("http://{addr}")).max_retries(0).build().unwrap();
+        let d = dn.decide(DecideRequest::new().question("q", truth("?"))).await.unwrap();
+        assert_eq!(d.request_id.as_deref(), Some("req_9"));
+        assert_eq!(d.usage.input_tokens, Some(1400));
+        assert_eq!((d.usage.image_tokens, d.usage.video_tokens), (Some(1024), Some(300)));
+        assert!(d.raw["usage"].get("image_tokens").is_none());
+    }
+
     #[test]
     fn idempotency_keys_are_random_uuids() {
         let re = regex::Regex::new("^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$").unwrap();

@@ -1768,6 +1768,8 @@ fn norm_decision(d: &Decision) -> Value {
         "latency_ms": d.latency_ms.map(num),
         "usage": {
             "input_tokens": d.usage.input_tokens,
+            "image_tokens": d.usage.image_tokens,
+            "video_tokens": d.usage.video_tokens,
             "output_tokens": d.usage.output_tokens,
             "video_frames": d.usage.video_frames,
             "video_seconds": d.usage.video_seconds.map(num),
