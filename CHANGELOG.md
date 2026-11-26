@@ -4,7 +4,7 @@ All notable changes to this crate are listed here. The format follows [Keep a Ch
 
 ## [0.5.0] - Unreleased
 
-Implements DecisionNode SDK specification version 1.5 (`SPEC_VERSION`): the image and video shares of the input tokens, so callers can bill or budget vision tokens at their own price.
+Implements DecisionNode SDK specification version 1.5 (`SPEC_VERSION`): the image and video shares of the input tokens, so callers can bill or budget vision tokens at their own price, checked against conformance suite 1.28 with the async and the blocking client.
 
 ### Added
 
