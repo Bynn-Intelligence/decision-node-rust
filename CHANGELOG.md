@@ -13,6 +13,7 @@ Implements DecisionNode SDK specification version 1.5 (`SPEC_VERSION`): the imag
 ### Changed
 
 - `SPEC_VERSION` is `"1.5"`.
+- `Cargo.lock` takes the fixed releases of `rustls-webpki` (0.103.16), `tokio` (1.53.3), `url` (2.5.9) and `webpki-roots` (1.0.12) for RUSTSEC-2026-0382, RUSTSEC-2026-0386, RUSTSEC-2026-0592 and RUSTSEC-2026-0381.
 
 ## [0.4.0] - Unreleased
 
