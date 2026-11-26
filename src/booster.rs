@@ -1295,8 +1295,9 @@ mod tests {
         // unknown field ignored.
         let photo = ev["ai_generated"].results[4].as_ai_generated().unwrap();
         assert_eq!((photo.top_generator.as_ref(), photo.c2pa.as_deref()), (None, Some("untrusted")));
-        for i in 5..8 {
-            assert!(matches!(ev["ai_generated"].results[i], Reading::Unknown(_)), "{i}");
+        assert!(ev["ai_generated"].results.len() >= 8);
+        for (i, reading) in ev["ai_generated"].results.iter().enumerate().skip(5).take(3) {
+            assert!(matches!(reading, Reading::Unknown(_)), "{i}");
         }
         assert!(ev["slow"].results.is_empty());
         assert_eq!((age.billed_calls, ev["slow"].billed_calls, ev["colour"].billed_calls), (Some(2), None, None));
